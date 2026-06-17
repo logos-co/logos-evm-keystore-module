@@ -1,0 +1,19 @@
+{
+  "author": "Logos Core Team",
+  "category": "security",
+  "dependencies": [],
+  "description": "Coordinates permissions between modules",
+  "hashes": {
+    "root": "862462f2a1620275da544ea82828af24b98c997e3a672a4827086a65885a6f73",
+    "variants": "633f1044ca45f1bbdc8719629e85de0c5a39c2daeacdbf74e2ffe0c3aa6f0197",
+    "variants/darwin-arm64-dev": "8b079caa43498f70fcbfc282645f5e409f1f23c215c5f0a3461ee80beb31a7fe"
+  },
+  "icon": "",
+  "main": {
+    "darwin-arm64-dev": "capability_module_plugin.dylib"
+  },
+  "manifestVersion": "0.2.0",
+  "name": "capability_module",
+  "type": "core",
+  "version": "1.0.0"
+}
