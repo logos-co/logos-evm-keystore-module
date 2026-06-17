@@ -1,0 +1,47 @@
+[package]
+name = "keystore_module"
+version = "1.0.0"
+edition = "2021"
+description = "Logos keystore module — scrypt vaults, BIP39/BIP32 HD derivation, secp256k1 signing. No network."
+# Pin to the nix toolchain's rustc so the MSRV-aware resolver (below) selects
+# dependency versions that compile under the builder (rustc 1.89), not just the
+# newest that need a fresher compiler.
+rust-version = "1.89"
+
+# Standalone crate — the empty table keeps cargo from adopting the workspace's
+# many sibling crates. resolver "3" makes lockfile selection MSRV-aware.
+[workspace]
+resolver = "3"
+
+[lib]
+# staticlib: linked into the Qt plugin by the builder. rlib: lets `cargo test`
+# build the core crypto in isolation (the Logos glue is feature-gated, off by
+# default for cargo, on for the builder — see lib.rs).
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Offline Ethereum crypto. Narrow alloy features — no provider/rpc/network I/O.
+alloy = { version = "1", default-features = false, features = [
+    "std", "consensus", "eips", "rlp", "signers", "signer-local", "signer-mnemonic", "k256",
+] }
+eth-keystore = "0.5"
+# coins-bip39 (BIP39/BIP32) is used via alloy's re-export (alloy::signers::local::
+# coins_bip39) so there is exactly one version in the graph.
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+hex = "0.4"
+
+# The Logos runtime SDK is staged by the builder as a sibling crate. It is
+# optional + enabled by the default `logos_module` feature so `cargo test
+# --no-default-features` can build the crypto core without it (and without the
+# generated scaffold / unresolved lp_* link symbols).
+logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[features]
+default = ["logos_module"]
+logos_module = ["dep:logos-rust-sdk"]
+
+[dev-dependencies]
+tempfile = "3"
