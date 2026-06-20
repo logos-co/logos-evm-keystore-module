@@ -1,0 +1,9 @@
+# Track only the spec, runner, and rendered docs/screenshots — everything else
+# here (built CLIs, installed modules, .lgx links, transient fixtures written by
+# the spec's `file:` steps, logs) is a run artifact.
+*
+!.gitignore
+!*.test.yaml
+!run.sh
+!outputs/
+!outputs/**
