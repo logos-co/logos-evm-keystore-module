@@ -45,6 +45,12 @@ pub trait KeystoreModule: Send + 'static {
     fn sign_transaction(&mut self, address: String, unsigned_tx_json: String, chain_id: i64) -> String;
     /// EIP-191 personal_sign → `{ ok, signature }`.
     fn sign_message(&mut self, address: String, message: String) -> String;
+    /// Sign a raw 32-byte digest (hex) with `address`'s key → `{ ok, signature }`
+    /// (65-byte hex). For protocol digests — an ERC-4337 UserOperation hash or an
+    /// EIP-7702 authorization hash — that aren't a transaction or an EIP-191
+    /// message. ⚠️ Signs an opaque hash (see `Keystore::sign_digest`); for trusted
+    /// in-app callers only. The account must be unlocked.
+    fn sign_digest(&mut self, address: String, digest_hex: String) -> String;
     /// Framework hook — defaulted, so it is NOT part of the IPC contract.
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
 }
@@ -230,6 +236,16 @@ impl KeystoreModule for KeystoreModuleImpl {
     fn sign_message(&mut self, address: String, message: String) -> String {
         match self.ks() {
             Ok(ks) => match ks.sign_message(&address, &message) {
+                Ok(sig) => json!({ "ok": true, "signature": sig }).to_string(),
+                Err(e) => err(e),
+            },
+            Err(e) => err(e),
+        }
+    }
+
+    fn sign_digest(&mut self, address: String, digest_hex: String) -> String {
+        match self.ks() {
+            Ok(ks) => match ks.sign_digest(&address, &digest_hex) {
                 Ok(sig) => json!({ "ok": true, "signature": sig }).to_string(),
                 Err(e) => err(e),
             },

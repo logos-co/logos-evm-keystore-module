@@ -350,6 +350,42 @@ impl Keystore {
 
         Ok(format!("0x{}", hex::encode(raw)))
     }
+
+    /// Sign a raw 32-byte `digest` with `address`'s key (ECDSA over the hash —
+    /// no EIP-191/EIP-712 prefix). Returns the 65-byte signature hex.
+    ///
+    /// ⚠️ SECURITY: this signs an *opaque* hash. Unlike [`Self::sign_transaction`],
+    /// whose fields a UI can display, the caller fully controls the preimage — and
+    /// a 32-byte digest could be a transaction's `signature_hash`, so anyone able
+    /// to reach an *unlocked* account here could obtain a draining-tx signature.
+    /// Expose it only to trusted in-app modules signing protocol digests (an
+    /// ERC-4337 UserOperation hash or an EIP-7702 authorization hash), never to
+    /// untrusted input. The account must be unlocked (same gate as the others).
+    pub fn sign_digest(&mut self, address: &str, digest_hex: &str) -> Result<String> {
+        let addr = parse_address(address)?;
+        let digest = parse_b256(digest_hex)?;
+        let signer = self
+            .live_signer(&addr)
+            .ok_or_else(|| KeystoreError::Locked(address.to_string()))?;
+        let sig = signer
+            .sign_hash_sync(&digest)
+            .map_err(|e| KeystoreError::Signing(e.to_string()))?;
+        Ok(format!("0x{}", hex::encode(sig.as_bytes())))
+    }
+}
+
+/// Parse a 32-byte hash hex (`0x`-prefixed or bare) into a `B256`.
+fn parse_b256(s: &str) -> Result<B256> {
+    let s = s.trim();
+    let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let bytes = hex::decode(h).map_err(|e| KeystoreError::InvalidParams(format!("digest hex: {e}")))?;
+    if bytes.len() != 32 {
+        return Err(KeystoreError::InvalidParams(format!(
+            "digest must be 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(B256::from_slice(&bytes))
 }
 
 fn parse_bytes(s: &str) -> Result<Bytes> {
@@ -466,6 +502,34 @@ mod tests {
         let mut ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
         assert!(matches!(ks.sign_message(&addr.to_string(), "x"), Err(KeystoreError::Locked(_))));
+    }
+
+    #[test]
+    fn sign_digest_recovers_signer_from_prehash() {
+        use alloy::primitives::b256;
+        let dir = tempfile::tempdir().unwrap();
+        let mut ks = Keystore::new(dir.path());
+        let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
+        ks.unlock(&addr.to_string(), "pw", None).unwrap();
+        // A raw 32-byte digest (e.g. an ERC-4337 UserOperation hash) — signed with
+        // no prefix, so it recovers via the prehash (not the EIP-191 msg) path.
+        let digest = b256!("00000000000000000000000000000000000000000000000000000000deadbeef");
+        let sig_hex = ks.sign_digest(&addr.to_string(), &digest.to_string()).unwrap();
+        let sig: alloy::primitives::Signature =
+            sig_hex.strip_prefix("0x").unwrap().parse().unwrap();
+        assert_eq!(sig.recover_address_from_prehash(&digest).unwrap(), ACCT0);
+        // Bare (no 0x) hex also accepted; wrong length rejected.
+        assert!(ks.sign_digest(&addr.to_string(), &hex::encode(digest)).is_ok());
+        assert!(ks.sign_digest(&addr.to_string(), "0x1234").is_err());
+    }
+
+    #[test]
+    fn sign_digest_requires_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ks = Keystore::new(dir.path());
+        let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
+        let digest = "0x00000000000000000000000000000000000000000000000000000000deadbeef";
+        assert!(matches!(ks.sign_digest(&addr.to_string(), digest), Err(KeystoreError::Locked(_))));
     }
 
     #[test]
