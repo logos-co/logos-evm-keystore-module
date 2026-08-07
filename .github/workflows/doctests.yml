@@ -13,6 +13,7 @@ name: keystore-module Doc-Tests
 #   https://<owner>.github.io/<repo>/                  (root index of all refs)
 #   https://<owner>.github.io/<repo>/main/<os>/        (pushes to main)
 #   https://<owner>.github.io/<repo>/pr-<N>/<os>/      (pull requests)
+#   https://<owner>.github.io/<repo>/branch-<name>/<os>/  (manual dispatch)
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -20,6 +21,7 @@ on:
     branches: [master, main]
   push:
     branches: [master, main]
+  workflow_dispatch:
 
 concurrency:
   group: doctests-${{ github.ref }}
@@ -117,8 +119,12 @@ jobs:
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="pr-${{ github.event.pull_request.number }}"
-          else
+          elif [ "${{ github.ref_name }}" = "main" ] || [ "${{ github.ref_name }}" = "master" ]; then
             BASE="main"
+          else
+            # A manual workflow_dispatch on a feature branch publishes under its
+            # own directory, so it can never overwrite the main report.
+            BASE="branch-$(printf '%s' "${{ github.ref_name }}" | tr -c 'A-Za-z0-9._-' '-')"
           fi
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
@@ -159,7 +165,7 @@ jobs:
           refs=""
           if git ls-remote --exit-code --heads "https://github.com/${{ github.repository }}.git" gh-pages >/dev/null 2>&1; then
             git clone --depth 1 --branch gh-pages "https://github.com/${{ github.repository }}.git" existing 2>/dev/null || true
-            refs="$(ls -1 existing 2>/dev/null | grep -E '^(main|pr-[0-9]+)$' || true)"
+            refs="$(ls -1 existing 2>/dev/null | grep -E '^(main|pr-[0-9]+|branch-.+)$' || true)"
           fi
           refs="$(printf '%s\n%s\n' "$refs" "${{ steps.arrange.outputs.base }}" | sort -u | grep -v '^$' || true)"
           {
