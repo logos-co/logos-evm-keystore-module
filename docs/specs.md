@@ -465,9 +465,14 @@ and worth stating before anyone reads a green result as "done":
 
 * **Tier A stays safe.** `"core"` is not the configured approver, so it is still
   refused and no signature becomes reachable.
-* **Result collection stays safe.** `fetch_result` / `ack_result` authorise on the
-  **receipt**, not the name, so requesters sharing a name still cannot collect each
-  other's signatures.
+* **Result collection stays safe, and this is why the blast radius is bounded.**
+  `fetch_result` / `ack_result` authorise on the **receipt**, not on the caller
+  name. That single choice is what keeps a misattributed identity a problem of
+  *attribution* rather than one of *collection*: requesters that collapse into one
+  name still cannot fetch each other's signatures, because the receipt is returned
+  exactly once to the requester that asked. Had collection been authorised by
+  caller name, the same bug would have let any module collect any other's signed
+  payloads.
 * **Tier B becomes wrongly permissive.** Every requester collapses into one
   identity: `MAX_PENDING_PER_REQUESTER` stops being per-requester, and — the part
   that matters — `acknowledge()` reports `requester` into the render lines, so **the
@@ -476,9 +481,27 @@ and worth stating before anyone reads a green result as "done":
   entire job is to tell the human what they are authorising.
 
 So Tier B must not be treated as usable until the caller is named *correctly*, not
-merely named. A host that spells a bootstrap anchor key as a module name should
-refuse to name it at all — failing closed, exactly as it already does for the
-credential-store side.
+merely named.
+
+**The upstream mitigation, and what it changes.** A host that spells a bootstrap
+anchor key as a module name should refuse to name it at all. `authorize()` already
+enforces exactly that on the credential store — the anchor-key check lives there —
+but the caller-keyed store offers its key unconditionally, and that is the store
+the origin bug deposits `"core"` into. Applying the same rule to both suppresses
+the name, which fails the `moduleHits == 1 && keyLen > 0` test and falls through to
+**`unknown`**. That is the honest answer: we know we cannot name this caller; we do
+not know it is the host.
+
+With that in place the observable goes back to `unknown` — but for a different
+reason than today's, and the difference is the whole point. Today's `unknown` means
+*the mechanism could not answer*; the post-fix one means *the mechanism answered
+that this caller cannot be honestly named*. Both refuse, so keystore is fail-closed
+either way, and Tier B is safe to leave unshipped rather than actively wrong.
+
+The generalisable rule worth stating, because it is what keeps this fixed: **a
+store may only name a caller with a key it alone can write.** Ordinary module names
+have that property in the caller-keyed store; anchor keys do not, because another
+writer puts them there with another meaning.
 
 **A "correctly refused" result on such a host proves less than it looks like.** It
 evidences that identity was *absent*, not that the authorization path is sound —
