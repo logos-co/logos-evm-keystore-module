@@ -456,6 +456,15 @@ established, and is what this module must be designed against, is the observable
 * Consequently the end-to-end proof of approved signing must be **hosted in
   Basecamp or standalone**, never in `logoscore`.
 
+**A "correctly refused" result on such a host proves less than it looks like.** It
+evidences that identity was *absent*, not that the authorization path is sound —
+those are different claims, and only the first is established here. (Work on
+`logos-protocol#72`, which splits the token store into direction-pure
+inbound/outbound/credential halves, reports that an old-host + old-module pairing
+authorizes *wrongly* — the same store confusion this section describes from the
+naming side, seen from the access side.) Read refusals here as "identity is
+missing", never as "the gate was tested".
+
 Use `caller_identity()` to see what this module currently observes. It is ungated
 and side-effect-free on purpose: an identity mechanism must not be able to report
 its own absence only to the party it would refuse.
