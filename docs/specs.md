@@ -456,6 +456,30 @@ established, and is what this module must be designed against, is the observable
 * Consequently the end-to-end proof of approved signing must be **hosted in
   Basecamp or standalone**, never in `logoscore`.
 
+**Fixing identity will not, on its own, make Tier B usable — expect a wrong name
+before a right one.** The handshake announces the caller as the bootstrap anchor
+`"core"` (above). Once the mechanism is repaired, `authorize()` finds that name in
+its caller-keyed store and is expected to answer `{"kind":"module","name":"core"}`
+— populated, and wrong — rather than `unknown`. The consequences are asymmetric
+and worth stating before anyone reads a green result as "done":
+
+* **Tier A stays safe.** `"core"` is not the configured approver, so it is still
+  refused and no signature becomes reachable.
+* **Result collection stays safe.** `fetch_result` / `ack_result` authorise on the
+  **receipt**, not the name, so requesters sharing a name still cannot collect each
+  other's signatures.
+* **Tier B becomes wrongly permissive.** Every requester collapses into one
+  identity: `MAX_PENDING_PER_REQUESTER` stops being per-requester, and — the part
+  that matters — `acknowledge()` reports `requester` into the render lines, so **the
+  human is shown the wrong requester**. A prompt that says *requested by `core`*
+  when it was `wallet_backend_module` is a misattribution in the one surface whose
+  entire job is to tell the human what they are authorising.
+
+So Tier B must not be treated as usable until the caller is named *correctly*, not
+merely named. A host that spells a bootstrap anchor key as a module name should
+refuse to name it at all — failing closed, exactly as it already does for the
+credential-store side.
+
 **A "correctly refused" result on such a host proves less than it looks like.** It
 evidences that identity was *absent*, not that the authorization path is sound —
 those are different claims, and only the first is established here. (Work on
