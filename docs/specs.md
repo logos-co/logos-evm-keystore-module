@@ -511,11 +511,21 @@ measured consequences went well past a bad label: the caller reported
 own anchor was destroyed, locking the host itself out of it.
 
 This is what `HostAnchor` being refused at **both** Tier A and Tier B was actually
-protecting against. The stated reason was that the anchor is one undifferentiated
-bag shared with the shells and `core_service`; the sharper reason is that a
-*module* could arrive wearing it. Tier A held throughout regardless — `"core"` is
-not the configured approver — so no signature was ever reachable, but "refuses
-everyone" was doing more work than it appeared to.
+protecting against. Tier A held throughout regardless — `"core"` is not the
+configured approver — so no signature was ever reachable, but "refuses everyone"
+was doing more work than it appeared to.
+
+**The rule, stated so it does not decay into a mitigation.** `HostAnchor` is
+refused at every gated tier not because the historical bug existed, and not merely
+because the anchor is a bag shared with the shells and `core_service`, but because
+**the anchor is not an identity at all.** `core` and `capability_module` share one
+token *value*, so nothing presenting it can be distinguished from anything else
+presenting it — including a module that came by it legitimately. `authorize()`
+already encodes this by refusing to name an anchor. **A tier that admits
+`HostAnchor` is admitting an unbounded set, not a trusted party.** That holds
+whether or not any module currently claims `core`, which is what makes it a
+standing rule rather than a fix for a defect that has since been repaired — and
+why it must not be relaxed on the reasoning that "the host is trusted anyway".
 
 The generalisable rule worth stating, because it is what keeps this fixed: **a
 store may only name a caller with a key it alone can write.** Ordinary module names
