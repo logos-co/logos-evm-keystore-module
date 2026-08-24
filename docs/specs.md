@@ -545,8 +545,28 @@ identity as a **plain argument**. Its only check is that the asserted name is on
 image holds a token for — the source says so directly: *"fail closed on an unknown
 name rather than mint a token for a self-asserted identity that was never loaded"*
 (`capability_module_impl.cpp:65-93`). It verifies the name **is loaded**, not that the
-caller **is** it. The per-target `m_restrictions` allowlist does not help either: it
-is consulted against the same self-asserted name.
+caller **is** it. Be precise about what it *does* provide: a gate on **existence**,
+not on identity — a name that was never loaded is refused, so a reserved or invented
+namespace cannot be forged. What is not checked is the only thing that would matter
+here.
+
+**`--access-policy enforce` is not a mitigation, and this is the trap.** The natural
+first response to everything below is "turn the access policy on". It does not work.
+The policy arm filters on the *same self-asserted argument*
+(`capability_module_plugin.cpp:99-100`):
+
+```cpp
+if (auto it = m_restrictions.constFind(moduleName); it != m_restrictions.constEnd()) {
+    if (!it->contains(fromModuleName)) { … return {}; }
+}
+```
+
+A module that asserts the name of an **allowed** caller passes the allowlist. So a
+fully populated policy under `enforce` provides no protection against any loaded
+module, because the input it filters on is chosen by the requester. The `TODO` there
+documents the fail-**open** case when the restriction map is empty; this — the
+populated case failing open to anyone who names an allowed caller — is documented
+nowhere else, so it is easy to deploy `enforce` and believe it closed this.
 
 Measured on shipped tooling, no harness: a request naming an arbitrary origin mints a
 token and the victim records it under that name —
@@ -590,9 +610,19 @@ and a signature.
 
 **Closing it is one upstream change**, named here rather than worked around:
 `requestModule` deriving the requester from the platform's own caller identity instead
-of the `fromModuleName` argument. Until then, treat Tier A as *"the operator
-designated this package as the approver"*, never as *"only that package can reach
-this"*.
+of the `fromModuleName` argument.
+
+That change has a hard prerequisite, which is worth stating because it reorders what
+looks like unrelated work: `currentCaller()` answers `unknown` on **every host in the
+fleet today** (see above), so `requestModule` has nothing trustworthy to switch to
+yet. The chain is **qt-host provenance → caller identity live fleet-wide →
+`requestModule` stops trusting its argument.** The qt-host defect is therefore not
+merely a broken feature; it is the thing gating a real authorization improvement.
+
+Until that lands, treat Tier A as *"the operator designated this package as the
+approver"*, never as *"only that package can reach this"* — and rank **intent
+disclosure** first among what remains, since `acknowledge()` returns `render_lines`
+with no password and no race.
 
 **A "correctly refused" result on such a host proves less than it looks like.** It
 evidences that identity was *absent*, not that the authorization path is sound —
