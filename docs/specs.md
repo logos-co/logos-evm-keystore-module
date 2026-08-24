@@ -427,16 +427,20 @@ against a live daemon at protocol 0.6.0 with a purpose-built probe module:
 | `logosctl` → keystore | `unknown` |
 | **probe module → keystore** (real module plane) | **`unknown`** |
 
-Unchanged by `--access-policy enforce`. The cause is visible in the handshake:
-the outbound client announces `requestModule for origin: "core"`, because a
-module's `LogosAPIClient` in this host is constructed with the **bootstrap anchor
-name `"core"`**, not the module's own name. `authorize()` then deliberately
-refuses to name an anchor — `"core"` and `"capability_module"` share one value, so
-naming a module from it would assert an identity that ambiguity forbids.
+Unchanged by `--access-policy enforce`. What the verbose handshake shows is that
+the capability exchange announces `requestModule for origin: "core"` — the
+bootstrap anchor — rather than `caller_probe`. Only `ModuleProxy::m_tokens`, keyed
+by the announced caller, can name anyone, and `authorize()` deliberately refuses
+to name an anchor: `"core"` and `"capability_module"` share one value, so naming a
+module from it would assert an identity that ambiguity forbids.
 
-Naming therefore requires a host that gives each plugin its **own** identity via
-`LogosAPI::forIdentity(name)` — which **Basecamp** and **logos-standalone-app** do
-and `logoscore` does not.
+**The upstream cause of that `"core"` is not settled here.** The module host does
+construct the module's API with its own name
+(`logos-module-loader-qt`, `src/host/module_initializer.cpp:103`,
+`new LogosAPI(moduleName, …)`), so the announced origin contradicts the host code
+and the discrepancy needs an upstream fix rather than a keystore one. What is
+established, and is what this module must be designed against, is the observable:
+**under `logoscore` no caller can currently be named.**
 
 **What this means in practice, and it is deliberate:**
 
