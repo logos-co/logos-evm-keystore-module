@@ -7,9 +7,7 @@
 //! private key across its API — only addresses, signed payloads, and
 //! (re-encrypted) vault JSON.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy::eips::eip2718::Encodable2718;
@@ -50,17 +48,17 @@ pub enum KeystoreError {
 
 type Result<T> = std::result::Result<T, KeystoreError>;
 
-/// An unlocked, in-memory signer with an optional auto-relock deadline.
-struct Unlocked {
-    signer: PrivateKeySigner,
-    expires_at: Option<Instant>,
-}
-
-/// Manages a directory of scrypt vault files plus the set of currently-unlocked
-/// signers. One vault file per account, named `<lowercase-hex-address>.json`.
+/// Manages a directory of scrypt vault files. One vault file per account, named
+/// `<lowercase-hex-address>.json`.
+///
+/// There is deliberately NO cache of unlocked signers. Signing *is* vault
+/// access: a key is derived from the vault password for one operation and wiped
+/// when that operation ends. The previous design kept a `HashMap<Address,
+/// Unlocked>` whose entries carried an *optional* deadline, and the only caller
+/// passed `None` — so an unlock was an unlimited, process-lifetime signer that
+/// any module able to reach this one could spend.
 pub struct Keystore {
     dir: PathBuf,
-    unlocked: HashMap<Address, Unlocked>,
 }
 
 /// Fields of an unsigned transaction, as JSON from the caller. All numeric
@@ -68,36 +66,36 @@ pub struct Keystore {
 /// JSON boundary. `fee_mode` selects EIP-1559 (default) vs legacy.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct UnsignedTx {
-    to: Option<String>,
+pub struct UnsignedTx {
+    pub to: Option<String>,
     /// Contract creation must be asked for explicitly. Previously an absent or
     /// blank `to` fell through to `TxKind::Create`, so a transfer whose
     /// recipient failed to render became a contract deployment that burned the
     /// value.
     #[serde(default)]
-    create: bool,
+    pub create: bool,
     /// Present only so an access-list-bearing tx is REFUSED with a reason
     /// rather than silently stripped: the signer previously hardcoded
     /// `access_list: Default::default()`, so a caller's EIP-2930 list was
     /// dropped and the signature covered a different transaction than the one
     /// requested.
     #[serde(default)]
-    access_list: Option<serde_json::Value>,
+    pub access_list: Option<serde_json::Value>,
     #[serde(default)]
-    value: String,
-    nonce: String,
+    pub value: String,
+    pub nonce: String,
     #[serde(default)]
-    gas_limit: String,
+    pub gas_limit: String,
     #[serde(default)]
-    data: String,
+    pub data: String,
     #[serde(default)]
-    fee_mode: String, // "eip1559" (default) | "legacy"
+    pub fee_mode: String, // "eip1559" (default) | "legacy"
     #[serde(default)]
-    max_fee_per_gas: String,
+    pub max_fee_per_gas: String,
     #[serde(default)]
-    max_priority_fee_per_gas: String,
+    pub max_priority_fee_per_gas: String,
     #[serde(default)]
-    gas_price: String,
+    pub gas_price: String,
 }
 
 fn parse_u128(s: &str, what: &str) -> Result<u128> {
@@ -169,7 +167,21 @@ fn vault_name(addr: &Address) -> String {
 
 impl Keystore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), unlocked: HashMap::new() }
+        Self { dir: dir.into() }
+    }
+
+    /// Derive the signer for `address` from its vault. The returned signer is
+    /// live only for the caller's scope — there is nowhere else it is kept.
+    pub fn signer_for(&self, address: &str, password: &str) -> Result<PrivateKeySigner> {
+        let addr = parse_address(address)?;
+        let path = self.vault_path(&addr);
+        if !path.exists() {
+            return Err(KeystoreError::NotFound(address.to_string()));
+        }
+        let key = Zeroizing::new(
+            eth_keystore::decrypt_key(&path, password).map_err(|e| KeystoreError::Vault(e.to_string()))?,
+        );
+        PrivateKeySigner::from_slice(&key).map_err(|e| KeystoreError::InvalidKey(e.to_string()))
     }
 
     fn ensure_dir(&self) -> Result<()> {
@@ -275,7 +287,7 @@ impl Keystore {
         }
     }
 
-    pub fn delete_account(&mut self, address: &str, password: &str) -> Result<bool> {
+    pub fn delete_account(&self, address: &str, password: &str) -> Result<bool> {
         let addr = parse_address(address)?;
         let path = self.vault_path(&addr);
         if !path.exists() {
@@ -284,178 +296,141 @@ impl Keystore {
         // Require the correct password before destroying the vault.
         eth_keystore::decrypt_key(&path, password).map_err(|e| KeystoreError::Vault(e.to_string()))?;
         std::fs::remove_file(&path).map_err(|e| KeystoreError::Io(e.to_string()))?;
-        self.unlocked.remove(&addr);
         Ok(true)
     }
 
-    pub fn unlock(&mut self, address: &str, password: &str, ttl: Option<Duration>) -> Result<()> {
-        let addr = parse_address(address)?;
-        let path = self.vault_path(&addr);
-        if !path.exists() {
-            return Err(KeystoreError::NotFound(address.to_string()));
-        }
-        let key = Zeroizing::new(
-            eth_keystore::decrypt_key(&path, password).map_err(|e| KeystoreError::Vault(e.to_string()))?,
-        );
-        let signer = PrivateKeySigner::from_slice(&key).map_err(|e| KeystoreError::InvalidKey(e.to_string()))?;
-        let expires_at = ttl.map(|d| Instant::now() + d);
-        self.unlocked.insert(addr, Unlocked { signer, expires_at });
-        Ok(())
+    /// EIP-191 personal_sign over `message` — derives, signs, wipes.
+    pub fn sign_message(&self, address: &str, password: &str, message: &str) -> Result<String> {
+        sign_message_with(&self.signer_for(address, password)?, message)
     }
 
-    pub fn lock(&mut self, address: &str) -> bool {
-        match parse_address(address) {
-            Ok(addr) => self.unlocked.remove(&addr).is_some(),
-            Err(_) => false,
-        }
+    /// Sign an unsigned tx, returning the broadcast-ready EIP-2718 envelope hex.
+    pub fn sign_transaction(
+        &self,
+        address: &str,
+        password: &str,
+        unsigned_tx_json: &str,
+        chain_id: u64,
+    ) -> Result<String> {
+        sign_transaction_with(&self.signer_for(address, password)?, unsigned_tx_json, chain_id)
     }
 
-    pub fn is_unlocked(&mut self, address: &str) -> bool {
-        match parse_address(address) {
-            Ok(addr) => self.live_signer(&addr).is_some(),
-            Err(_) => false,
-        }
+    /// Sign a raw 32-byte digest. See [`sign_digest_with`] for the caveat.
+    pub fn sign_digest(&self, address: &str, password: &str, digest_hex: &str) -> Result<String> {
+        sign_digest_with(&self.signer_for(address, password)?, digest_hex)
     }
+}
 
-    /// Fetch an unlocked signer, evicting it first if its TTL has elapsed.
-    fn live_signer(&mut self, addr: &Address) -> Option<&PrivateKeySigner> {
-        if let Some(u) = self.unlocked.get(addr) {
-            if let Some(exp) = u.expires_at {
-                if Instant::now() >= exp {
-                    self.unlocked.remove(addr);
-                    return None;
-                }
-            }
-        }
-        self.unlocked.get(addr).map(|u| &u.signer)
-    }
+/// EIP-191 personal_sign. Refuses text that can render differently than it
+/// signs (see [`check_displayable`]).
+pub fn sign_message_with(signer: &PrivateKeySigner, message: &str) -> Result<String> {
+    check_displayable(message, "message")?;
+    let sig = signer
+        .sign_message_sync(message.as_bytes())
+        .map_err(|e| KeystoreError::Signing(e.to_string()))?;
+    Ok(format!("0x{}", hex::encode(sig.as_bytes())))
+}
 
-    /// EIP-191 personal_sign over `message`. Returns 65-byte signature hex.
-    ///
-    /// The message is REJECTED — never rewritten — if it contains characters
-    /// that let a rendered line differ from the bytes actually signed. The
-    /// signed bytes must stay exactly what the caller supplied, so
-    /// normalisation is not an option here; refusal is.
-    pub fn sign_message(&mut self, address: &str, message: &str) -> Result<String> {
-        check_displayable(message, "message")?;
-        let addr = parse_address(address)?;
-        let signer = self.live_signer(&addr).ok_or_else(|| KeystoreError::Locked(address.to_string()))?;
-        let sig = signer
-            .sign_message_sync(message.as_bytes())
-            .map_err(|e| KeystoreError::Signing(e.to_string()))?;
-        Ok(format!("0x{}", hex::encode(sig.as_bytes())))
-    }
+/// Sign an unsigned tx and return the raw, broadcast-ready signed tx hex
+/// (EIP-2718 envelope). Supports legacy (EIP-155) and EIP-1559.
+pub fn sign_transaction_with(
+    signer: &PrivateKeySigner,
+    unsigned_tx_json: &str,
+    chain_id: u64,
+) -> Result<String> {
+    let tx: UnsignedTx = serde_json::from_str(unsigned_tx_json)
+        .map_err(|e| KeystoreError::InvalidParams(format!("tx json: {e}")))?;
+    sign_parsed_tx(signer, &tx, chain_id)
+}
 
-    /// Sign an unsigned tx and return the raw, broadcast-ready signed tx hex
-    /// (EIP-2718 envelope). Supports legacy (EIP-155) and EIP-1559.
-    pub fn sign_transaction(&mut self, address: &str, unsigned_tx_json: &str, chain_id: u64) -> Result<String> {
-        let addr = parse_address(address)?;
-        let signer = self
-            .live_signer(&addr)
-            .ok_or_else(|| KeystoreError::Locked(address.to_string()))?
-            .clone();
-
-        let tx: UnsignedTx = serde_json::from_str(unsigned_tx_json)
-            .map_err(|e| KeystoreError::InvalidParams(format!("tx json: {e}")))?;
-
-        let to = match (tx.to.as_deref().map(str::trim).filter(|s| !s.is_empty()), tx.create) {
-            (Some(_), true) => {
-                return Err(KeystoreError::InvalidParams(
-                    "tx json: `to` and `create: true` are mutually exclusive".into(),
-                ))
-            }
-            (Some(s), false) => TxKind::Call(parse_address(s)?),
-            (None, true) => TxKind::Create,
-            (None, false) => {
-                return Err(KeystoreError::InvalidParams(
-                    "tx json: `to` is required; set `create: true` to deploy a contract".into(),
-                ))
-            }
-        };
-
-        if tx.access_list.as_ref().is_some_and(|v| !v.is_null()) {
+/// Sign an ALREADY-PARSED transaction. The approval path parses once, commits
+/// to the parsed value, and signs from that same value — so the bytes a human
+/// was shown and the bytes that get signed cannot drift apart.
+pub fn sign_parsed_tx(signer: &PrivateKeySigner, tx: &UnsignedTx, chain_id: u64) -> Result<String> {
+    let to = match (tx.to.as_deref().map(str::trim).filter(|s| !s.is_empty()), tx.create) {
+        (Some(_), true) => {
             return Err(KeystoreError::InvalidParams(
-                "tx json: access lists are not supported by this signer — remove `access_list` \
-                 rather than have it silently dropped from the signed payload"
-                    .into(),
-            ));
+                "tx json: `to` and `create: true` are mutually exclusive".into(),
+            ))
         }
-        let value = parse_u256(&tx.value, "value")?;
-        let nonce = parse_u64(&tx.nonce, "nonce")?;
-        let gas_limit = parse_u64(&tx.gas_limit, "gas_limit")?;
-        let input = parse_bytes(&tx.data)?;
+        (Some(s), false) => TxKind::Call(parse_address(s)?),
+        (None, true) => TxKind::Create,
+        (None, false) => {
+            return Err(KeystoreError::InvalidParams(
+                "tx json: `to` is required; set `create: true` to deploy a contract".into(),
+            ))
+        }
+    };
 
-        // Previously any value that was not exactly "legacy" fell through to
-        // EIP-1559 — so `""`, `" legacy"` and a typo all signed 1559 with
-        // `max_fee_per_gas: 0` while silently ignoring `gas_price`.
-        let legacy = match tx.fee_mode.trim() {
-            "" | "eip1559" => false,
-            "legacy" => true,
-            other => {
-                return Err(KeystoreError::InvalidParams(format!(
-                    "tx json: fee_mode must be \"eip1559\" or \"legacy\", got {other:?}"
-                )))
-            }
-        };
-
-        let raw = if legacy {
-            let t = TxLegacy {
-                chain_id: Some(chain_id),
-                nonce,
-                gas_price: parse_u128(&tx.gas_price, "gas_price")?,
-                gas_limit,
-                to,
-                value,
-                input,
-            };
-            let sig = signer
-                .sign_hash_sync(&t.signature_hash())
-                .map_err(|e| KeystoreError::Signing(e.to_string()))?;
-            let signed = t.into_signed(sig);
-            TxEnvelope::Legacy(signed).encoded_2718()
-        } else {
-            let t = TxEip1559 {
-                chain_id,
-                nonce,
-                gas_limit,
-                max_fee_per_gas: parse_u128(&tx.max_fee_per_gas, "max_fee_per_gas")?,
-                max_priority_fee_per_gas: parse_u128(&tx.max_priority_fee_per_gas, "max_priority_fee_per_gas")?,
-                to,
-                value,
-                input,
-                access_list: Default::default(),
-            };
-            let sig = signer
-                .sign_hash_sync(&t.signature_hash())
-                .map_err(|e| KeystoreError::Signing(e.to_string()))?;
-            let signed = t.into_signed(sig);
-            TxEnvelope::Eip1559(signed).encoded_2718()
-        };
-
-        Ok(format!("0x{}", hex::encode(raw)))
+    if tx.access_list.as_ref().is_some_and(|v| !v.is_null()) {
+        return Err(KeystoreError::InvalidParams(
+            "tx json: access lists are not supported by this signer — remove `access_list` \
+             rather than have it silently dropped from the signed payload"
+                .into(),
+        ));
     }
 
-    /// Sign a raw 32-byte `digest` with `address`'s key (ECDSA over the hash —
-    /// no EIP-191/EIP-712 prefix). Returns the 65-byte signature hex.
-    ///
-    /// ⚠️ SECURITY: this signs an *opaque* hash. Unlike [`Self::sign_transaction`],
-    /// whose fields a UI can display, the caller fully controls the preimage — and
-    /// a 32-byte digest could be a transaction's `signature_hash`, so anyone able
-    /// to reach an *unlocked* account here could obtain a draining-tx signature.
-    /// Expose it only to trusted in-app modules signing protocol digests (an
-    /// ERC-4337 UserOperation hash or an EIP-7702 authorization hash), never to
-    /// untrusted input. The account must be unlocked (same gate as the others).
-    pub fn sign_digest(&mut self, address: &str, digest_hex: &str) -> Result<String> {
-        let addr = parse_address(address)?;
-        let digest = parse_b256(digest_hex)?;
-        let signer = self
-            .live_signer(&addr)
-            .ok_or_else(|| KeystoreError::Locked(address.to_string()))?;
+    let value = parse_u256(&tx.value, "value")?;
+    let nonce = parse_u64(&tx.nonce, "nonce")?;
+    let gas_limit = parse_u64(&tx.gas_limit, "gas_limit")?;
+    let input = parse_bytes(&tx.data)?;
+
+    let legacy = match tx.fee_mode.trim() {
+        "" | "eip1559" => false,
+        "legacy" => true,
+        other => {
+            return Err(KeystoreError::InvalidParams(format!(
+                "tx json: fee_mode must be \"eip1559\" or \"legacy\", got {other:?}"
+            )))
+        }
+    };
+
+    let raw = if legacy {
+        let t = TxLegacy {
+            chain_id: Some(chain_id),
+            nonce,
+            gas_price: parse_u128(&tx.gas_price, "gas_price")?,
+            gas_limit,
+            to,
+            value,
+            input,
+        };
         let sig = signer
-            .sign_hash_sync(&digest)
+            .sign_hash_sync(&t.signature_hash())
             .map_err(|e| KeystoreError::Signing(e.to_string()))?;
-        Ok(format!("0x{}", hex::encode(sig.as_bytes())))
-    }
+        TxEnvelope::Legacy(t.into_signed(sig)).encoded_2718()
+    } else {
+        let t = TxEip1559 {
+            chain_id,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: parse_u128(&tx.max_fee_per_gas, "max_fee_per_gas")?,
+            max_priority_fee_per_gas: parse_u128(&tx.max_priority_fee_per_gas, "max_priority_fee_per_gas")?,
+            to,
+            value,
+            input,
+            access_list: Default::default(),
+        };
+        let sig = signer
+            .sign_hash_sync(&t.signature_hash())
+            .map_err(|e| KeystoreError::Signing(e.to_string()))?;
+        TxEnvelope::Eip1559(t.into_signed(sig)).encoded_2718()
+    };
+
+    Ok(format!("0x{}", hex::encode(raw)))
+}
+
+/// Sign a raw 32-byte digest (ECDSA over the hash — no EIP-191/712 prefix).
+///
+/// This signs an OPAQUE hash: unlike a transaction, nothing here can be
+/// rendered, so the approval layer must commit to a typed preimage and describe
+/// that instead.
+pub fn sign_digest_with(signer: &PrivateKeySigner, digest_hex: &str) -> Result<String> {
+    let digest = parse_b256(digest_hex)?;
+    let sig = signer
+        .sign_hash_sync(&digest)
+        .map_err(|e| KeystoreError::Signing(e.to_string()))?;
+    Ok(format!("0x{}", hex::encode(sig.as_bytes())))
 }
 
 /// Parse a 32-byte hash hex (`0x`-prefixed or bare) into a `B256`.
@@ -544,7 +519,7 @@ const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 /// bidirectional overrides, and zero-width characters. These are exactly the
 /// characters that let a display say one thing while the signature covers
 /// another.
-fn check_displayable(text: &str, what: &str) -> Result<()> {
+pub(crate) fn check_displayable(text: &str, what: &str) -> Result<()> {
     if text.len() > MAX_MESSAGE_BYTES {
         return Err(KeystoreError::InvalidParams(format!(
             "{what}: {} bytes exceeds the {MAX_MESSAGE_BYTES}-byte limit",
@@ -659,12 +634,26 @@ mod tests {
     // One test per defect fixed in this pass. Each asserts the DANGEROUS
     // behaviour is gone, not merely that the happy path still works.
 
-    /// Build a signed tx for `tx_json`, with the account unlocked.
+    /// Build a signed tx for `tx_json`. There is no unlock step: the key is
+    /// derived from the vault password for this one signature.
     fn sign_with(dir: &std::path::Path, tx_json: &str) -> Result<String> {
-        let mut ks = Keystore::new(dir);
+        let ks = Keystore::new(dir);
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
-        ks.unlock(&addr.to_string(), "pw", None).unwrap();
-        ks.sign_transaction(&addr.to_string(), tx_json, 1)
+        ks.sign_transaction(&addr.to_string(), "pw", tx_json, 1)
+    }
+
+    #[test]
+    fn there_is_no_unlocked_state_to_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let a = ks.import_private_key(ACCT0_PK, "pw").unwrap().to_string();
+
+        // A correct-password signature must not leave anything behind that a
+        // later wrong-password call could spend. Under the old cache, the
+        // second call here succeeded.
+        assert!(ks.sign_message(&a, "pw", "first").is_ok());
+        assert!(ks.sign_message(&a, "wrong", "second").is_err());
+        assert!(ks.sign_message(&a, "pw", "third").is_ok());
     }
 
     #[test]
@@ -750,19 +739,18 @@ mod tests {
     #[test]
     fn sign_message_refuses_text_that_renders_differently_than_it_signs() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ks = Keystore::new(dir.path());
+        let ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
-        ks.unlock(&addr.to_string(), "pw", None).unwrap();
         let a = addr.to_string();
 
         for bad in ["send 1 ETH\u{202E}drow", "zero\u{200B}width", "nul\u{0}byte"] {
-            assert!(ks.sign_message(&a, bad).is_err(), "must refuse {bad:?}");
+            assert!(ks.sign_message(&a, "pw", bad).is_err(), "must refuse {bad:?}");
         }
         // Ordinary text, including newlines, still signs.
-        assert!(ks.sign_message(&a, "hello\nworld").is_ok());
+        assert!(ks.sign_message(&a, "pw", "hello\nworld").is_ok());
         // And an oversize message is refused rather than signed unseen.
         let huge = "a".repeat(MAX_MESSAGE_BYTES + 1);
-        assert!(ks.sign_message(&a, &huge).is_err());
+        assert!(ks.sign_message(&a, "pw", &huge).is_err());
     }
 
     #[test]
@@ -857,27 +845,24 @@ mod tests {
     #[test]
     fn vault_roundtrip_and_listing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ks = Keystore::new(dir.path());
+        let ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
         assert_eq!(addr, ACCT0);
         assert!(ks.has_address(&addr.to_string()));
         assert_eq!(ks.list_accounts(), vec![ACCT0]);
 
-        // wrong password fails, correct password unlocks
-        assert!(ks.unlock(&addr.to_string(), "wrong", None).is_err());
-        ks.unlock(&addr.to_string(), "pw", None).unwrap();
-        assert!(ks.is_unlocked(&addr.to_string()));
-        ks.lock(&addr.to_string());
-        assert!(!ks.is_unlocked(&addr.to_string()));
+        // The vault password is the gate on every signature — there is no
+        // unlocked state to be in.
+        assert!(ks.signer_for(&addr.to_string(), "wrong").is_err());
+        assert_eq!(ks.signer_for(&addr.to_string(), "pw").unwrap().address(), ACCT0);
     }
 
     #[test]
     fn sign_message_recovers_signer() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ks = Keystore::new(dir.path());
+        let ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
-        ks.unlock(&addr.to_string(), "pw", None).unwrap();
-        let sig_hex = ks.sign_message(&addr.to_string(), "hello logos").unwrap();
+        let sig_hex = ks.sign_message(&addr.to_string(), "pw", "hello logos").unwrap();
         let sig: alloy::primitives::Signature =
             sig_hex.strip_prefix("0x").unwrap().parse::<alloy::primitives::Signature>().unwrap();
         let recovered = sig.recover_address_from_msg("hello logos").unwrap();
@@ -885,47 +870,45 @@ mod tests {
     }
 
     #[test]
-    fn locked_account_cannot_sign() {
+    fn a_wrong_password_cannot_sign() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ks = Keystore::new(dir.path());
+        let ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
-        assert!(matches!(ks.sign_message(&addr.to_string(), "x"), Err(KeystoreError::Locked(_))));
+        assert!(ks.sign_message(&addr.to_string(), "wrong", "x").is_err());
     }
 
     #[test]
     fn sign_digest_recovers_signer_from_prehash() {
         use alloy::primitives::b256;
         let dir = tempfile::tempdir().unwrap();
-        let mut ks = Keystore::new(dir.path());
+        let ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
-        ks.unlock(&addr.to_string(), "pw", None).unwrap();
         // A raw 32-byte digest (e.g. an ERC-4337 UserOperation hash) — signed with
         // no prefix, so it recovers via the prehash (not the EIP-191 msg) path.
         let digest = b256!("00000000000000000000000000000000000000000000000000000000deadbeef");
-        let sig_hex = ks.sign_digest(&addr.to_string(), &digest.to_string()).unwrap();
+        let sig_hex = ks.sign_digest(&addr.to_string(), "pw", &digest.to_string()).unwrap();
         let sig: alloy::primitives::Signature =
             sig_hex.strip_prefix("0x").unwrap().parse().unwrap();
         assert_eq!(sig.recover_address_from_prehash(&digest).unwrap(), ACCT0);
         // Bare (no 0x) hex also accepted; wrong length rejected.
-        assert!(ks.sign_digest(&addr.to_string(), &hex::encode(digest)).is_ok());
-        assert!(ks.sign_digest(&addr.to_string(), "0x1234").is_err());
+        assert!(ks.sign_digest(&addr.to_string(), "pw", &hex::encode(digest)).is_ok());
+        assert!(ks.sign_digest(&addr.to_string(), "pw", "0x1234").is_err());
     }
 
     #[test]
-    fn sign_digest_requires_unlock() {
+    fn sign_digest_requires_the_vault_password() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ks = Keystore::new(dir.path());
+        let ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
         let digest = "0x00000000000000000000000000000000000000000000000000000000deadbeef";
-        assert!(matches!(ks.sign_digest(&addr.to_string(), digest), Err(KeystoreError::Locked(_))));
+        assert!(ks.sign_digest(&addr.to_string(), "wrong", digest).is_err());
     }
 
     #[test]
     fn sign_eip1559_recovers_signer() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ks = Keystore::new(dir.path());
+        let ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
-        ks.unlock(&addr.to_string(), "pw", None).unwrap();
         let unsigned = serde_json::json!({
             "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
             "value": "0xde0b6b3a7640000",
@@ -936,7 +919,7 @@ mod tests {
             "fee_mode": "eip1559"
         })
         .to_string();
-        let raw = ks.sign_transaction(&addr.to_string(), &unsigned, 1).unwrap();
+        let raw = ks.sign_transaction(&addr.to_string(), "pw", &unsigned, 1).unwrap();
         assert!(raw.starts_with("0x02")); // typed EIP-1559 envelope
         // decode + recover
         let bytes = hex::decode(raw.strip_prefix("0x").unwrap()).unwrap();
@@ -947,9 +930,8 @@ mod tests {
     #[test]
     fn sign_legacy_recovers_signer() {
         let dir = tempfile::tempdir().unwrap();
-        let mut ks = Keystore::new(dir.path());
+        let ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
-        ks.unlock(&addr.to_string(), "pw", None).unwrap();
         let unsigned = serde_json::json!({
             "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
             "value": "0x1",
@@ -959,7 +941,7 @@ mod tests {
             "fee_mode": "legacy"
         })
         .to_string();
-        let raw = ks.sign_transaction(&addr.to_string(), &unsigned, 1).unwrap();
+        let raw = ks.sign_transaction(&addr.to_string(), "pw", &unsigned, 1).unwrap();
         let bytes = hex::decode(raw.strip_prefix("0x").unwrap()).unwrap();
         let env = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
         assert_eq!(env.recover_signer().unwrap(), ACCT0);
