@@ -434,13 +434,19 @@ by the announced caller, can name anyone, and `authorize()` deliberately refuses
 to name an anchor: `"core"` and `"capability_module"` share one value, so naming a
 module from it would assert an identity that ambiguity forbids.
 
-**The upstream cause of that `"core"` is not settled here.** The module host does
-construct the module's API with its own name
-(`logos-module-loader-qt`, `src/host/module_initializer.cpp:103`,
-`new LogosAPI(moduleName, …)`), so the announced origin contradicts the host code
-and the discrepancy needs an upstream fix rather than a keystore one. What is
-established, and is what this module must be designed against, is the observable:
-**under `logoscore` no caller can currently be named.**
+**The cause of that `"core"`: fixed upstream (Rust SDK).** `logos-rust-sdk`'s
+`src/plugin.rs` hardcoded `CString::new("core")` as the origin when building a
+module's **outbound** client. That is why it never contradicted
+`logos-module-loader-qt`'s `module_initializer.cpp:103` (`new LogosAPI(moduleName, …)`)
+— that line constructs the **provider**-side API, while the outbound client is built
+separately. The SDK has no way to learn its own name at runtime (there is no
+self-name export in the module-impl C ABI, and `set_context`'s `instance_id` is a
+per-instance id that is often absent), so `lidl-gen` now emits `LOGOS_MODULE_NAME`
+from the LIDL contract and latches it into a set-once cell before the install hook;
+unset yields an empty string rather than a guess. **C++ was never affected** —
+`logos_lp_client.h` passes a real origin — which is exactly why the symptom looked
+host-shaped. Measured RED→GREEN: `requestModule for origin: "core"` became
+`requestModule for origin: "<the module's real name>"`, with no `"core"` anywhere.
 
 **What this means in practice, and it is deliberate:**
 
@@ -456,12 +462,12 @@ established, and is what this module must be designed against, is the observable
 * Consequently the end-to-end proof of approved signing must be **hosted in
   Basecamp or standalone**, never in `logoscore`.
 
-**Fixing identity will not, on its own, make Tier B usable — expect a wrong name
-before a right one.** The handshake announces the caller as the bootstrap anchor
-`"core"` (above). Once the mechanism is repaired, `authorize()` finds that name in
-its caller-keyed store and is expected to answer `{"kind":"module","name":"core"}`
-— populated, and wrong — rather than `unknown`. The consequences are asymmetric
-and worth stating before anyone reads a green result as "done":
+**Naming a caller and naming it *correctly* were separate milestones, and the gap
+between them is worth keeping on record.** Before the origin fix, repairing the
+pull alone would have produced `{"kind":"module","name":"core"}` — populated, and
+wrong — rather than `unknown`, because `authorize()` would have found the announced
+anchor name sitting in its caller-keyed store. The consequences were asymmetric,
+and they are the reason this module refuses rather than guesses:
 
 * **Tier A stays safe.** `"core"` is not the configured approver, so it is still
   refused and no signature becomes reachable.
@@ -480,23 +486,36 @@ and worth stating before anyone reads a green result as "done":
   when it was `wallet_backend_module` is a misattribution in the one surface whose
   entire job is to tell the human what they are authorising.
 
-So Tier B must not be treated as usable until the caller is named *correctly*, not
-merely named.
+The rule this leaves behind: a *populated but wrong* identity is worse for this
+module than an absent one, because only the wrong one puts a confident falsehood in
+front of the human. Tier B is usable when the caller is named **correctly**, not
+when it is merely named.
 
-**The upstream mitigation, and what it changes.** A host that spells a bootstrap
-anchor key as a module name should refuse to name it at all. `authorize()` already
-enforces exactly that on the credential store — the anchor-key check lives there —
-but the caller-keyed store offers its key unconditionally, and that is the store
-the origin bug deposits `"core"` into. Applying the same rule to both suppresses
-the name, which fails the `moduleHits == 1 && keyLen > 0` test and falls through to
-**`unknown`**. That is the honest answer: we know we cannot name this caller; we do
-not know it is the host.
+**Both halves are now fixed, and they close different layers.** The origin fix above
+stops a module announcing itself as an anchor. The host-side half applies the
+anchor-key rule to the *caller-keyed* store as well: `authorize()` already enforced
+"an anchor key is never a module name" on the credential store, but the caller-keyed
+store offered its key unconditionally — so anything that ever lands an anchor name
+there gets suppressed, the `moduleHits == 1 && keyLen > 0` test fails, and the
+verdict falls through to `unknown`. `unknown` rather than `host` is the honest
+answer: we know we cannot name this caller, we do not know it is the host. Either
+half alone leaves a gap, so both are load-bearing.
 
-With that in place the observable goes back to `unknown` — but for a different
-reason than today's, and the difference is the whole point. Today's `unknown` means
-*the mechanism could not answer*; the post-fix one means *the mechanism answered
-that this caller cannot be honestly named*. Both refuse, so keystore is fail-closed
-either way, and Tier B is safe to leave unshipped rather than actively wrong.
+**Why that mattered more than misattribution — the escalation this prevented.**
+`"core"` is not merely a wrong name; it is a `bootstrapKeys()` name. On a pre-0.8
+module the provider's `saveToken("core", …)` therefore lands in the **outbound**
+namespace, which is precisely where the credential check reads. An ordinary
+capability-minted pair token thus became the provider's *own credential*, and the
+measured consequences went well past a bad label: the caller reported
+`caller_kind=host` — **a module authorizing as the host** — and the victim module's
+own anchor was destroyed, locking the host itself out of it.
+
+This is what `HostAnchor` being refused at **both** Tier A and Tier B was actually
+protecting against. The stated reason was that the anchor is one undifferentiated
+bag shared with the shells and `core_service`; the sharper reason is that a
+*module* could arrive wearing it. Tier A held throughout regardless — `"core"` is
+not the configured approver — so no signature was ever reachable, but "refuses
+everyone" was doing more work than it appeared to.
 
 The generalisable rule worth stating, because it is what keeps this fixed: **a
 store may only name a caller with a key it alone can write.** Ordinary module names
