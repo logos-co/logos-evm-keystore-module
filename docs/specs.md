@@ -532,6 +532,68 @@ store may only name a caller with a key it alone can write.** Ordinary module na
 have that property in the caller-keyed store; anchor keys do not, because another
 writer puts them there with another meaning.
 
+### The gate's premise is violable by any loaded module — and what survives
+
+This module was built on an explicit scope decision: **caller identity as delivered
+by the platform is treated as authoritative**, and validating that a token holder is
+who it claims is `capability_module`'s job, not the keystore's. That decision stands.
+What follows is the precise, measured statement of what it costs, so nobody reads the
+tier table as a stronger guarantee than it is.
+
+`capability_module.requestModule(fromModuleName, moduleName)` takes the requesting
+identity as a **plain argument**. Its only check is that the asserted name is one the
+image holds a token for — the source says so directly: *"fail closed on an unknown
+name rather than mint a token for a self-asserted identity that was never loaded"*
+(`capability_module_impl.cpp:65-93`). It verifies the name **is loaded**, not that the
+caller **is** it. The per-target `m_restrictions` allowlist does not help either: it
+is consulted against the same self-asserted name.
+
+Measured on shipped tooling, no harness: a request naming an arbitrary origin mints a
+token and the victim records it under that name —
+
+```
+$ logoscore call capability_module requestModule core caller_probe
+{"result":"b4b5632a-…","status":"ok"}
+[caller_probe] ModuleProxy: Token saved for module: "core"
+```
+
+Substitute `signer_ui` for `core` and any loaded module can present a token this
+keystore will name `signer_ui`, i.e. **reach Tier A**. Every primitive needed is
+ordinary public SDK surface.
+
+**What that gets an attacker, and what it does not:**
+
+* **It does NOT get a signature.** `approve()` requires the **vault password**, which
+  exists only in the human's head and in `signer_ui`'s hands for the duration of one
+  call. Impersonating the approver does not produce one.
+* **It cannot redirect a human's approval onto another payload.** `approve()` is
+  refused unless the handle is the one currently `Rendered` *and* the echoed
+  `bundle_id` matches what was displayed. An attacker who demotes the human's render
+  by acknowledging something else causes the human's `approve()` to be **refused**,
+  not misapplied.
+* **It cannot collect someone else's signatures.** `fetch_result`/`ack_result`
+  authorise on the per-request **receipt**, which is returned exactly once to the
+  requester that asked — not on the caller name.
+* **It does get intent disclosure.** `acknowledge()` returns `render_lines` and the
+  requester for a pending request, so an impersonator learns what the user is about
+  to sign — amounts, addresses, calldata.
+* **It does get denial of service.** `reject()` on any pending request, and repeated
+  `acknowledge()` to demote whatever the human is looking at, so approvals fail.
+
+So the design **degrades to disclosure and denial of service, not to unauthorised
+signing**, and it does so because of choices that do not depend on identity at all:
+per-approval password derivation with no cached signer, the `bundle_id` echo, the
+single-`Rendered` rule, and receipt-based collection. That is the property worth
+keeping — the tier gate is the part that rests on a premise the platform does not yet
+enforce, and it is deliberately *not* the only thing standing between a hostile module
+and a signature.
+
+**Closing it is one upstream change**, named here rather than worked around:
+`requestModule` deriving the requester from the platform's own caller identity instead
+of the `fromModuleName` argument. Until then, treat Tier A as *"the operator
+designated this package as the approver"*, never as *"only that package can reach
+this"*.
+
 **A "correctly refused" result on such a host proves less than it looks like.** It
 evidences that identity was *absent*, not that the authorization path is sound —
 those are different claims, and only the first is established here. (Work on
