@@ -154,7 +154,7 @@ sequenceDiagram
     SU->>KS: approve(handle, bundle_id, password)
     KS->>DISK: decrypt vault (scrypt) → signer (a local)
     Note right of KS: re-parse intent, re-derive commitment,<br/>compare to bundle_id, sign every leg, ZEROIZE
-    KS-->>SU: { ok, signed: [...] }
+    KS-->>SU: { ok, signed_count: n }   %% a COUNT — the approver never gets the signatures
     KS--)BE: event approval_settled(handle, "approved")
 
     BE->>KS: fetch_result(handle, receipt)
@@ -219,7 +219,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `cancel_approval` | `handle, receipt: String` | `bool` | no |
 | `pending` | — | `{ ok, pending: [..] }` | no |
 | `acknowledge` | `handle: String` | `{ ok, bundle_id, requester, render_lines }` | no |
-| `approve` | `handle, bundle_id, password: String` | `{ ok, signed: [..] }` | no |
+| `approve` | `handle, bundle_id, password: String` | `{ ok, signed_count: n }` | no |
 | `reject` | `handle: String` | `bool` | no |
 | `caller_identity` | — | `{ ok, kind, identity, approver }` | no |
 
@@ -712,7 +712,14 @@ a mismatch is refused. The intent is **re-parsed and the commitment re-derived
 inside this call** before anything is signed, so what is signed is what was
 committed to.
 
-One key derivation, every leg signed, then wiped → `{ ok, signed: [...] }`.
+One key derivation, every leg signed, then wiped → `{ ok, signed_count: n }`.
+
+**The approver never receives what it authorised.** `approve()` answers with a
+**count**, not the signatures. Only the requester can collect those, and only
+with the receipt it was handed at request time — so a compromised approver can
+cause a signature to exist but cannot walk away with it. That is also why this
+field is named differently from `fetch_result`'s `signed` array: the two must
+never be mistaken for one another.
 
 **At most once per handle:** a second `approve` for a handle that has left
 `Rendered` returns the recorded outcome and never re-signs. Because a scrypt

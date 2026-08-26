@@ -311,7 +311,9 @@ impl KeystoreModule for KeystoreModuleImpl {
             return not_authorized();
         }
         match self.approvals.fetch_result(&handle, &receipt) {
-            Ok(results) => json!({ "ok": true, "results": results }).to_string(),
+            // `signed`, matching the documented contract and `approve`'s count
+            // field name-for-meaning: this is the array the requester collects.
+            Ok(results) => json!({ "ok": true, "signed": results }).to_string(),
             Err(_) => not_authorized(),
         }
     }
@@ -371,7 +373,12 @@ impl KeystoreModule for KeystoreModuleImpl {
         match out {
             Ok(n) => {
                 emit_approval_settled(&handle, "approved");
-                json!({ "ok": true, "signed": n }).to_string()
+                // A COUNT, not the signatures. The approver authorises a
+                // bundle; it never receives what it authorised. Only the
+                // requester can collect that, and only with the receipt it was
+                // handed at request time. Distinct key from fetch_result's
+                // `signed` array so the two can never be confused.
+                json!({ "ok": true, "signed_count": n }).to_string()
             }
             // Deliberately coarse: a wrong password, an unknown handle and a
             // stale commitment must not be distinguishable to a caller probing
