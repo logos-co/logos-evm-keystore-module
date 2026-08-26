@@ -480,6 +480,29 @@ Three properties matter here, and all three hold:
   `informModuleTokenTo(…, /*moduleName=*/callerName, …)`. `fromModuleName` appears
   nowhere in the binding path.
 
+**Why it is closed in principle, not merely in this code path.** Ignoring the argument
+would be worth little if an attacker could instead poison the map the name is recovered
+from. It cannot. To be named `Y`, attacker `X` would have to make the naming scan match
+`X`'s presented token against key `Y` — and that caller-keyed map has exactly two
+writers: the host, which files each module's root token under its real name
+(`module_manager.cpp:226`, whose comment states the purpose: *"capability stores
+(name, token) so authorize can name the caller from the presented token rather than from
+a self-asserted fromModuleName"*), and `capability_module` itself. Writing to it via
+`informModuleToken` is gated on the **target's own credential**
+(`module_proxy.cpp:413-421`), which no API hands out — `requestModule` returns a fresh
+UUID, never the target's token. And the anchor role labels are masked out of the naming
+fold (`module_proxy.cpp:332-337`, `out.fold.offer(match & ~isAnchor, …)`), so a caller
+filed under `core`/`capability_module` resolves to `Unknown` and is refused rather than
+being spelled as a module.
+
+The fail-closed behaviour is pinned by tests, and was contested during development:
+`requestModule_rejects_unnamed_caller` asserts an empty result even when
+`fromModuleName` names a seeded, loaded module, and
+`requestModule_denies_spoofed_fromModuleName` covers the spoof directly. A commit that
+added *"fall back when mocks/old hosts omit the caller"* was **reverted** in favour of
+simulating identity in the test harness — which is the right call, and exactly the
+fallback that would have re-opened this.
+
 Confirmed live — the mechanism firing, verbatim from the daemon log:
 
 ```
