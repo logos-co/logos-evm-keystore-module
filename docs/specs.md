@@ -521,6 +521,56 @@ complement for deployments that want to bound the requester set. Operators who w
 both should register the requester set as the restriction and leave the approver
 distinction to the tier gate.
 
+### What identity still does not guarantee
+
+Identity being live changes what the gate can *do*; it does not make the name a
+cryptographic fact. Five residuals, each of which bounds a claim this document makes.
+
+**1. The name is *token-bound*, not verified.** `logos_caller_scope.h` says so in its
+own words — token-bound is *"the strongest honest word … chosen over 'verified' or
+'authenticated' deliberately"*, because the name is the key under which **this module**
+recorded the token the caller presented. It is exactly as strong as that recording. It
+is not a signature, and nothing here should be read as authentication.
+
+**2. Only the QtRO path yields a caller at all.** Identity is resolved from the
+meta-object dispatch. `plain` tcp / tcp_ssl operator tokens carry no name (the validator
+returns a bool), and in-process paths do not go through the proxy. Because
+`requestModule` now **fails closed** on an unnamed dispatch, a deployment on those
+transports does not degrade to a weaker check — it stops working. That is the right
+direction for a signer, but it is a deployment constraint, not a detail: **this module
+requires the QtRO transport to be usable at all.**
+
+**3. Same-process impersonation is not closed, and this is the one that matters here.**
+`TokenManager::isolateIdentity` is idempotent and `LogosAPI::forIdentity` hands back the
+*same* store for an already-isolated name, so native code running inside the host
+process can obtain another plugin's identity. In Basecamp every `ui_qml` plugin — this
+module's approver among them — lives in **one process**. So the Tier A boundary is a
+**code-authority boundary enforced by a name, not a process boundary**: it holds against
+another *module* (which is a separate process), and it does not hold against hostile
+**native code already inside the shell**. An attacker who has that has already won more
+than this gate was defending.
+
+**4. A lying `fromModuleName` is warned about, not refused.** `capability_module` logs
+*"ignoring leftover fromModuleName=…"* and proceeds. The binding is unaffected — that is
+what matters — but there is no counter and no event, so an operator cannot observe
+attempts programmatically. Worth a metric upstream.
+
+**5. `registerRestriction` was not converted.** It still authenticates by a
+self-presented `authToken` compared against the trust-root tokens rather than by
+`currentCaller()`. That is a *secret*, not a name, so it is a different class from the
+hole that was closed — but it means the policy-writing path did not move with the
+policy-checking path.
+
+One quieter failure mode is worth knowing because it is *not* the one that was fixed:
+the `Q_INVOKABLE currentCallerJson` **declaration** is unguarded while its **body** is
+`#if`-guarded on protocol ≥ 0.6. Under a sub-0.6 protocol the old symptom would not
+reappear as `No such method` — `invokeMethod` would succeed and return an **empty
+string**, which collapses to `unknown`. The loud failure is the one that has been fixed;
+a silent one remains reachable on an old protocol. And the check that would catch it
+(`caller-invokable`, the only one that actually calls `invokeMethod` by name against a
+real `LogosAPI`) is exposed as a flake check but is **not wired into CI**, so the
+property is not continuously verified.
+
 ### What the gate does and does not guarantee
 
 With identity live and impersonation closed, Tier A means what it is meant to mean: the
