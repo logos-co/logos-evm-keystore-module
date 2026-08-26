@@ -410,232 +410,143 @@ Every request is classified by the **caller identity** the platform reports
 Tiers A and B both return the identical string `{"ok":false,"error":"not authorized"}`
 on refusal, so a caller cannot use the error text to probe which tier it failed.
 
-### Caller identity — and which hosts can actually supply it
+### Caller identity — live, and what it reports
 
-The caller is populated by a `logos::CallerScope` opened around the inbound
-dispatch. The callee names it by finding the presented token in
-`ModuleProxy::m_tokens` — its **caller-keyed inbound record**, written by
-`informModuleToken`. That is the only store that can honestly name anyone;
-`m_store` is direction-mixed and contributes no name, and a validator-accepted
-operator token carries none at all.
-
-**Under `logoscore` today, nothing can be named — not even a module.** Measured
-against a live daemon at protocol 0.6.0 with a purpose-built probe module:
+Caller identity **works**. Measured 2026-08-26 against a `logoscore` daemon built from
+master, with `keystore_module` and a purpose-built `caller_probe` module:
 
 | call | `caller_identity()` reports |
 |------|------------------------------|
-| `logosctl` → keystore | `unknown` |
-| **probe module → keystore** (real module plane) | **`unknown`** |
+| `logosctl` → keystore | `{"kind":"host","identity":""}` |
+| `logosctl` → probe (`current_caller()` directly) | `HostAnchor` |
+| **probe module → keystore** (real module plane) | **`{"kind":"module","identity":"caller_probe"}`** |
+| **probe → keystore `request_approval`** (Tier B) | **`{"ok":true,"handle":"ksh_…","receipt":"ksc_…"}`** |
 
-Unchanged by `--access-policy enforce`. What the verbose handshake shows is that
-the capability exchange announces `requestModule for origin: "core"` — the
-bootstrap anchor — rather than `caller_probe`. Only `ModuleProxy::m_tokens`, keyed
-by the announced caller, can name anyone, and `authorize()` deliberately refuses
-to name an anchor: `"core"` and `"capability_module"` share one value, so naming a
-module from it would assert an identity that ambiguity forbids.
+Row 3 is the positive path: a named module is named correctly. Row 4 is the **first
+end-to-end proof that the tier gate admits a legitimate caller** rather than merely
+refusing everyone.
 
-**The cause of that `"core"`: fixed upstream (Rust SDK).** `logos-rust-sdk`'s
-`src/plugin.rs` hardcoded `CString::new("core")` as the origin when building a
-module's **outbound** client. That is why it never contradicted
-`logos-module-loader-qt`'s `module_initializer.cpp:103` (`new LogosAPI(moduleName, …)`)
-— that line constructs the **provider**-side API, while the outbound client is built
-separately. The SDK has no way to learn its own name at runtime (there is no
-self-name export in the module-impl C ABI, and `set_context`'s `instance_id` is a
-per-instance id that is often absent), so `lidl-gen` now emits `LOGOS_MODULE_NAME`
-from the LIDL contract and latches it into a set-once cell before the install hook;
-unset yields an empty string rather than a guess. **C++ was never affected** —
-`logos_lp_client.h` passes a real origin — which is exactly why the symptom looked
-host-shaped. Measured RED→GREEN: `requestModule for origin: "core"` became
-`requestModule for origin: "<the module's real name>"`, with no `"core"` anywhere.
+The host now carries the accessor the plugin pulls (`currentCallerJson` present in
+`logos_host_qt`, and exactly **one** `logos-qt-host` in the closure), and the
+`No such method LogosAPI::currentCallerJson` warning that used to fire on every
+dispatch is **gone**. Three defects had to be fixed for this, in this order — the
+sequencing is worth keeping because it looked like unrelated work:
 
-**What this means in practice, and it is deliberate:**
+1. **qt-host provenance.** `logos-qt-sdk` exported the `logos-qt-host` it was itself
+   built against — by propagation, by a baked absolute-store-path `HINTS`, and by
+   forwarding headers containing literal `#include "/nix/store/…"`. So the module host
+   linked a stale `LogosAPI` with no `Q_INVOKABLE currentCallerJson`, the plugin's
+   cross-image `invokeMethod` failed, and the pushed caller document was empty.
+2. **The announced origin.** `logos-rust-sdk` hardcoded `"core"` as the origin of a
+   module's *outbound* client. `lidl-gen` now emits `LOGOS_MODULE_NAME` from the
+   contract and latches it before the install hook. (C++ was never affected.)
+3. **Naming the anchor.** `authorize()` enforced "an anchor key is never a module name"
+   on the credential store but not on the caller-keyed one, so `"core"` arriving there
+   would have been spelled as a module.
 
-* The gate is **fail-closed**. Where identity is unavailable, Tiers A and B refuse
-  *everyone* rather than admitting anyone. `{"ok":false,"error":"not authorized"}`
-  is the correct answer to an unnameable caller, not a bug.
-* **The CLI can never approve a signature**, on any host. `logosctl`'s relayed
-  operator token is one undifferentiated bag shared with the shells and
-  `core_service`; admitting it at Tier A would make the human bypassable by anyone
-  who can reach the daemon socket.
-* **Tier C is unaffected**, so account management still works headlessly under
-  `logoscore`.
-* Consequently the end-to-end proof of approved signing must be **hosted in
-  Basecamp or standalone**, never in `logoscore`.
+**`HostAnchor` is refused at Tier A and Tier B, and that is deliberate.** The CLI now
+reports honestly as the host rather than as `unknown`, and is still refused — which is
+the intended property, not a gap. The rule does not depend on any past defect:
+`"core"` and `"capability_module"` hold **one token value under two keys**, so nothing
+presenting it is distinguishable from anything else presenting it. **A tier admitting
+`HostAnchor` admits an unbounded set, not a trusted party.** It must not be relaxed on
+the reasoning that "the host is trusted anyway".
 
-**Naming a caller and naming it *correctly* were separate milestones, and the gap
-between them is worth keeping on record.** Before the origin fix, repairing the
-pull alone would have produced `{"kind":"module","name":"core"}` — populated, and
-wrong — rather than `unknown`, because `authorize()` would have found the announced
-anchor name sitting in its caller-keyed store. The consequences were asymmetric,
-and they are the reason this module refuses rather than guesses:
+### Impersonation of the approver: closed upstream
 
-* **Tier A stays safe.** `"core"` is not the configured approver, so it is still
-  refused and no signature becomes reachable.
-* **Result collection stays safe, and this is why the blast radius is bounded.**
-  `fetch_result` / `ack_result` authorise on the **receipt**, not on the caller
-  name. That single choice is what keeps a misattributed identity a problem of
-  *attribution* rather than one of *collection*: requesters that collapse into one
-  name still cannot fetch each other's signatures, because the receipt is returned
-  exactly once to the requester that asked. Had collection been authorised by
-  caller name, the same bug would have let any module collect any other's signed
-  payloads.
-* **Tier B becomes wrongly permissive.** Every requester collapses into one
-  identity: `MAX_PENDING_PER_REQUESTER` stops being per-requester, and — the part
-  that matters — `acknowledge()` reports `requester` into the render lines, so **the
-  human is shown the wrong requester**. A prompt that says *requested by `core`*
-  when it was `wallet_backend_module` is a misattribution in the one surface whose
-  entire job is to tell the human what they are authorising.
-
-The rule this leaves behind: a *populated but wrong* identity is worse for this
-module than an absent one, because only the wrong one puts a confident falsehood in
-front of the human. Tier B is usable when the caller is named **correctly**, not
-when it is merely named.
-
-**Both halves are now fixed, and they close different layers.** The origin fix above
-stops a module announcing itself as an anchor. The host-side half applies the
-anchor-key rule to the *caller-keyed* store as well: `authorize()` already enforced
-"an anchor key is never a module name" on the credential store, but the caller-keyed
-store offered its key unconditionally — so anything that ever lands an anchor name
-there gets suppressed, the `moduleHits == 1 && keyLen > 0` test fails, and the
-verdict falls through to `unknown`. `unknown` rather than `host` is the honest
-answer: we know we cannot name this caller, we do not know it is the host. Either
-half alone leaves a gap, so both are load-bearing.
-
-**Why that mattered more than misattribution — the escalation this prevented.**
-`"core"` is not merely a wrong name; it is a `bootstrapKeys()` name. On a pre-0.8
-module the provider's `saveToken("core", …)` therefore lands in the **outbound**
-namespace, which is precisely where the credential check reads. An ordinary
-capability-minted pair token thus became the provider's *own credential*, and the
-measured consequences went well past a bad label: the caller reported
-`caller_kind=host` — **a module authorizing as the host** — and the victim module's
-own anchor was destroyed, locking the host itself out of it.
-
-This is what `HostAnchor` being refused at **both** Tier A and Tier B was actually
-protecting against. Tier A held throughout regardless — `"core"` is not the
-configured approver — so no signature was ever reachable, but "refuses everyone"
-was doing more work than it appeared to.
-
-**The rule, stated so it does not decay into a mitigation.** `HostAnchor` is
-refused at every gated tier not because the historical bug existed, and not merely
-because the anchor is a bag shared with the shells and `core_service`, but because
-**the anchor is not an identity at all.** `core` and `capability_module` share one
-token *value*, so nothing presenting it can be distinguished from anything else
-presenting it — including a module that came by it legitimately. `authorize()`
-already encodes this by refusing to name an anchor. **A tier that admits
-`HostAnchor` is admitting an unbounded set, not a trusted party.** That holds
-whether or not any module currently claims `core`, which is what makes it a
-standing rule rather than a fix for a defect that has since been repaired — and
-why it must not be relaxed on the reasoning that "the host is trusted anyway".
-
-The generalisable rule worth stating, because it is what keeps this fixed: **a
-store may only name a caller with a key it alone can write.** Ordinary module names
-have that property in the caller-keyed store; anchor keys do not, because another
-writer puts them there with another meaning.
-
-### The gate's premise is violable by any loaded module — and what survives
-
-This module was built on an explicit scope decision: **caller identity as delivered
-by the platform is treated as authoritative**, and validating that a token holder is
-who it claims is `capability_module`'s job, not the keystore's. That decision stands.
-What follows is the precise, measured statement of what it costs, so nobody reads the
-tier table as a stronger guarantee than it is.
-
-`capability_module.requestModule(fromModuleName, moduleName)` takes the requesting
-identity as a **plain argument**. Its only check is that the asserted name is one the
-image holds a token for — the source says so directly: *"fail closed on an unknown
-name rather than mint a token for a self-asserted identity that was never loaded"*
-(`capability_module_impl.cpp:65-93`). It verifies the name **is loaded**, not that the
-caller **is** it. Be precise about what it *does* provide: a gate on **existence**,
-not on identity — a name that was never loaded is refused, so a reserved or invented
-namespace cannot be forged. What is not checked is the only thing that would matter
-here.
-
-**`--access-policy enforce` is not a mitigation, and this is the trap.** The natural
-first response to everything below is "turn the access policy on". It does not work.
-The policy arm filters on the *same self-asserted argument*
-(`capability_module_plugin.cpp:99-100`):
+An earlier revision of this document recorded a live exposure: any loaded module could
+reach Tier A by naming `signer_ui`, because `capability_module.requestModule` took the
+requesting identity as a **plain argument** and checked only that the name was loaded.
+**That is fixed** (`capability_module_impl.cpp:77-92`):
 
 ```cpp
-if (auto it = m_restrictions.constFind(moduleName); it != m_restrictions.constEnd()) {
-    if (!it->contains(fromModuleName)) { … return {}; }
+const logos::LogosCaller caller = logos::currentCaller();
+std::string callerName;
+if (caller.isHost())                                    callerName = "core";
+else if (caller.isModule() && !caller.name.empty())     callerName = caller.name;
+else { /* unnamed / unknown / derived / operator -> REFUSE */ return {}; }
+if (!fromModuleName.empty() && fromModuleName != callerName) {
+    warn("ignoring leftover fromModuleName='%s' (token-bound caller is '%s')", …);
 }
 ```
 
-A module that asserts the name of an **allowed** caller passes the allowlist. So a
-fully populated policy under `enforce` provides no protection against any loaded
-module, because the input it filters on is chosen by the requester. The `TODO` there
-documents the fail-**open** case when the restriction map is empty; this — the
-populated case failing open to anyone who names an allowed caller — is documented
-nowhere else, so it is easy to deploy `enforce` and believe it closed this.
+Three properties matter here, and all three hold:
 
-Measured on shipped tooling, no harness: a request naming an arbitrary origin mints a
-token and the victim records it under that name —
+* The identity comes from the platform's caller document, **not** the argument. The
+  argument is dead ABI — it survives only to be warned about.
+* It **fails closed** when there is no named caller. A fallback to the argument on an
+  unnameable dispatch would have re-opened the hole entirely; there is none.
+* The **binding** uses the derived name: the token is delivered as
+  `informModuleTokenTo(…, /*moduleName=*/callerName, …)`. `fromModuleName` appears
+  nowhere in the binding path.
+
+Confirmed live — the mechanism firing, verbatim from the daemon log:
 
 ```
-$ logoscore call capability_module requestModule core caller_probe
-{"result":"b4b5632a-…","status":"ok"}
-[caller_probe] ModuleProxy: Token saved for module: "core"
+[capability_module] ignoring leftover fromModuleName='signer_ui' (token-bound caller is 'core')
 ```
 
-Substitute `signer_ui` for `core` and any loaded module can present a token this
-keystore will name `signer_ui`, i.e. **reach Tier A**. Every primitive needed is
-ordinary public SDK surface.
+That is a `logosctl` request to be minted as `signer_ui`, overridden to the CLI's real
+token-bound identity. Measured in two composing halves: a module's `currentCaller()` is
+its own name (row 3 above), and `requestModule` binds to `currentCaller()`, not to its
+argument (source, all paths). A forged argument therefore cannot change the binding.
 
-**What that gets an attacker, and what it does not:**
+### The access policy is now a real control — with one residual gap
 
-* **It does NOT get a signature.** `approve()` requires the **vault password**, which
-  exists only in the human's head and in `signer_ui`'s hands for the duration of one
-  call. Impersonating the approver does not produce one.
-* **It cannot redirect a human's approval onto another payload.** `approve()` is
-  refused unless the handle is the one currently `Rendered` *and* the echoed
-  `bundle_id` matches what was displayed. An attacker who demotes the human's render
-  by acknowledging something else causes the human's `approve()` to be **refused**,
-  not misapplied.
-* **It cannot collect someone else's signatures.** `fetch_result`/`ack_result`
-  authorise on the per-request **receipt**, which is returned exactly once to the
-  requester that asked — not on the caller name.
-* **It does get intent disclosure.** `acknowledge()` returns `render_lines` and the
-  requester for a pending request, so an impersonator learns what the user is about
-  to sign — amounts, addresses, calldata.
-* **It does get denial of service.** `reject()` on any pending request, and repeated
-  `acknowledge()` to demote whatever the human is looking at, so approvals fail.
+A previous revision of this document said `--access-policy enforce` was **not** a
+mitigation, because the policy arm filtered the same self-asserted name. **That is no
+longer true** and the correction matters: the allowlist is now consulted against the
+derived `callerName`:
 
-So the design **degrades to disclosure and denial of service, not to unauthorised
-signing**, and it does so because of choices that do not depend on identity at all:
-per-approval password derivation with no cached signer, the `bundle_id` echo, the
-single-`Rendered` rule, and receipt-based collection. That is the property worth
-keeping — the tier gate is the part that rests on a premise the platform does not yet
-enforce, and it is deliberately *not* the only thing standing between a hostile module
-and a signature.
+```cpp
+auto it = m_restrictions.find(moduleName);
+if (it != m_restrictions.end() && it->second.count(callerName) == 0) { /* deny */ }
+```
 
-**Closing it is one upstream change**, named here rather than worked around:
-`requestModule` deriving the requester from the platform's own caller identity instead
-of the `fromModuleName` argument.
+The residual gap is documented in the code and is a rollout decision, not an oversight:
 
-That change has a hard prerequisite, which is worth stating because it reorders what
-looks like unrelated work: `currentCaller()` answers `unknown` on **every host in the
-fleet today** (see above), so `requestModule` has nothing trustworthy to switch to
-yet. The chain is **qt-host provenance → caller identity live fleet-wide →
-`requestModule` stops trusting its argument.** The qt-host defect is therefore not
-merely a broken feature; it is the thing gating a real authorization improvement.
+> `TODO(access-policy): still fail-OPEN — a target with no registered restriction is
+> unrestricted. Intentional for back-compat during rollout.`
 
-Until that lands, treat Tier A as *"the operator designated this package as the
-approver"*, never as *"only that package can reach this"* — and rank **intent
-disclosure** first among what remains, since `acknowledge()` returns `render_lines`
-with no password and no race.
+So a policy that is *registered* is now enforced against a real identity; a target with
+**no** policy remains reachable by any named module.
 
-**A "correctly refused" result on such a host proves less than it looks like.** It
-evidences that identity was *absent*, not that the authorization path is sound —
-those are different claims, and only the first is established here. (Work on
-`logos-protocol#72`, which splits the token store into direction-pure
-inbound/outbound/credential halves, reports that an old-host + old-module pairing
-authorizes *wrongly* — the same store confusion this section describes from the
-naming side, seen from the access side.) Read refusals here as "identity is
-missing", never as "the gate was tested".
+**Why keystore does not simply register one.** `registerRestriction` is **per-target,
+not per-method**. This module deliberately needs a *wide* Tier B (any named module may
+*request*) and a *narrow* Tier A (exactly one may *approve*). A blanket allowlist
+naming only `signer_ui` would lock out every legitimate requester —
+`wallet_backend_module` among them. So the tier gate inside this module stays the
+mechanism that separates asking from approving, and the access policy is a coarse
+complement for deployments that want to bound the requester set. Operators who want
+both should register the requester set as the restriction and leave the approver
+distinction to the tier gate.
 
-Use `caller_identity()` to see what this module currently observes. It is ungated
-and side-effect-free on purpose: an identity mechanism must not be able to report
-its own absence only to the party it would refuse.
+### What the gate does and does not guarantee
+
+With identity live and impersonation closed, Tier A means what it is meant to mean: the
+caller *is* the configured approver package. Two limits remain worth stating plainly.
+
+**`module:signer_ui` names a plugin package, not a human.** A `ui_qml` plugin's QML view
+and its `ui-host` backend are one identity by design, and this module cannot distinguish
+them — it must not pretend to. What the entry asserts is that *the operator designated
+this package as the code permitted to approve*. It does not assert that a human saw
+anything, and no token check can make it. (This design routes **all** keystore calls
+through the backend, so it is the backend's identity that is checked.)
+
+**Defence in depth is not resting on identity alone**, and this was tested rather than
+asserted. While the impersonation hole was open, the design degraded to *intent
+disclosure and denial of service* — never to unauthorised signing — because the
+properties that stop signing do not depend on who the caller is:
+
+* `approve()` requires the **vault password**, and no signer is cached; impersonating
+  the approver does not produce one.
+* The single-`Rendered` rule plus the echoed `bundle_id` mean demoting the human's
+  render makes their `approve()` **fail**, not misapply.
+* `fetch_result`/`ack_result` authorise on the per-request **receipt**, so requesters
+  cannot collect each other's signatures even if they share a name.
+
+Those choices are why a premise failure cost confidentiality and availability rather
+than integrity, and they should survive any future change to how identity is delivered.
 
 ### Lifecycle
 
@@ -916,7 +827,7 @@ logosctl module show keystore_module        # note: no unlock/sign_* methods exi
 logosctl call keystore_module create_mnemonic 12
 logosctl call keystore_module import_private_key <privkey> pw   # → {address}
 logosctl call keystore_module list_accounts
-logosctl call keystore_module caller_identity          # → {"kind":"unknown", ...}
+logosctl call keystore_module caller_identity          # → {"kind":"host", ...}
 
 # Tier A and Tier B are UNREACHABLE from the CLI, by design:
 logosctl call keystore_module pending                  # → {"ok":false,"error":"not authorized"}
@@ -941,14 +852,21 @@ Foundry's canonical test mnemonic / account 0
 * `import_private_key` returns the expected address (`f39Fd6e51aad…`), proving the
   key stayed inside while only the address came out;
 * `list_accounts` then contains that address;
+* `caller_identity` reports `"kind":"host"` — the CLI is the host anchor, named
+  honestly;
 * every Tier A / Tier B method refuses the CLI with the identical
-  `{"ok":false,"error":"not authorized"}` — the fail-closed property, asserted
-  rather than assumed.
+  `{"ok":false,"error":"not authorized"}` — asserted rather than assumed, and now
+  for the *right* reason: the caller is named and is not admitted, rather than
+  unnameable.
 
-Signing itself cannot be exercised from `logosctl` (that is the point). The
-end-to-end request → acknowledge → approve → broadcast proof is a **Basecamp**
-doctest, because only a host that assigns per-plugin identity via
-`LogosAPI::forIdentity` can name the approver.
+Signing cannot be exercised from `logosctl` — that is the point, and it is the
+property to guard. The **Tier B** half of the positive path is now reachable
+headlessly, since a named module calling `request_approval` is admitted and gets a
+handle and receipt (measured). The **Tier A** half still needs a real approver
+plugin, so the full request → acknowledge → approve → broadcast proof remains a
+**Basecamp** doctest — not because `logoscore` cannot name callers (it can), but
+because `approve()` requires a human at a rendered surface, and `ui-host` is a
+`QCoreApplication` that cannot face one.
 
 The CI workflow resolves the commit under test and passes
 `--release-for logos-evm-keystore-module=<sha>` so the spec's `{release}`
@@ -1058,10 +976,12 @@ This module is the wallet's **secret-holding boundary**. Its security properties
    for legacy, the `chainId` field for EIP-1559), so a signed tx cannot be replayed
    on another chain. The chain is also shown to the human on its own render line.
 
-8. **The gate fails closed.** Where the host cannot name a caller, Tiers A and B
-   refuse *everyone*. This is why the module is safe to run under `logoscore` even
-   though identity is unavailable there: the failure mode is "nothing can be
-   signed", never "anyone can sign".
+8. **The gate fails closed, and that was load-bearing while it had to be.** Where a
+   caller cannot be named, Tiers A and B refuse *everyone* — the failure mode is
+   "nothing can be signed", never "anyone can sign". Identity is live now, so the
+   gate admits legitimate callers rather than refusing all of them; the fail-closed
+   direction stays because it is what makes a future regression in the identity path
+   an availability problem instead of a signing one.
 
 ---
 
