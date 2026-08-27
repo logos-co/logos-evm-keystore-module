@@ -47,6 +47,15 @@ jobs:
         with:
           attic-token-ci: ${{ secrets.ATTIC_TOKEN_CI }}
           attic-token-public: ${{ secrets.ATTIC_TOKEN_PUBLIC }}
+          # Keep READING the old Cachix while the Attic caches fill up. The
+          # rust crate derivations this build needs are in Cachix and in no
+          # other cache -- so dropping it outright did not just cost cache
+          # hits, it turned "substitute a prebuilt path" into "build it from
+          # source", which fails. Credential-free: the cache is public, and
+          # nothing publishes here any more. Remove once Attic has the paths.
+          extra-nix-config: |
+            extra-substituters = https://logos-co.cachix.org
+            extra-trusted-public-keys = logos-co.cachix.org-1:12K8609ho1pCt0erUQrOrs/KmOuhWq/EhVwhzQRb35E=
 
       # The commit under test. For PRs it's the head commit (so the spec's
       # `{release}` placeholder resolves to THIS PR's code, not main). Fork PRs
