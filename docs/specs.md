@@ -405,10 +405,22 @@ Every request is classified by the **caller identity** the platform reports
 |------|---------|--------|
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | the configured **approver only** (default `signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
-| **C** | account management (`create_mnemonic` … `delete_account`) | ungated / password-gated |
+| **C** | reads: `list_accounts`, `has_address`, `caller_identity` | ungated |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `new_account`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account` | the configured **custodian only** (default `keystore_ui`) |
 
-Tiers A and B both return the identical string `{"ok":false,"error":"not authorized"}`
+Tiers A, B and D all return the identical string `{"ok":false,"error":"not authorized"}`
 on refusal, so a caller cannot use the error text to probe which tier it failed.
+`delete_account` returns a bare `false`, which is what it already returned for a wrong
+password — a refusal is indistinguishable from a failure there by construction.
+
+The Tier D gate runs **before the arguments are parsed**, and every secret a refused call
+carried — a mnemonic, a private key, a vault JSON, a password — is zeroized rather than left
+for the allocator. Gating `delete_account` also closes an unmetered password oracle: before,
+any module could guess at the vault password there, and a correct guess DESTROYED the account.
+
+An **empty** custodian admits nobody. That is the same fail-closed direction Tier A took
+before `signer_ui` shipped: an unconfigured role means the surface that should hold it does
+not exist yet, and the capability is then unavailable rather than universal.
 
 ### Caller identity — live, and what it reports
 

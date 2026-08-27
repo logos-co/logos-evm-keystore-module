@@ -17,4 +17,5 @@ pub use keystore::{Keystore, KeystoreError};
 #[cfg(feature = "logos_module")]
 mod glue;
 
+pub mod gate;
 pub mod approval;

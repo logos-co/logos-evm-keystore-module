@@ -12,13 +12,19 @@
 
 use serde::Deserialize;
 use serde_json::json;
+use zeroize::Zeroizing;
 use std::time::Duration;
 
 use crate::approval::Approvals;
+use crate::gate;
 use crate::keystore::Keystore;
 
 /// Default approver. Overridden by `approver` in `<persistence>/keystore.json`.
 const DEFAULT_APPROVER: &str = "signer_ui";
+/// The one module permitted to MUTATE the keystore. Mirrors `DEFAULT_APPROVER`: a wallet
+/// requests signatures and reads which accounts exist; creating, importing, exporting and
+/// deleting them belongs to one surface, and that surface is the keystore UI.
+const DEFAULT_CUSTODIAN: &str = "keystore_ui";
 
 /// The keystore module's IPC contract. Each non-defaulted method is a callable
 /// module method. Private keys never appear in any signature — only addresses,
@@ -103,6 +109,9 @@ struct KeystoreModuleImpl {
     /// method, which would make "who may approve a signature" remotely
     /// writable.
     approver: String,
+    /// The one module name permitted to mutate the keystore. Read from the same
+    /// config file, for the same reason.
+    custodian: String,
 }
 
 impl KeystoreModuleImpl {
@@ -135,16 +144,35 @@ impl KeystoreModuleImpl {
     /// admitting it here would make a plain `logosctl call … approve` a legal
     /// bypass of the human.
     fn is_approver(&self) -> bool {
-        logos_rust_sdk::current_caller().is_module(&self.approver)
+        gate::holds_role(&self.approver, &Self::caller())
+    }
+
+    /// Tier D: the configured custodian, and nothing else.
+    ///
+    /// `HostAnchor` is refused for the same reason as Tier A — it is one undifferentiated
+    /// bag covering the shells and every relayed CLI token, so admitting it would make a
+    /// plain `logosctl call … import_private_key` a legal way in.
+    fn is_custodian(&self) -> bool {
+        gate::holds_role(&self.custodian, &Self::caller())
+    }
+
+    /// The live caller, reduced to the pure form the gate reasons about.
+    fn caller() -> gate::Caller {
+        match logos_rust_sdk::current_caller() {
+            logos_rust_sdk::LogosCaller::Unknown => gate::Caller::Unknown,
+            logos_rust_sdk::LogosCaller::HostAnchor => gate::Caller::HostAnchor,
+            logos_rust_sdk::LogosCaller::Module { name, .. } => gate::Caller::Module(name),
+            logos_rust_sdk::LogosCaller::Derived { parent, leaf } => {
+                gate::Caller::Derived { parent, leaf }
+            }
+            logos_rust_sdk::LogosCaller::Operator { name } => gate::Caller::Operator(name),
+        }
     }
 
     /// Tier B: any NAMED module. Returns the name to record against the
     /// request, so results can only be collected by the module that asked.
     fn named_caller(&self) -> Option<String> {
-        match logos_rust_sdk::current_caller() {
-            logos_rust_sdk::LogosCaller::Module { name, .. } => Some(name),
-            _ => None,
-        }
+        Self::caller().named().map(str::to_string)
     }
 }
 
@@ -166,14 +194,21 @@ impl KeystoreModule for KeystoreModuleImpl {
         // Who may approve is configuration, not a method: a `set_approver` call
         // would be a remotely-writable answer to "who may authorise a
         // signature". This file is written by whoever deploys the module.
-        self.approver = std::fs::read_to_string(base.join("keystore.json"))
+        let cfg = std::fs::read_to_string(base.join("keystore.json"))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-            .and_then(|v| v.get("approver").and_then(|a| a.as_str()).map(str::to_string))
-            .unwrap_or_else(|| DEFAULT_APPROVER.to_string());
+            .unwrap_or(serde_json::Value::Null);
+        let name_or = |key: &str, fallback: &str| {
+            cfg.get(key).and_then(|a| a.as_str()).map(str::to_string).unwrap_or_else(|| fallback.to_string())
+        };
+        self.approver = name_or("approver", DEFAULT_APPROVER);
+        self.custodian = name_or("custodian", DEFAULT_CUSTODIAN);
     }
 
     fn create_mnemonic(&mut self, words: i64) -> String {
+        if !self.is_custodian() {
+            return not_authorized();
+        }
         match Keystore::create_mnemonic(words as u32) {
             Ok(phrase) => json!({ "ok": true, "phrase": phrase }).to_string(),
             Err(e) => err(e),
@@ -181,6 +216,12 @@ impl KeystoreModule for KeystoreModuleImpl {
     }
 
     fn import_mnemonic(&mut self, params_json: String) -> String {
+        if !self.is_custodian() {
+            // Scrub before returning: the phrase and the password are both in this buffer,
+            // and a refusal is exactly when they should not outlive the call.
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
         let p: ImportMnemonicParams = match serde_json::from_str(&params_json) {
             Ok(p) => p,
             Err(e) => return err(e),
@@ -199,6 +240,10 @@ impl KeystoreModule for KeystoreModuleImpl {
     }
 
     fn new_account(&mut self, password: String) -> String {
+        if !self.is_custodian() {
+            let _ = Zeroizing::new(password);
+            return not_authorized();
+        }
         let res = match self.ks() {
             Ok(ks) => ks.new_account(&password),
             Err(e) => return err(e),
@@ -213,6 +258,11 @@ impl KeystoreModule for KeystoreModuleImpl {
     }
 
     fn import_private_key(&mut self, priv_hex: String, password: String) -> String {
+        if !self.is_custodian() {
+            let _ = Zeroizing::new(priv_hex);
+            let _ = Zeroizing::new(password);
+            return not_authorized();
+        }
         let res = match self.ks() {
             Ok(ks) => ks.import_private_key(&priv_hex, &password),
             Err(e) => return err(e),
@@ -227,6 +277,12 @@ impl KeystoreModule for KeystoreModuleImpl {
     }
 
     fn import_keystore_json(&mut self, key_json: String, password: String, new_password: String) -> String {
+        if !self.is_custodian() {
+            let _ = Zeroizing::new(key_json);
+            let _ = Zeroizing::new(password);
+            let _ = Zeroizing::new(new_password);
+            return not_authorized();
+        }
         let res = match self.ks() {
             Ok(ks) => ks.import_keystore_json(&key_json, &password, &new_password),
             Err(e) => return err(e),
@@ -241,6 +297,10 @@ impl KeystoreModule for KeystoreModuleImpl {
     }
 
     fn export_keystore_json(&mut self, address: String, password: String) -> String {
+        if !self.is_custodian() {
+            let _ = Zeroizing::new(password);
+            return not_authorized();
+        }
         match self.ks() {
             Ok(ks) => match ks.export_keystore_json(&address, &password) {
                 Ok(json_str) => json!({ "ok": true, "keystore": json_str }).to_string(),
@@ -265,6 +325,12 @@ impl KeystoreModule for KeystoreModuleImpl {
     }
 
     fn delete_account(&mut self, address: String, password: String) -> bool {
+        // Gating this also closes an unmetered password oracle: before, any module could
+        // guess at the vault password here, and a correct guess DESTROYED the account.
+        if !self.is_custodian() {
+            let _ = Zeroizing::new(password);
+            return false;
+        }
         let res = match self.ks() {
             Ok(ks) => ks.delete_account(&address, &password),
             Err(_) => return false,
@@ -285,7 +351,7 @@ impl KeystoreModule for KeystoreModuleImpl {
             return not_authorized();
         };
         if self.approver.is_empty() {
-            return err("no approver configured");
+            return not_authorized();
         }
         match self.approvals.request(&requester, &intent_json) {
             Ok((handle, receipt)) => {
@@ -407,7 +473,9 @@ impl KeystoreModule for KeystoreModuleImpl {
             logos_rust_sdk::LogosCaller::Derived { parent, leaf } => ("derived", format!("{parent}.{leaf}")),
             logos_rust_sdk::LogosCaller::Operator { name } => ("operator", name.clone()),
         };
-        json!({ "ok": true, "kind": kind, "identity": name, "approver": self.approver }).to_string()
+        json!({ "ok": true, "kind": kind, "identity": name,
+                "approver": self.approver, "custodian": self.custodian })
+        .to_string()
     }
 }
 

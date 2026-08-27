@@ -1,0 +1,59 @@
+name: keystore-module Unit Tests
+
+# The crypto core and the approval/gate state machines, run on every change.
+#
+# These ~38 tests existed and ran under NO CI at all until this workflow: the only
+# workflow in the repo was doctests.yml, which exercises the module end-to-end through a
+# logoscore daemon and can be green while a refusal rule is quietly wrong.
+#
+# `--no-default-features` drops the `logos_module` glue and with it the logos-rust-sdk path
+# dependency, so this needs no SDK checkout, no nix and no network beyond crates.io — which
+# is why it can be a plain cargo job while everything else here goes through nix. (nix's own
+# fetcher gets 403s from crates.io; plain cargo does not.)
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (pure cores)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # Matches rust-version in rust-lib/Cargo.toml, which is itself pinned to the nix
+        # toolchain — so a test passing here cannot fail the real build on MSRV.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+
+      - name: cargo test --no-default-features
+        run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
+
+      - name: The gate tests must actually be present
+        # A refusal suite that silently stops being compiled is worse than none: it reads as
+        # coverage. Assert the NAMES, not a count — a count still passes if someone deletes
+        # the hard test and adds an easier one.
+        run: |
+          out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
+          for t in \
+            the_configured_holder_is_admitted_and_nobody_else_is \
+            an_empty_role_refuses_everyone_including_a_module_named_empty \
+            the_host_anchor_is_refused_however_the_role_is_configured \
+            unknown_derived_and_operator_callers_are_refused \
+            the_approver_and_custodian_roles_are_independent ; do
+            echo "$out" | grep -q "gate::tests::$t" || { echo "MISSING gate test: $t"; exit 1; }
+            echo "  present: $t"
+          done
