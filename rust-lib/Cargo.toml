@@ -32,6 +32,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 hex = "0.4"
+# Wipes decrypted secrets on drop. Already in the lock graph transitively; this
+# only promotes it to a direct dependency.
+zeroize = "1"
+# SHA-256 for the approval commitment. Deliberately NOT keccak256: a bundle id
+# must never be mistakable for a signable Ethereum digest.
+sha2 = "0.10"
 
 # The Logos runtime SDK is staged by the builder as a sibling crate. It is
 # optional + enabled by the default `logos_module` feature so `cargo test
