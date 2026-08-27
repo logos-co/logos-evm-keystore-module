@@ -47,6 +47,16 @@ pub trait KeystoreModule: Send + 'static {
     fn list_accounts(&mut self) -> String;
     fn has_address(&mut self, address: String) -> bool;
     fn delete_account(&mut self, address: String, password: String) -> bool;
+    /// Re-encrypt a vault under a new password. Tier D. Crash-safe: the new vault is staged
+    /// and renamed, so a failure cannot leave the account with no readable copy.
+    /// `{ ok, address }`, or `{ ok: false }` if the old password is wrong.
+    fn change_password(&mut self, address: String, old_password: String, new_password: String) -> String;
+    /// Name an account, or clear the name with an empty string. Tier D — a label is written
+    /// by whoever manages accounts, not by whoever spends from them. `{ ok }`.
+    fn set_label(&mut self, address: String, label: String) -> String;
+    /// Account names, `{ ok, labels: { <address>: <name> } }`. UNGATED: a label is not a
+    /// secret, and a wallet showing an account picker needs it.
+    fn get_labels(&mut self) -> String;
     // ── Tier B: any NAMED module may ask ────────────────────────────────
     /// Ask a human to approve signing. Returns immediately with
     /// `{ ok, handle, receipt }` — it does NOT block on the human. `handle` is
@@ -306,6 +316,41 @@ impl KeystoreModule for KeystoreModuleImpl {
                 Ok(json_str) => json!({ "ok": true, "keystore": json_str }).to_string(),
                 Err(e) => err(e),
             },
+            Err(e) => err(e),
+        }
+    }
+
+    fn change_password(&mut self, address: String, old_password: String, new_password: String) -> String {
+        if !self.is_custodian() {
+            let _ = Zeroizing::new(old_password);
+            let _ = Zeroizing::new(new_password);
+            return not_authorized();
+        }
+        match self.ks() {
+            Ok(ks) => match ks.change_password(&address, &old_password, &new_password) {
+                Ok(addr) => json!({ "ok": true, "address": addr.to_string() }).to_string(),
+                Err(e) => err(e),
+            },
+            Err(e) => err(e),
+        }
+    }
+
+    fn set_label(&mut self, address: String, label: String) -> String {
+        if !self.is_custodian() {
+            return not_authorized();
+        }
+        match self.ks() {
+            Ok(ks) => match ks.set_label(&address, &label) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(e) => err(e),
+            },
+            Err(e) => err(e),
+        }
+    }
+
+    fn get_labels(&mut self) -> String {
+        match self.ks() {
+            Ok(ks) => json!({ "ok": true, "labels": ks.get_labels() }).to_string(),
             Err(e) => err(e),
         }
     }

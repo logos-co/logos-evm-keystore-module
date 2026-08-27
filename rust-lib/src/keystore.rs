@@ -7,6 +7,7 @@
 //! private key across its API — only addresses, signed payloads, and
 //! (re-encrypted) vault JSON.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
@@ -263,6 +264,77 @@ impl Keystore {
         std::fs::read_to_string(&path).map_err(|e| KeystoreError::Io(e.to_string()))
     }
 
+    /// Re-encrypt an existing vault under a new password.
+    ///
+    /// Crash-safe by construction: the new vault is written to a temporary directory and
+    /// only then renamed over the old one. `eth_keystore::encrypt_key` writes straight to
+    /// its destination, so doing this in place would leave a window where a crash destroys
+    /// the only copy of the key — the one failure this method must not have.
+    pub fn change_password(&self, address: &str, old: &str, new: &str) -> Result<Address> {
+        // Deriving the signer IS the check that `old` is correct; a wrong password fails
+        // here, before anything on disk is touched.
+        let signer = self.signer_for(address, old)?;
+        let addr = signer.address();
+
+        let tmp = self.dir.join(format!(".rekey-{}", vault_name(&addr)));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).map_err(|e| KeystoreError::Vault(e.to_string()))?;
+
+        let name = format!("{}.json", vault_name(&addr));
+        let key = Zeroizing::new(signer.to_bytes().0);
+        let mut rng = rand::thread_rng();
+        let write = eth_keystore::encrypt_key(&tmp, &mut rng, key.as_slice(), new, Some(&name))
+            .map_err(|e| KeystoreError::Vault(e.to_string()));
+        drop(signer);
+        if let Err(e) = write {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+
+        let staged = tmp.join(&name);
+        // Restrict BEFORE the rename, so the file is never briefly world-readable at its
+        // real path.
+        restrict_permissions(&staged, 0o600)?;
+        std::fs::rename(&staged, self.vault_path(&addr))
+            .map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        let _ = std::fs::remove_dir_all(&tmp);
+        Ok(addr)
+    }
+
+    /// Human-readable account names. Kept beside the vaults, never inside them: a label is
+    /// not a secret and must not require a password to read.
+    fn labels_path(&self) -> PathBuf {
+        self.dir.join("labels.json")
+    }
+
+    pub fn get_labels(&self) -> BTreeMap<String, String> {
+        std::fs::read_to_string(self.labels_path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    /// Set or clear (empty `label`) the name for an address. Refuses an address the keystore
+    /// does not hold, so the file cannot accumulate labels for accounts that never existed.
+    pub fn set_label(&self, address: &str, label: &str) -> Result<()> {
+        let addr = parse_address(address)?;
+        if !self.has_address(address) {
+            return Err(KeystoreError::InvalidParams(format!("no such account: {addr}")));
+        }
+        let mut labels = self.get_labels();
+        let key = vault_name(&addr);
+        if label.trim().is_empty() {
+            labels.remove(&key);
+        } else {
+            labels.insert(key, label.trim().to_string());
+        }
+        self.ensure_dir()?;
+        let txt =
+            serde_json::to_string_pretty(&labels).map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        std::fs::write(self.labels_path(), txt).map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn list_accounts(&self) -> Vec<Address> {
         let mut out = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.dir) {
@@ -270,6 +342,8 @@ impl Keystore {
                 let name = e.file_name();
                 let name = name.to_string_lossy();
                 if let Some(stem) = name.strip_suffix(".json") {
+                    // labels.json lives here too and is not a vault; parse() rejects it,
+                    // but say so rather than relying on that.
                     if let Ok(addr) = format!("0x{stem}").parse::<Address>() {
                         out.push(addr);
                     }
@@ -946,4 +1020,61 @@ mod tests {
         let env = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
         assert_eq!(env.recover_signer().unwrap(), ACCT0);
     }
+
+    #[test]
+    fn change_password_re_encrypts_and_the_old_password_stops_working() {
+        let d = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(d.path().to_path_buf());
+        let addr = ks.import_private_key(ACCT0_PK, "old-pw").unwrap();
+
+        ks.change_password(&addr.to_string(), "old-pw", "new-pw").unwrap();
+
+        assert!(ks.signer_for(&addr.to_string(), "new-pw").is_ok(), "the new password must work");
+        assert!(
+            ks.signer_for(&addr.to_string(), "old-pw").is_err(),
+            "the OLD password must stop working — otherwise nothing was re-encrypted"
+        );
+        // Same account, not a second one.
+        assert_eq!(ks.list_accounts(), vec![addr]);
+    }
+
+    #[test]
+    fn a_wrong_old_password_changes_nothing_on_disk() {
+        let d = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(d.path().to_path_buf());
+        let addr = ks.import_private_key(ACCT0_PK, "old-pw").unwrap();
+
+        assert!(ks.change_password(&addr.to_string(), "WRONG", "new-pw").is_err());
+        // The vault must survive a refused attempt intact — this is the failure that would
+        // destroy the only copy of a key.
+        assert!(ks.signer_for(&addr.to_string(), "old-pw").is_ok());
+        assert!(ks.signer_for(&addr.to_string(), "new-pw").is_err());
+        assert_eq!(ks.list_accounts().len(), 1);
+    }
+
+    #[test]
+    fn labels_round_trip_and_do_not_become_accounts() {
+        let d = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(d.path().to_path_buf());
+        let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
+
+        assert!(ks.get_labels().is_empty());
+        ks.set_label(&addr.to_string(), "  Savings  ").unwrap();
+        assert_eq!(ks.get_labels().values().next().map(String::as_str), Some("Savings"));
+
+        // labels.json sits beside the vaults; it must never be read back as an account.
+        assert_eq!(ks.list_accounts(), vec![addr], "labels.json must not appear as an account");
+
+        ks.set_label(&addr.to_string(), "   ").unwrap();
+        assert!(ks.get_labels().is_empty(), "an empty label clears the entry");
+    }
+
+    #[test]
+    fn a_label_for_an_account_we_do_not_hold_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(d.path().to_path_buf());
+        assert!(ks.set_label("0x0000000000000000000000000000000000000001", "ghost").is_err());
+        assert!(ks.get_labels().is_empty());
+    }
+
 }

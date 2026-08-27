@@ -405,8 +405,8 @@ Every request is classified by the **caller identity** the platform reports
 |------|---------|--------|
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | the configured **approver only** (default `signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
-| **C** | reads: `list_accounts`, `has_address`, `caller_identity` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `new_account`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account` | the configured **custodian only** (default `keystore_ui`) |
+| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `caller_identity` | ungated |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `new_account`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label` | the configured **custodian only** (default `keystore_ui`) |
 
 Tiers A, B and D all return the identical string `{"ok":false,"error":"not authorized"}`
 on refusal, so a caller cannot use the error text to probe which tier it failed.
