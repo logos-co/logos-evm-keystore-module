@@ -34,6 +34,8 @@ const ANNOUNCES: &[&str] = &[
 /// Methods that must stay silent: they persist nothing, or nothing a reader shows. Listed so
 /// a stray emit on a read path — every consumer re-reading on its own read — fails here.
 const SILENT: &[&str] = &[
+    // Configuration: it moves who may call, never what a reader shows.
+    "configure",
     "create_mnemonic",
     "preview_addresses",
     "export_keystore_json",

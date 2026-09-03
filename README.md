@@ -12,6 +12,20 @@ Built on well-established crates: [`alloy`](https://github.com/alloy-rs/alloy)
 
 ## Contract (`KeystoreModule`)
 
+**Configuration:** `configure` names who holds the two roles —
+`{ approver?, custodian? }` → `{ ok, approver, custodian }`. It is **total**: a role the
+document does not name is held by nobody, and an empty name admits no caller. Until it is
+called the built-in defaults stand (`signer_ui` approves, `keystore_ui` mutates), so a
+deployment that configures nothing still works. A malformed document is refused whole and
+leaves the roles in force untouched.
+
+Configuration arrives by **method call**, never as a file in the module's persistence
+directory: that directory belongs to the module instance, may be sandboxed away from every
+other process, and does not exist until the module has written to it. `configure` is
+**ungated for now** — any caller can name itself custodian — which is a deliberate,
+temporary exposure rather than an oversight; see
+[`docs/specs.md`](docs/specs.md#configureconfig_json-string---string).
+
 **Accounts (Tier D — the custodian only):** `create_mnemonic`, `import_mnemonic`,
 `create_unrelated_account`, `import_private_key`, `import_keystore_json`,
 `export_keystore_json`, `change_password`, `set_label`, `set_group_label`,
@@ -31,7 +45,8 @@ scan being complete — which is not decidable by inspection.
 `preview_addresses`, `forget_derivation`, `remove_group`.
 
 **Reads (ungated):** `list_accounts`, `has_address`, `get_labels`, `get_group_labels`,
-`list_groups`, `list_derivation_keys`, `get_provenance`, `caller_identity`.
+`list_groups`, `list_derivation_keys`, `get_provenance`, `caller_identity` — the last of
+which also reports the two role names in force.
 
 A wallet is named like an account is: `set_group_label` writes, an empty string clears,
 and `get_group_labels` answers from `group-labels.json` alone — so the name survives the

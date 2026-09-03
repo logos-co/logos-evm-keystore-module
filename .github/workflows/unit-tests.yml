@@ -78,6 +78,10 @@ jobs:
             gate::tests::the_host_anchor_is_refused_however_the_role_is_configured \
             gate::tests::unknown_derived_and_operator_callers_are_refused \
             gate::tests::the_approver_and_custodian_roles_are_independent \
+            gate::tests::the_built_in_defaults_are_in_force_until_something_configures_them \
+            gate::tests::configuring_both_roles_moves_the_gate_to_the_named_modules \
+            gate::tests::a_role_the_configuration_does_not_name_admits_nobody \
+            gate::tests::a_malformed_configuration_is_refused_and_the_roles_in_force_survive_it \
             gate::tests::tier_d_admits_only_the_custodian_for_every_mutation \
             gate::tests::every_hd_derivation_mutation_is_in_the_tier_d_registry \
             gate::tests::a_method_the_registry_does_not_name_is_refused_even_for_the_custodian \

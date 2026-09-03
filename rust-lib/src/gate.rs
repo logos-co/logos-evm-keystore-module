@@ -5,6 +5,64 @@
 //! it can be tested without one. `glue.rs` resolves the caller and asks this module; it does
 //! not decide anything itself.
 
+/// Default approver: the surface that renders an intent to a human and takes the vault
+/// password. Stands until `Roles::configure` replaces it.
+pub const DEFAULT_APPROVER: &str = "signer_ui";
+/// Default custodian. Mirrors `DEFAULT_APPROVER`: a wallet requests signatures and reads
+/// which accounts exist; creating, importing, exporting and deleting them belongs to one
+/// surface, and that surface is the keystore UI.
+pub const DEFAULT_CUSTODIAN: &str = "keystore_ui";
+
+/// Who holds the two roles. Configuration, so it is data rather than a decision — but it
+/// lives here because it is the only input the decisions below take besides the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Roles {
+    pub approver: String,
+    pub custodian: String,
+}
+
+/// The built-in defaults, in force from load. A module nobody configures is not inert.
+impl Default for Roles {
+    fn default() -> Self {
+        Self { approver: DEFAULT_APPROVER.into(), custodian: DEFAULT_CUSTODIAN.into() }
+    }
+}
+
+/// `{ approver?, custodian? }`. Unknown keys are refused rather than ignored: under the
+/// total rule below a typo'd key would otherwise empty BOTH roles, which fails closed but
+/// says nothing about why.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RolesWire {
+    #[serde(default)]
+    approver: String,
+    #[serde(default)]
+    custodian: String,
+}
+
+impl Roles {
+    /// Replace both roles from a `{ approver?, custodian? }` document.
+    ///
+    /// TOTAL, not a patch: the document is the whole answer to "who holds these roles", so
+    /// one it does not name is held by nobody — `holds_role` refuses an empty name. Half a
+    /// configuration inheriting the other half from a default is how a deployer who replaced
+    /// one surface goes on granting the old one. A malformed document is refused and the
+    /// roles in force are left untouched.
+    pub fn configure(&mut self, config_json: &str) -> Result<(), String> {
+        let doc: serde_json::Value = serde_json::from_str(config_json).map_err(|e| e.to_string())?;
+        // A struct deserializes from a JSON ARRAY as well, defaulting every field — so `[]`
+        // would empty both roles instead of being refused. Insist on an object.
+        if !doc.is_object() {
+            return Err("configuration must be a JSON object".into());
+        }
+        let wire: RolesWire = serde_json::from_value(doc).map_err(|e| e.to_string())?;
+        // Whitespace is not a module name, so it means nobody rather than an unmatchable one.
+        self.approver = wire.approver.trim().to_string();
+        self.custodian = wire.custodian.trim().to_string();
+        Ok(())
+    }
+}
+
 /// The caller, reduced to what a gate is allowed to care about.
 ///
 /// `HostAnchor` is deliberately distinct from a named module rather than folded into it: it
@@ -190,6 +248,68 @@ mod tests {
         // gate that still admitted the name would let a resurrected one through ungated.
         for unknown in ["derive_nextaccount", "list_accounts", "approve", "", "DERIVE_NEXT_ACCOUNT", "new_account"] {
             assert!(!tier_d_admits(unknown, "keystore_ui", &m("keystore_ui")), "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn the_built_in_defaults_are_in_force_until_something_configures_them() {
+        // A module nobody configures must not be inert: the shipped surfaces work out of
+        // the box, and only a deployer replacing one has to say so.
+        let r = Roles::default();
+        assert!(holds_role(&r.approver, &m("signer_ui")));
+        assert!(tier_d_admits("import_private_key", &r.custodian, &m("keystore_ui")));
+    }
+
+    #[test]
+    fn configuring_both_roles_moves_the_gate_to_the_named_modules() {
+        let mut r = Roles::default();
+        r.configure(r#"{"approver":"probe_ui","custodian":"probe_custodian"}"#).unwrap();
+        assert!(holds_role(&r.approver, &m("probe_ui")));
+        assert!(tier_d_admits("import_private_key", &r.custodian, &m("probe_custodian")));
+        // And the modules the defaults named lose it in the same call.
+        assert!(!holds_role(&r.approver, &m("signer_ui")));
+        assert!(!tier_d_admits("import_private_key", &r.custodian, &m("keystore_ui")));
+    }
+
+    #[test]
+    fn a_role_the_configuration_does_not_name_admits_nobody() {
+        // Named empty, omitted entirely, or given whitespace: all three are "nobody holds
+        // this", never "fall back to the default the deployer just replaced".
+        for doc in [
+            r#"{"approver":"","custodian":"probe_custodian"}"#,
+            r#"{"custodian":"probe_custodian"}"#,
+            r#"{"approver":"   ","custodian":"probe_custodian"}"#,
+        ] {
+            let mut r = Roles::default();
+            r.configure(doc).unwrap();
+            assert_eq!(r.approver, "", "{doc}");
+            for who in [m("signer_ui"), m(""), Caller::HostAnchor, Caller::Unknown] {
+                assert!(!holds_role(&r.approver, &who), "{doc} admitted {who:?}");
+            }
+            // The role that WAS named is unaffected by its neighbour being empty.
+            assert!(tier_d_admits("import_private_key", &r.custodian, &m("probe_custodian")));
+        }
+    }
+
+    #[test]
+    fn a_malformed_configuration_is_refused_and_the_roles_in_force_survive_it() {
+        // Refusing has to leave the gate where it was. A partial apply would hand one role
+        // to an attacker-chosen name and blame the other half on a parse error.
+        let mut r = Roles::default();
+        r.configure(r#"{"approver":"probe_ui","custodian":"probe_custodian"}"#).unwrap();
+        let good = r.clone();
+        for doc in [
+            "",
+            "not json",
+            "[]",
+            r#"{"approver":5}"#,
+            r#"{"approver":null}"#,
+            // A typo'd key, which the total rule would otherwise turn into "nobody holds
+            // anything" — fail-closed, but silent about why every method started refusing.
+            r#"{"custodain":"probe_custodian"}"#,
+        ] {
+            assert!(r.configure(doc).is_err(), "{doc:?} was accepted");
+            assert_eq!(r, good, "{doc:?} moved the roles");
         }
     }
 

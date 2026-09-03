@@ -20,17 +20,19 @@ use crate::approval::Approvals;
 use crate::gate;
 use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, Keystore, Storage};
 
-/// Default approver. Overridden by `approver` in `<persistence>/keystore.json`.
-const DEFAULT_APPROVER: &str = "signer_ui";
-/// The one module permitted to MUTATE the keystore. Mirrors `DEFAULT_APPROVER`: a wallet
-/// requests signatures and reads which accounts exist; creating, importing, exporting and
-/// deleting them belongs to one surface, and that surface is the keystore UI.
-const DEFAULT_CUSTODIAN: &str = "keystore_ui";
-
 /// The keystore module's IPC contract. Each non-defaulted method is a callable
 /// module method. Private keys never appear in any signature — only addresses,
 /// signed payloads, and (re-encrypted) keystore JSON cross the boundary.
 pub trait KeystoreModule: Send + 'static {
+    /// Name who holds the two roles: `{ approver?, custodian? }` → `{ ok, approver,
+    /// custodian }`. TOTAL — a role the document does not name is held by nobody — and it
+    /// takes effect at once, on a module that has been serving the built-in defaults
+    /// (`signer_ui`, `keystore_ui`) since it loaded. A malformed document is refused and
+    /// the roles in force are left untouched.
+    ///
+    /// UNGATED, deliberately and for now: any caller can name itself custodian and then
+    /// mutate the keystore. Protecting it is deferred, not refuted — see docs/specs.md.
+    fn configure(&mut self, config_json: String) -> String;
     /// Generate a fresh BIP-39 mnemonic of `words` (12/15/18/21/24) — `{ ok, phrase }`.
     fn create_mnemonic(&mut self, words: i64) -> String;
     /// Derive + persist an account from a mnemonic, creating its derivation group. params
@@ -193,17 +195,8 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 struct KeystoreModuleImpl {
     ks: Option<Keystore>,
     approvals: Approvals,
-    /// The one module name permitted to approve. Read from a config file in
-    /// `on_context_ready`, i.e. from the loader's own directory — never from a
-    /// method, which would make "who may approve a signature" remotely
-    /// writable.
-    approver: String,
-    /// The one module name permitted to mutate the keystore. Read from the same
-    /// config file, for the same reason.
-    custodian: String,
-    /// Why both roles are empty, when they are empty because the config could not be read.
-    /// Reported by `caller_identity` so "nothing works" has a stated cause.
-    config_error: String,
+    /// Who may approve and who may mutate. Defaults from load, replaced by `configure`.
+    roles: gate::Roles,
 }
 
 impl KeystoreModuleImpl {
@@ -242,7 +235,7 @@ impl KeystoreModuleImpl {
     /// admitting it here would make a plain `logosctl call … approve` a legal
     /// bypass of the human.
     fn is_approver(&self) -> bool {
-        gate::holds_role(&self.approver, &Self::caller())
+        gate::holds_role(&self.roles.approver, &Self::caller())
     }
 
     /// Tier D: the configured custodian, for a method `gate::TIER_D_METHODS` names.
@@ -252,7 +245,7 @@ impl KeystoreModuleImpl {
     /// plain `logosctl call … import_private_key` a legal way in. A method missing from the
     /// registry is refused outright rather than falling through ungated.
     fn may_mutate(&self, method: &str) -> bool {
-        gate::tier_d_admits(method, &self.custodian, &Self::caller())
+        gate::tier_d_admits(method, &self.roles.custodian, &Self::caller())
     }
 
     /// The live caller, reduced to the pure form the gate reasons about.
@@ -386,34 +379,15 @@ impl KeystoreModule for KeystoreModuleImpl {
     fn on_context_ready(&mut self, ctx: &RustModuleContext) {
         let base = std::path::Path::new(&ctx.instance_persistence_path);
         self.ks = Some(Keystore::new(base.join("keystore")));
+    }
 
-        // Who may approve is configuration, not a method: a `set_approver` call
-        // would be a remotely-writable answer to "who may authorise a
-        // signature". This file is written by whoever deploys the module.
-        //
-        // ABSENT means "not configured", and the defaults apply. UNREADABLE means we do not
-        // know who was named — and silently reverting to the defaults would hand both roles
-        // to modules the deployer may have replaced on purpose. An empty role admits nobody
-        // (`gate::holds_role`), so a torn config makes every gated method refuse instead.
-        let cfg = match std::fs::read_to_string(base.join("keystore.json")) {
-            Ok(t) => serde_json::from_str::<serde_json::Value>(&t).ok(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(serde_json::Value::Null),
-            Err(_) => None,
-        };
-        let Some(cfg) = cfg else {
-            self.approver = String::new();
-            self.custodian = String::new();
-            self.config_error =
-                "keystore.json is present but unreadable, so no module holds the approver or \
-                 custodian role"
-                    .into();
-            return;
-        };
-        let name_or = |key: &str, fallback: &str| {
-            cfg.get(key).and_then(|a| a.as_str()).map(str::to_string).unwrap_or_else(|| fallback.to_string())
-        };
-        self.approver = name_or("approver", DEFAULT_APPROVER);
-        self.custodian = name_or("custodian", DEFAULT_CUSTODIAN);
+    fn configure(&mut self, config_json: String) -> String {
+        match self.roles.configure(&config_json) {
+            Ok(()) => json!({ "ok": true, "approver": self.roles.approver,
+                              "custodian": self.roles.custodian })
+            .to_string(),
+            Err(e) => err(e),
+        }
     }
 
     fn create_mnemonic(&mut self, words: i64) -> String {
@@ -915,7 +889,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         let Some(requester) = self.named_caller() else {
             return not_authorized();
         };
-        if self.approver.is_empty() {
+        if self.roles.approver.is_empty() {
             return not_authorized();
         }
         match self.approvals.request(&requester, &intent_json) {
@@ -1039,8 +1013,7 @@ impl KeystoreModule for KeystoreModuleImpl {
             logos_rust_sdk::LogosCaller::Operator { name } => ("operator", name.clone()),
         };
         json!({ "ok": true, "kind": kind, "identity": name,
-                "approver": self.approver, "custodian": self.custodian,
-                "configError": self.config_error })
+                "approver": self.roles.approver, "custodian": self.roles.custodian })
         .to_string()
     }
 }

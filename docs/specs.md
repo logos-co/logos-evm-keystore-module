@@ -71,7 +71,7 @@ flowchart TB
         DISP["Generated C-ABI dispatch + install()<br/>(injected from generated/provider_gen.rs)"]
         subgraph Glue["Logos glue — src/glue.rs (feature logos_module)"]
             TRAIT["trait KeystoreModule<br/>(the IPC contract)"]
-            IMPL["KeystoreModuleImpl<br/>{ ks, approvals, approver }"]
+            IMPL["KeystoreModuleImpl<br/>{ ks, approvals, roles }"]
             GATE["Tier gate<br/>current_caller() → A / B / C"]
             EV["KeystoreModuleEvents::accounts_changed<br/>→ emit_accounts_changed(count)"]
             CTX["on_context_ready(ctx)<br/>ks = Keystore::new(ctx.instance_persistence_path/keystore)"]
@@ -137,7 +137,7 @@ sequenceDiagram
     participant H as the human
     participant DISK as scrypt vault dir
 
-    Note over KS: on_context_ready(ctx) → Keystore::new(...)<br/>approver read from keystore.json (default "signer_ui")
+    Note over KS: on_context_ready(ctx) → Keystore::new(...)<br/>roles default to signer_ui / keystore_ui until configure() names them
 
     BE->>KS: request_approval({ address, purpose, legs })
     Note right of KS: caller must be a NAMED module (Tier B)
@@ -203,6 +203,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 
 | Method | Params | Returns | Mutates accounts? |
 |--------|--------|---------|-------------------|
+| `configure` | `config_json: String` | `{ ok, approver, custodian }` | no — sets who may |
 | `create_mnemonic` | `words: i64` | `{ ok, phrase }` | no |
 | `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin }` | yes → event |
 | `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
@@ -235,7 +236,53 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `acknowledge` | `handle: String` | `{ ok, bundle_id, requester, render_lines }` | no |
 | `approve` | `handle, bundle_id, password: String` | `{ ok, signed_count: n }` | no |
 | `reject` | `handle: String` | `bool` | no |
-| `caller_identity` | — | `{ ok, kind, identity, approver }` | no |
+| `caller_identity` | — | `{ ok, kind, identity, approver, custodian }` | no |
+
+---
+
+### `configure(config_json: String) -> String`
+
+Name who holds the two roles. `config_json` is `{ approver?, custodian? }`; the reply is
+`{ ok, approver, custodian }` echoing what is now in force, or the usual
+`{ ok: false, error }`. It takes effect on the next call — nothing is reloaded.
+
+**Total, not a patch.** The document is the whole answer to who holds these roles, so one
+it does not name is held by **nobody**: `gate::holds_role` refuses an empty name, and every
+method of that tier then refuses everyone. Half a configuration inheriting the other half
+from a default is how a deployer who replaced one surface goes on granting the old one.
+Whitespace is not a module name, so a blank string means nobody rather than an unmatchable
+somebody.
+
+**Refusals leave the gate where it stood.** A document that is not a JSON object, carries an
+unknown key, or types a role as anything but a string is refused whole and the roles in
+force are untouched — there is no partial apply. The unknown-key rule exists because under
+the total rule a typo (`custodain`) would otherwise empty **both** roles: fail-closed, but
+silent about why everything started refusing.
+
+**Until it is called, the built-in defaults stand** — `signer_ui` approves, `keystore_ui`
+mutates. A module nobody configures is not inert.
+
+#### It is deliberately ungated, for now
+
+Any caller can call `configure`, name **itself** custodian, and then mutate the keystore.
+That is a real exposure and it is a deliberate, temporary one: protecting this call is
+**deferred, not refuted**.
+
+The design this replaced put the two role names in `<persistence>/keystore.json`, read once
+in `on_context_ready`, on the stated ground that *who may mutate the keystore is
+configuration, not a method — a `set_custodian` call would be a remotely-writable answer to
+"who may import a key."* That reasoning still holds; what did not hold was the delivery. A
+module's persistence directory is owned by the module instance and may be sandboxed with no
+other process able to reach it, so configuration cannot be **placed** there from outside —
+and in practice it did not even exist until the module had written to it, which put the
+config out of reach at exactly the moment it was needed. Configuration has to arrive by
+method call.
+
+What is still owed is the protection the file gave for free: an answer to "who may set
+policy" that is not simply "whoever calls first". Claim-once semantics, a caller gate, or a
+platform-level configuration channel are all candidates; none is implemented here. Until one
+is, treat the roles as advisory against a hostile co-resident module and load-bearing against
+an honest one.
 
 ---
 
@@ -1002,7 +1049,7 @@ Every request is classified by the **caller identity** the platform reports
 |------|---------|--------|
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | the configured **approver only** (default `signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
-| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `caller_identity` | ungated |
+| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `caller_identity` — and, for now, `configure` | ungated |
 | **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | the configured **custodian only** (default `keystore_ui`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
@@ -1024,6 +1071,10 @@ any module could guess at the vault password there, and a correct guess DESTROYE
 An **empty** custodian admits nobody. That is the same fail-closed direction Tier A took
 before `signer_ui` shipped: an unconfigured role means the surface that should hold it does
 not exist yet, and the capability is then unavailable rather than universal.
+
+**Who sets the roles is itself ungated.** `configure` names both, and nothing stops a caller
+naming itself — so Tier D currently keeps an honest deployer's policy rather than enforcing
+one against a hostile co-resident module. See [`configure`](#configureconfig_json-string---string).
 
 ### Caller identity — live, and what it reports
 
@@ -1352,13 +1403,14 @@ mistaken for a signable Ethereum digest.
 
 ### `caller_identity() -> String`
 
-Ungated observability: `{ ok, kind, identity, approver, custodian, configError }`
-where `kind` is one of `unknown` | `host` | `module` | `derived` | `operator`.
+Ungated observability: `{ ok, kind, identity, approver, custodian }` where `kind` is one of
+`unknown` | `host` | `module` | `derived` | `operator`.
 
-`configError` is empty in normal operation. It is non-empty when `keystore.json`
-exists but could not be read: both roles are then the empty string, which admits
-nobody, and this field is what says so rather than leaving every gated method
-failing for no stated reason.
+`approver` and `custodian` are the names currently in force — the built-in defaults, or
+whatever `configure` last set. An **empty** one means that role is held by nobody and every
+method of its tier refuses, which is what this field exists to make visible. (It used to
+carry a `configError` naming an unreadable `keystore.json`; there is no config file any
+more, so that state cannot occur and the field is gone.)
 
 ### Events
 
@@ -1437,6 +1489,13 @@ Until that hook runs, `self.ks` is `None` and `String`-returning methods report
 The `instance_persistence_path` is supplied by the Logos runtime
 (`RustModuleContext`), so each module instance gets its own isolated vault
 directory.
+
+**Nothing is read from that directory as configuration.** It is owned by the module
+instance and may be sandboxed away from every other process, so nothing outside can be
+relied on to write there — and it does not exist until this module has written to it.
+The two role names arrive by method call
+([`configure`](#configureconfig_json-string---string)); everything else the module needs it
+either defaults or computes.
 
 ### Directory layout
 
@@ -1605,12 +1664,12 @@ Four reads had that shape, and all four now refuse:
 | `Keystore::get_provenance` | `accounts.json` | "this account came from nowhere" |
 | `Keystore::get_labels` | `labels.json` | "no names" → the next `set_label` erases them all |
 | `Keystore::get_group_labels` | `group-labels.json` | "no wallet names" → the next `set_group_label` erases them all, and every wallet frame falls back to an address that moves |
-| glue `on_context_ready` | `keystore.json` | "not configured" → both roles revert to their **defaults**, re-granting approver and custodian to modules the deployer may have replaced |
 
-`keystore.json` fails closed rather than loud, because `on_context_ready` cannot
-return an error: an unreadable config sets both roles to the **empty string**, which
-`gate::holds_role` admits nobody for, and states the reason in
-`caller_identity().configError`.
+A fifth read used to sit in this table: `on_context_ready` read the role names from
+`<persistence>/keystore.json`, and an unreadable one emptied both roles rather than
+reverting to defaults. That read is gone — the roles arrive by
+[`configure`](#configureconfig_json-string---string) — and with it the whole class: a call
+either parses or is refused, and a refused one changes nothing.
 
 **Writes are staged and renamed.** `write_json` writes `<name>.json.tmp`, `sync_all`s
 it, restricts it to 0600 and renames it into place, so a crash or a full disk leaves
