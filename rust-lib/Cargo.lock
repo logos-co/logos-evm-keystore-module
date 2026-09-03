@@ -1862,6 +1862,7 @@ name = "keystore_module"
 version = "1.0.0"
 dependencies = [
  "alloy",
+ "coins-bip32",
  "eth-keystore",
  "hex",
  "logos-rust-sdk",

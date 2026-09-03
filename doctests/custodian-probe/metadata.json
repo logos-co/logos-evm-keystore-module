@@ -1,0 +1,21 @@
+{
+  "name": "keystore_custodian",
+  "version": "1.0.0",
+  "description": "Doc-test fixture: a Tier D custodian. Stands in for keystore_ui so the account-mutation gate can be proven headlessly, from both sides.",
+  "author": "Logos Core Team",
+  "type": "core",
+  "interface": "cdylib",
+  "category": "test",
+  "main": "keystore_custodian_plugin",
+  "dependencies": ["keystore_module"],
+  "include": [],
+  "capabilities": [],
+  "codegen": {
+    "rust": { "crate": "rust-lib", "trait": "KeystoreCustodianModule", "source": "src/glue.rs" }
+  },
+  "nix": {
+    "external_libraries": [],
+    "packages": { "build": [], "runtime": [] },
+    "cmake": { "find_packages": [], "extra_include_dirs": [] }
+  }
+}
