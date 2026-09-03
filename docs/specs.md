@@ -203,7 +203,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 
 | Method | Params | Returns | Mutates accounts? |
 |--------|--------|---------|-------------------|
-| `configure` | `config_json: String` | `{ ok, approver, custodian }` | no — sets who may |
+| `configure` | `config_json: String` | `{ ok, approvers, custodians }` | no — sets who may |
 | `create_mnemonic` | `words: i64` | `{ ok, phrase }` | no |
 | `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin }` | yes → event |
 | `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
@@ -236,19 +236,25 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `acknowledge` | `handle: String` | `{ ok, bundle_id, requester, render_lines }` | no |
 | `approve` | `handle, bundle_id, password: String` | `{ ok, signed_count: n }` | no |
 | `reject` | `handle: String` | `bool` | no |
-| `caller_identity` | — | `{ ok, kind, identity, approver, custodian }` | no |
+| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians }` | no |
 
 ---
 
 ### `configure(config_json: String) -> String`
 
-Name who holds the two roles. `config_json` is `{ approver?, custodian? }`; the reply is
-`{ ok, approver, custodian }` echoing what is now in force, or the usual
+Name who holds the two roles. `config_json` is `{ approvers?, custodians? }`; the reply is
+`{ ok, approvers, custodians }` echoing what is now in force, or the usual
 `{ ok: false, error }`. It takes effect on the next call — nothing is reloaded.
 
+**A role is a set.** Each key takes one name or a list of them, because a terminal signer
+has to approve *alongside* `signer_ui` rather than by displacing it. Blanks and repeats are
+normalised out, so `is_empty()` and "admits nobody" can never disagree. The pre-list
+`approver`/`custodian` spelling is refused as an unknown key — the right way for a stale
+configuration to fail, since accepting it silently would empty both roles.
+
 **Total, not a patch.** The document is the whole answer to who holds these roles, so one
-it does not name is held by **nobody**: `gate::holds_role` refuses an empty name, and every
-method of that tier then refuses everyone. Half a configuration inheriting the other half
+it does not name is held by **nobody**: `gate::holds_any_role` refuses an empty set, and
+every method of that tier then refuses everyone. Half a configuration inheriting the other half
 from a default is how a deployer who replaced one surface goes on granting the old one.
 Whitespace is not a module name, so a blank string means nobody rather than an unmatchable
 somebody.
@@ -1047,10 +1053,10 @@ Every request is classified by the **caller identity** the platform reports
 
 | Tier | Methods | Admits |
 |------|---------|--------|
-| **A** | `pending`, `acknowledge`, `approve`, `reject` | the configured **approver only** (default `signer_ui`) |
+| **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
 | **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `caller_identity` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | the configured **custodian only** (default `keystore_ui`) |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | a configured **custodian** (default `keystore_ui`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
 names and `gate::tier_d_admits(method, custodian, caller)` is the only decision.
@@ -1403,11 +1409,11 @@ mistaken for a signable Ethereum digest.
 
 ### `caller_identity() -> String`
 
-Ungated observability: `{ ok, kind, identity, approver, custodian }` where `kind` is one of
-`unknown` | `host` | `module` | `derived` | `operator`.
+Ungated observability: `{ ok, kind, identity, approvers, custodians }` where `kind` is one
+of `unknown` | `host` | `module` | `derived` | `operator`.
 
-`approver` and `custodian` are the names currently in force — the built-in defaults, or
-whatever `configure` last set. An **empty** one means that role is held by nobody and every
+`approvers` and `custodians` are the names currently in force — the built-in defaults, or
+whatever `configure` last set. An **empty** list means that role is held by nobody and every
 method of its tier refuses, which is what this field exists to make visible. (It used to
 carry a `configError` naming an unreadable `keystore.json`; there is no config file any
 more, so that state cannot occur and the field is gone.)

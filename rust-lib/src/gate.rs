@@ -15,36 +15,80 @@ pub const DEFAULT_CUSTODIAN: &str = "keystore_ui";
 
 /// Who holds the two roles. Configuration, so it is data rather than a decision — but it
 /// lives here because it is the only input the decisions below take besides the caller.
+///
+/// A role is a SET, not a name. One surface per role was true while Basecamp was the only
+/// frontend; a terminal signer has to be able to approve alongside `signer_ui` rather than
+/// by displacing it, and a single name makes those mutually exclusive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Roles {
-    pub approver: String,
-    pub custodian: String,
+    pub approvers: Vec<String>,
+    pub custodians: Vec<String>,
 }
 
 /// The built-in defaults, in force from load. A module nobody configures is not inert.
 impl Default for Roles {
     fn default() -> Self {
-        Self { approver: DEFAULT_APPROVER.into(), custodian: DEFAULT_CUSTODIAN.into() }
+        Self {
+            approvers: vec![DEFAULT_APPROVER.into()],
+            custodians: vec![DEFAULT_CUSTODIAN.into()],
+        }
     }
 }
 
-/// `{ approver?, custodian? }`. Unknown keys are refused rather than ignored: under the
+/// One role's holders, written either as a bare name or as a list of them. The singular
+/// form is not legacy support — `"approvers": "signer_ui"` is the common case, and making
+/// it spell a one-element array would be noise.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RoleWire {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Default for RoleWire {
+    fn default() -> Self {
+        RoleWire::Many(Vec::new())
+    }
+}
+
+impl RoleWire {
+    /// Trim, drop the blanks, and keep the first of any repeat. Whitespace is not a module
+    /// name, so it means nobody rather than an unmatchable one — and a blank surviving into
+    /// the list would make `is_empty()` disagree with "admits nobody".
+    fn into_holders(self) -> Vec<String> {
+        let raw = match self {
+            RoleWire::One(s) => vec![s],
+            RoleWire::Many(v) => v,
+        };
+        let mut out: Vec<String> = Vec::with_capacity(raw.len());
+        for name in raw {
+            let name = name.trim();
+            if !name.is_empty() && !out.iter().any(|k| k == name) {
+                out.push(name.to_string());
+            }
+        }
+        out
+    }
+}
+
+/// `{ approvers?, custodians? }`. Unknown keys are refused rather than ignored: under the
 /// total rule below a typo'd key would otherwise empty BOTH roles, which fails closed but
-/// says nothing about why.
+/// says nothing about why. That also catches the pre-list `approver`/`custodian` spelling,
+/// which is the right way for a stale configuration to fail.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RolesWire {
     #[serde(default)]
-    approver: String,
+    approvers: RoleWire,
     #[serde(default)]
-    custodian: String,
+    custodians: RoleWire,
 }
 
 impl Roles {
-    /// Replace both roles from a `{ approver?, custodian? }` document.
+    /// Replace both roles from a `{ approvers?, custodians? }` document.
     ///
     /// TOTAL, not a patch: the document is the whole answer to "who holds these roles", so
-    /// one it does not name is held by nobody — `holds_role` refuses an empty name. Half a
+    /// one it does not name is held by nobody — an empty set admits nobody. Half a
     /// configuration inheriting the other half from a default is how a deployer who replaced
     /// one surface goes on granting the old one. A malformed document is refused and the
     /// roles in force are left untouched.
@@ -56,9 +100,8 @@ impl Roles {
             return Err("configuration must be a JSON object".into());
         }
         let wire: RolesWire = serde_json::from_value(doc).map_err(|e| e.to_string())?;
-        // Whitespace is not a module name, so it means nobody rather than an unmatchable one.
-        self.approver = wire.approver.trim().to_string();
-        self.custodian = wire.custodian.trim().to_string();
+        self.approvers = wire.approvers.into_holders();
+        self.custodians = wire.custodians.into_holders();
         Ok(())
     }
 }
@@ -102,6 +145,15 @@ pub fn holds_role(role_holder: &str, caller: &Caller) -> bool {
     !role_holder.is_empty() && caller.is_module(role_holder)
 }
 
+/// Does `caller` hold the role, which any of `role_holders` may hold?
+///
+/// An EMPTY SET admits nobody, for the same reason an empty name does, and by the same
+/// arithmetic — `any` over nothing is false. Holders are independent: adding a terminal
+/// signer to the approvers grants that one name and nothing else.
+pub fn holds_any_role(role_holders: &[String], caller: &Caller) -> bool {
+    role_holders.iter().any(|holder| holds_role(holder, caller))
+}
+
 /// Every keystore mutation, by contract name — the Tier D registry.
 ///
 /// A list rather than a per-method `if`, so "which methods are custodian-only" is one
@@ -139,9 +191,9 @@ pub const TIER_D_METHODS: &[&str] = &[
     "remove_unexplained",
 ];
 
-/// Tier D: the configured custodian, for a method the registry names.
-pub fn tier_d_admits(method: &str, custodian: &str, caller: &Caller) -> bool {
-    TIER_D_METHODS.contains(&method) && holds_role(custodian, caller)
+/// Tier D: a configured custodian, for a method the registry names.
+pub fn tier_d_admits(method: &str, custodians: &[String], caller: &Caller) -> bool {
+    TIER_D_METHODS.contains(&method) && holds_any_role(custodians, caller)
 }
 
 #[cfg(test)]
@@ -150,6 +202,10 @@ mod tests {
 
     fn m(n: &str) -> Caller {
         Caller::Module(n.into())
+    }
+
+    fn holders(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
     }
 
     #[test]
@@ -201,7 +257,7 @@ mod tests {
         // Every name, against every shape of caller. A gate that is right for eight of nine
         // methods is a gate that lets an account be created by whoever asks.
         for method in TIER_D_METHODS {
-            assert!(tier_d_admits(method, "keystore_ui", &m("keystore_ui")), "{method}");
+            assert!(tier_d_admits(method, &holders(&["keystore_ui"]), &m("keystore_ui")), "{method}");
             for other in [
                 m("signer_ui"),
                 m("eth_wallet_backend"),
@@ -211,11 +267,14 @@ mod tests {
                 Caller::Operator("cli".into()),
                 Caller::Derived { parent: "keystore_ui".into(), leaf: "child".into() },
             ] {
-                assert!(!tier_d_admits(method, "keystore_ui", &other), "{method} admitted {other:?}");
+                assert!(
+                    !tier_d_admits(method, &holders(&["keystore_ui"]), &other),
+                    "{method} admitted {other:?}"
+                );
             }
             // An unconfigured custodian admits nobody, including the module named "".
-            assert!(!tier_d_admits(method, "", &m("keystore_ui")), "{method}");
-            assert!(!tier_d_admits(method, "", &m("")), "{method}");
+            assert!(!tier_d_admits(method, &[], &m("keystore_ui")), "{method}");
+            assert!(!tier_d_admits(method, &holders(&[""]), &m("")), "{method}");
         }
     }
 
@@ -247,7 +306,7 @@ mod tests {
         // `new_account` is on this list on purpose: it was removed from the contract, and a
         // gate that still admitted the name would let a resurrected one through ungated.
         for unknown in ["derive_nextaccount", "list_accounts", "approve", "", "DERIVE_NEXT_ACCOUNT", "new_account"] {
-            assert!(!tier_d_admits(unknown, "keystore_ui", &m("keystore_ui")), "{unknown:?}");
+            assert!(!tier_d_admits(unknown, &holders(&["keystore_ui"]), &m("keystore_ui")), "{unknown:?}");
         }
     }
 
@@ -256,19 +315,19 @@ mod tests {
         // A module nobody configures must not be inert: the shipped surfaces work out of
         // the box, and only a deployer replacing one has to say so.
         let r = Roles::default();
-        assert!(holds_role(&r.approver, &m("signer_ui")));
-        assert!(tier_d_admits("import_private_key", &r.custodian, &m("keystore_ui")));
+        assert!(holds_any_role(&r.approvers, &m("signer_ui")));
+        assert!(tier_d_admits("import_private_key", &r.custodians, &m("keystore_ui")));
     }
 
     #[test]
     fn configuring_both_roles_moves_the_gate_to_the_named_modules() {
         let mut r = Roles::default();
-        r.configure(r#"{"approver":"probe_ui","custodian":"probe_custodian"}"#).unwrap();
-        assert!(holds_role(&r.approver, &m("probe_ui")));
-        assert!(tier_d_admits("import_private_key", &r.custodian, &m("probe_custodian")));
+        r.configure(r#"{"approvers":"probe_ui","custodians":"probe_custodian"}"#).unwrap();
+        assert!(holds_any_role(&r.approvers, &m("probe_ui")));
+        assert!(tier_d_admits("import_private_key", &r.custodians, &m("probe_custodian")));
         // And the modules the defaults named lose it in the same call.
-        assert!(!holds_role(&r.approver, &m("signer_ui")));
-        assert!(!tier_d_admits("import_private_key", &r.custodian, &m("keystore_ui")));
+        assert!(!holds_any_role(&r.approvers, &m("signer_ui")));
+        assert!(!tier_d_admits("import_private_key", &r.custodians, &m("keystore_ui")));
     }
 
     #[test]
@@ -276,18 +335,21 @@ mod tests {
         // Named empty, omitted entirely, or given whitespace: all three are "nobody holds
         // this", never "fall back to the default the deployer just replaced".
         for doc in [
-            r#"{"approver":"","custodian":"probe_custodian"}"#,
-            r#"{"custodian":"probe_custodian"}"#,
-            r#"{"approver":"   ","custodian":"probe_custodian"}"#,
+            r#"{"approvers":"","custodians":"probe_custodian"}"#,
+            r#"{"custodians":"probe_custodian"}"#,
+            r#"{"approvers":"   ","custodians":"probe_custodian"}"#,
+            // An explicit empty list, and one holding only blanks, say the same thing.
+            r#"{"approvers":[],"custodians":"probe_custodian"}"#,
+            r#"{"approvers":["","  "],"custodians":"probe_custodian"}"#,
         ] {
             let mut r = Roles::default();
             r.configure(doc).unwrap();
-            assert_eq!(r.approver, "", "{doc}");
+            assert!(r.approvers.is_empty(), "{doc}");
             for who in [m("signer_ui"), m(""), Caller::HostAnchor, Caller::Unknown] {
-                assert!(!holds_role(&r.approver, &who), "{doc} admitted {who:?}");
+                assert!(!holds_any_role(&r.approvers, &who), "{doc} admitted {who:?}");
             }
             // The role that WAS named is unaffected by its neighbour being empty.
-            assert!(tier_d_admits("import_private_key", &r.custodian, &m("probe_custodian")));
+            assert!(tier_d_admits("import_private_key", &r.custodians, &m("probe_custodian")));
         }
     }
 
@@ -296,21 +358,67 @@ mod tests {
         // Refusing has to leave the gate where it was. A partial apply would hand one role
         // to an attacker-chosen name and blame the other half on a parse error.
         let mut r = Roles::default();
-        r.configure(r#"{"approver":"probe_ui","custodian":"probe_custodian"}"#).unwrap();
+        r.configure(r#"{"approvers":"probe_ui","custodians":"probe_custodian"}"#).unwrap();
         let good = r.clone();
         for doc in [
             "",
             "not json",
             "[]",
-            r#"{"approver":5}"#,
-            r#"{"approver":null}"#,
+            r#"{"approvers":5}"#,
+            r#"{"approvers":null}"#,
+            r#"{"approvers":["signer_ui",5]}"#,
             // A typo'd key, which the total rule would otherwise turn into "nobody holds
             // anything" — fail-closed, but silent about why every method started refusing.
-            r#"{"custodain":"probe_custodian"}"#,
+            r#"{"custodains":"probe_custodian"}"#,
+            // The pre-list spelling, refused for exactly that reason rather than accepted
+            // as a courtesy: a stale configuration must say so, not quietly grant nobody.
+            r#"{"approver":"probe_ui","custodian":"probe_custodian"}"#,
         ] {
             assert!(r.configure(doc).is_err(), "{doc:?} was accepted");
             assert_eq!(r, good, "{doc:?} moved the roles");
         }
+    }
+
+    #[test]
+    fn a_role_admits_every_holder_it_names_and_nobody_else() {
+        // The reason a role is a set: a terminal signer has to approve ALONGSIDE signer_ui,
+        // not by displacing it.
+        let mut r = Roles::default();
+        r.configure(r#"{"approvers":["signer_ui","signer_cli"],"custodians":["keystore_ui"]}"#)
+            .unwrap();
+        assert!(holds_any_role(&r.approvers, &m("signer_ui")));
+        assert!(holds_any_role(&r.approvers, &m("signer_cli")));
+        for other in [
+            m("keystore_ui"),
+            m("eth_wallet_backend"),
+            m(""),
+            Caller::HostAnchor,
+            Caller::Unknown,
+            Caller::Operator("signer_cli".into()),
+            Caller::Derived { parent: "signer_ui".into(), leaf: "child".into() },
+        ] {
+            assert!(!holds_any_role(&r.approvers, &other), "approvers admitted {other:?}");
+        }
+        // A second custodian reaches every mutation, not a subset of them.
+        r.configure(r#"{"approvers":"signer_ui","custodians":["keystore_ui","keystore_cli"]}"#)
+            .unwrap();
+        for method in TIER_D_METHODS {
+            assert!(tier_d_admits(method, &r.custodians, &m("keystore_cli")), "{method}");
+        }
+    }
+
+    #[test]
+    fn blanks_and_repeats_are_normalised_out_of_a_role() {
+        // `is_empty()` has to mean "admits nobody", so a blank must not survive into the
+        // list — a role holding only blanks would otherwise read as configured.
+        let mut r = Roles::default();
+        r.configure(
+            r#"{"approvers":[" signer_ui ","signer_ui","","  ","signer_cli"],"custodians":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.approvers, holders(&["signer_ui", "signer_cli"]));
+        assert!(r.custodians.is_empty());
+        assert!(holds_any_role(&r.approvers, &m("signer_ui")));
     }
 
     #[test]

@@ -13,10 +13,12 @@ Built on well-established crates: [`alloy`](https://github.com/alloy-rs/alloy)
 ## Contract (`KeystoreModule`)
 
 **Configuration:** `configure` names who holds the two roles —
-`{ approver?, custodian? }` → `{ ok, approver, custodian }`. It is **total**: a role the
-document does not name is held by nobody, and an empty name admits no caller. Until it is
-called the built-in defaults stand (`signer_ui` approves, `keystore_ui` mutates), so a
-deployment that configures nothing still works. A malformed document is refused whole and
+`{ approvers?, custodians? }` → `{ ok, approvers, custodians }`. Each role is a **set**, so
+a terminal signer can approve alongside `signer_ui` rather than by displacing it; write one
+name or a list of them. It is **total**: a role the document does not name is held by
+nobody, and an empty set admits no caller. Until it is called the built-in defaults stand
+(`signer_ui` approves, `keystore_ui` mutates), so a deployment that configures nothing still
+works. A malformed document is refused whole and
 leaves the roles in force untouched.
 
 Configuration arrives by **method call**, never as a file in the module's persistence

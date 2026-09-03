@@ -235,7 +235,7 @@ impl KeystoreModuleImpl {
     /// admitting it here would make a plain `logosctl call … approve` a legal
     /// bypass of the human.
     fn is_approver(&self) -> bool {
-        gate::holds_role(&self.roles.approver, &Self::caller())
+        gate::holds_any_role(&self.roles.approvers, &Self::caller())
     }
 
     /// Tier D: the configured custodian, for a method `gate::TIER_D_METHODS` names.
@@ -245,7 +245,7 @@ impl KeystoreModuleImpl {
     /// plain `logosctl call … import_private_key` a legal way in. A method missing from the
     /// registry is refused outright rather than falling through ungated.
     fn may_mutate(&self, method: &str) -> bool {
-        gate::tier_d_admits(method, &self.roles.custodian, &Self::caller())
+        gate::tier_d_admits(method, &self.roles.custodians, &Self::caller())
     }
 
     /// The live caller, reduced to the pure form the gate reasons about.
@@ -383,8 +383,8 @@ impl KeystoreModule for KeystoreModuleImpl {
 
     fn configure(&mut self, config_json: String) -> String {
         match self.roles.configure(&config_json) {
-            Ok(()) => json!({ "ok": true, "approver": self.roles.approver,
-                              "custodian": self.roles.custodian })
+            Ok(()) => json!({ "ok": true, "approvers": self.roles.approvers,
+                              "custodians": self.roles.custodians })
             .to_string(),
             Err(e) => err(e),
         }
@@ -889,7 +889,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         let Some(requester) = self.named_caller() else {
             return not_authorized();
         };
-        if self.roles.approver.is_empty() {
+        if self.roles.approvers.is_empty() {
             return not_authorized();
         }
         match self.approvals.request(&requester, &intent_json) {
@@ -1013,7 +1013,7 @@ impl KeystoreModule for KeystoreModuleImpl {
             logos_rust_sdk::LogosCaller::Operator { name } => ("operator", name.clone()),
         };
         json!({ "ok": true, "kind": kind, "identity": name,
-                "approver": self.roles.approver, "custodian": self.roles.custodian })
+                "approvers": self.roles.approvers, "custodians": self.roles.custodians })
         .to_string()
     }
 }
