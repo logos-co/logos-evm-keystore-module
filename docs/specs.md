@@ -1367,6 +1367,8 @@ The module declares a typed event contract:
 ```rust
 pub trait KeystoreModuleEvents {
     fn accounts_changed(&self, count: i64);
+    fn approval_offered(&self, handle: String);
+    fn approval_settled(&self, handle: String, state: String);
 }
 ```
 
@@ -1387,7 +1389,15 @@ failed. `-1` is not `0`: reporting a keystore we could not read as an empty one 
 exactly the defect removed from the layer below, and a subscriber that treats -1 as
 0 reintroduces it. Subscribers (`keystore_ui`, and `eth_wallet_backend`, which relays
 it to the wallet view) re-read their account list on it instead of polling. All event
-params are std-typed (`i64`).
+params are std-typed (`i64`, `String`).
+
+`approval_offered` announces that a new request is waiting, and carries the **handle
+only** — the event plane has no token, so a richer payload would publish the intent to
+every subscriber (see *`handle` vs `receipt`* above). `approval_settled` announces that
+one reached a terminal state, with `state` being `approved` or `rejected`. The other two
+terminal states in the lifecycle above, `expired_no_ack` and `cancelled`, are **not**
+announced — nothing emits for them, so a subscriber waiting on a settlement event for a
+request the human never saw waits forever. Poll `approval_status` for those.
 
 The rule is held by `rust-lib/tests/every_displayed_mutation_announces_itself.rs`,
 which reads `glue.rs` and fails if a listed mutator's success path stops emitting —

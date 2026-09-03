@@ -6,10 +6,11 @@ name: keystore-module Unit Tests
 # workflow in the repo was doctests.yml, which exercises the module end-to-end through a
 # logoscore daemon and can be green while a refusal rule is quietly wrong.
 #
-# `--no-default-features` drops the `logos_module` glue and with it the logos-rust-sdk path
-# dependency, so this needs no SDK checkout, no nix and no network beyond crates.io — which
-# is why it can be a plain cargo job while everything else here goes through nix. (nix's own
-# fetcher gets 403s from crates.io; plain cargo does not.)
+# `--no-default-features` drops the `logos_module` glue, so the logos-rust-sdk is never
+# COMPILED here — but cargo still RESOLVES its manifest, which is why the SDK is checked out
+# below. Beyond that this needs no nix and no network past crates.io, which is why it can be
+# a plain cargo job while everything else here goes through nix. (nix's own fetcher gets 403s
+# from crates.io; plain cargo does not.)
 
 on:
   pull_request:
@@ -34,6 +35,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.89"
+
+      - name: Provide the SDK manifest cargo insists on resolving
+        # `--no-default-features` drops the logos_module feature, so the SDK is
+        # never COMPILED here -- but cargo still resolves the manifest of an
+        # optional path dependency, and `logos-rust-sdk-src` is gitignored
+        # because the nix builder stages it at build time. Without this the job
+        # dies before running a single test:
+        #   failed to load manifest for dependency `logos-rust-sdk`
+        # Any recent rev serves; nothing from it is built.
+        uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          path: logos-rust-sdk-src
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -98,7 +112,7 @@ jobs:
             keystore::tests::a_wallet_name_round_trips_and_clears_like_an_account_name \
             keystore::tests::naming_an_account_needs_its_password_and_clearing_the_name_does_not \
             keystore::tests::naming_a_wallet_with_accounts_needs_one_of_their_passwords \
-            keystore::tests::a_wallet_with_nothing_under_it_is_named_without_a_secret \
+            keystore::tests::only_a_wallet_that_holds_nothing_is_named_without_a_secret \
             keystore::tests::removing_a_wallet_takes_its_record_and_its_name_and_nothing_else \
             keystore::tests::a_wallet_that_still_holds_anything_is_refused_rather_than_stripped \
             keystore::tests::a_key_at_the_staging_path_blocks_removal_exactly_as_the_live_one_does \
