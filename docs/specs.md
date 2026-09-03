@@ -55,8 +55,8 @@ The module is two layers that are deliberately decoupled by a Cargo feature:
 * **The Logos glue** (`rust-lib/src/glue.rs`) — the `KeystoreModule` contract
   trait and its implementation, compiled only behind the default `logos_module`
   feature. It marshals every structured value across the IPC boundary as a JSON
-  string, wires the on-context-ready hook to a persistence path, and emits the
-  `accounts_changed` event.
+  string, wires the on-context-ready hook to a persistence path, and emits
+  `accounts_changed` after every mutation that changes what a reader displays.
 
 ```mermaid
 flowchart TB
@@ -204,14 +204,28 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | Method | Params | Returns | Mutates accounts? |
 |--------|--------|---------|-------------------|
 | `create_mnemonic` | `words: i64` | `{ ok, phrase }` | no |
-| `import_mnemonic` | `params_json: String` | `{ ok, address }` | yes → event |
-| `new_account` | `password: String` | `{ ok, address }` | yes → event |
+| `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin }` | yes → event |
+| `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
+| `derive_account_at` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
+| `preview_addresses` | `params_json: String` | `{ ok, group, addresses: [..] }` | no |
+| `create_unrelated_account` | `params_json: String` | `{ ok, address, origin }`, or a refusal without the acknowledgement | yes → event |
+| `forget_derivation` | `params_json: String` | `{ ok, group, storage, recordUpdated, stranded, stagedRemoved }` | no |
+| `remove_group` | `params_json: String` | `{ ok, group, recordRemoved, nameRemoved }` | no — refuses while the wallet holds a key or an account |
+| `list_groups` | — | `{ ok, groups: [..] }` | no |
+| `list_derivation_keys` | — | `{ ok, groups: [id, ..], staged: [id, ..], unexplained: [path, ..], links: [..] }` | no |
+| `get_provenance` | — | `{ ok, accounts: {..} }` | no |
+| `settle` | — | `{ ok, swept, promoted, unexplained, links, staged, importStages }` | removes leftovers |
+| `remove_unexplained` | `params_json: String` | `{ ok, removed }` | removes one reported path |
 | `import_private_key` | `priv_hex: String, password: String` | `{ ok, address }` | yes → event |
 | `import_keystore_json` | `key_json, password, new_password: String` | `{ ok, address }` | yes → event |
 | `export_keystore_json` | `address, password: String` | `{ ok, keystore }` | no |
-| `list_accounts` | — | `{ ok, accounts: [..] }` | no |
+| `list_accounts` | — | `{ ok, accounts: [..], staged: [..], unexplained: [path, ..], mismatched: [..] }` | no |
 | `has_address` | `address: String` | `bool` | no |
 | `delete_account` | `address, password: String` | `bool` | yes → event |
+| `set_label` | `address, label, password: String` | `{ ok }` | no |
+| `get_labels` | — | `{ ok, labels: { <address>: <name> } }` | no |
+| `set_group_label` | `params_json: String` | `{ ok }` | no |
+| `get_group_labels` | — | `{ ok, labels: { <groupId>: <name> } }` | no |
 | `request_approval` | `intent_json: String` | `{ ok, handle, receipt, state }` | no |
 | `approval_status` | `handle, receipt: String` | `{ ok, state, reason? }` | no |
 | `fetch_result` | `handle, receipt: String` | `{ ok, signed: [..] }` | no |
@@ -247,44 +261,81 @@ logosctl call keystore_module create_mnemonic 12
 
 ### `import_mnemonic(params_json: String) -> String`
 
-Derive a single account from a mnemonic along the BIP-44 Ethereum path
-`m/44'/60'/0'/0/<accountIndex>` and persist its scrypt vault. The argument is a
-**JSON object** (`ImportMnemonicParams`):
+Derive an account from a mnemonic along the BIP-44 Ethereum path
+`m/44'/60'/<bip44Account>'/<change>/<accountIndex>`, persist its scrypt vault, and
+create the account's **derivation group**. The argument is a **JSON object**
+(`ImportMnemonicParams`):
 
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
 | `phrase` | string | yes | The BIP-39 mnemonic |
-| `passphrase` | string | no (default `""`) | Optional BIP-39 passphrase (the "25th word"); applied only if non-empty |
-| `accountIndex` (alias `account_index`) | u32 | no (default `0`) | HD index to derive |
+| `passphrase` | string | no (default `""`) | BIP-39 passphrase (the "25th word"). ASCII only — see below |
+| `accountIndex` (alias `account_index`) | u32 | no (default `0`) | The **address** index — the fifth path level |
 | `password` | string | yes | Vault password used to scrypt-encrypt the derived key on disk |
+| `storage` | string | no (default `"plain"`) | `"plain"` keeps nothing; `"extkey"` keeps the account key so later accounts can be derived without the phrase |
+| `bip44Account` | u32 | no (default `0`) | The **hardened BIP-44 account** level — the third |
+| `change` | u32 | no (default `0`) | `0` external, `1` change |
+| `groupPassword` | string | required when `storage` is `"extkey"` | Password for the group's own derivation-key vault |
+| `groupLabel` | string | no | Human name for the wallet |
 
-Both `accountIndex` and `account_index` are accepted (serde alias). On success
-emits `accounts_changed`.
+`accountIndex` and `bip44Account` are **different levels** and the names are a
+trap worth reading twice: `accountIndex` predates the BIP-44 account level and
+still means the address index.
 
-**Success:** `{ "ok": true, "address": "0x…" }`
+`storage` defaults to `"plain"`, so a pre-HD call shape behaves exactly as it did
+— nothing is retained and the group is recorded as not derivable. On success emits
+`accounts_changed`.
+
+**Success:** `{ "ok": true, "address": "0x…", "path": "m/44'/60'/0'/0/0", "group": "g_…", "storage": "plain", "index": 0, "origin": "derived" }`
 **Error:** `{ "ok": false, "error": "<parse / derivation error>" }`
 
 ```bash
 logosctl call keystore_module import_mnemonic \
   @mnemonic.json   # {"phrase":"test test … junk","accountIndex":0,"password":"pw"}
-# → {"ok":true,"address":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"}
+# → {"ok":true,"address":"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266", …}
 ```
+
+**The BIP-39 passphrase is part of the secret.** Same phrase, different passphrase
+⇒ a completely disjoint account tree. It is **not stored** and **not recoverable**;
+losing it loses the accounts as completely as losing the phrase. It is also **not
+trimmed** — a trailing space is a different passphrase, and trimming would derive
+accounts no other wallet recovers.
+
+**Non-ASCII passphrases are refused.** BIP-39 salts with the NFKD form of the
+passphrase; `coins-bip39` salts with the raw bytes it is handed, so `"café"` typed
+NFC and NFD would derive different accounts here and a normalizing wallet would
+disagree with both. ASCII is NFKD-invariant, so refusing now keeps the option of
+normalizing later **without changing any address that is derivable today**.
 
 ---
 
-### `new_account(password: String) -> String`
+### `new_account` — **removed**
 
-Create a brand-new random account (`PrivateKeySigner::random()`) and persist its
-scrypt vault under `password`. Emits `accounts_changed`.
+`new_account(password)` created an account from a random key. It has no replacement of
+the same shape, on purpose: [`create_unrelated_account`](#create_unrelated_accountparams_json-string---string)
+is now the only way to obtain a random key, and it requires an explicit acknowledgement.
 
-* **`password`** — vault password.
+The method was safe only where the keystore held no recovery phrase, so it grew a guard
+that scanned the directory and refused when it found derivation material. Seven rounds of
+fix-and-review could not make that guard sound, and the reason is structural rather than a
+missing case:
 
-**Success:** `{ "ok": true, "address": "0x…" }`
-**Error:** `{ "ok": false, "error": "vault error: …" }` (e.g. I/O failure)
+* every name the layout recognises becomes a hiding place — material wearing a recognised
+  name (`labels.json`, `.lock`) skipped the content check entirely and minted;
+* every name it does **not** recognise has to count as possible key material, so any stray
+  file wedged the store;
+* an account key and a derivation key **are the same shape**, and telling them apart needs
+  the password.
 
-```bash
-logosctl call keystore_module new_account hunter2
-```
+"Is there live key material anywhere under this store" is not decidable by inspection. The
+danger was never "a key exists on disk" — it was "a user got an unrecoverable key without
+knowing". That is made impossible directly: a random key may only be obtained through a
+door that says what it does and requires the acknowledgement, and no on-disk state either
+grants or withholds one.
+
+Callers that were calling `new_account` on an HD wallet want
+[`derive_next_account`](#derive_next_accountparams_json-string---string); callers that
+really wanted a random key want `create_unrelated_account` and now have to say so.
 
 ---
 
@@ -342,16 +393,45 @@ JSON is itself scrypt-encrypted — it is *not* a cleartext key.
 
 ### `list_accounts() -> String`
 
-List the addresses of all persisted vaults. Vaults are discovered by reading the
-keystore directory and parsing each `<addr>.json` filename back into an address;
-the list is sorted.
+List the addresses of all persisted vaults, through the one directory scan (see
+[Directory layout](#directory-layout)). The list is sorted.
 
-**Success:** `{ "ok": true, "accounts": ["0x…", "0x…"] }` (empty array if none)
-**Error:** `{ "ok": false, "error": "keystore not initialized (context not ready)" }`
+Two fields beyond the addresses, both of which used to be dropped in silence:
+
+* **`staged`** — a vault an interrupted write left at `.stage-<addr>/`. Normally
+  empty: the call settles the directory first, promoting such a copy to its real
+  path (it is the ONLY copy of that key) or reaping it when the real vault is
+  already there. It is non-empty only when the repair itself could not run.
+* **`unexplained`** — paths under the keystore directory that this module did not
+  write: a hand-placed `backup.json`, a `.DS_Store`, a leftover from an older
+  version. **Reported, not refused** — listing and signing keep working whatever
+  is here, and a wallet must not be bricked by a stray file. Both severities appear
+  (see *possible key material* below): a bucket is a severity, never a filter on
+  what a reader is shown.
+
+* **`mismatched`** — vault files whose own `address` field disagrees with their
+  filename, as `<file> holds 0x<address>`. They are **not listed as accounts**: the
+  two claims cannot both be true, and the wallet must not report an address whose
+  vault disputes it. They also appear in `unexplained`, so `remove_unexplained`
+  reaches them.
+
+A filename is a **claim**, never a proof. Where a vault declares no address — the
+ones this module writes do not — the mismatch is not knowable without a password, so
+it is caught at every *use* instead: `sign_message`, `sign_digest`,
+`export_keystore_json`, `change_password`, `delete_account` and `approve` all
+re-derive the address from the decrypted key and refuse if it is not the one that
+was asked for. Before that check, a vault renamed onto another address's filename
+signed as that address, with a key that was never its own.
+
+**Success:** `{ "ok": true, "accounts": ["0x…"], "staged": [], "unexplained": [], "mismatched": [] }`
+**Error:** `{ "ok": false, "error": "keystore not initialized (context not ready)" }`,
+or `{ "ok": false, "error": "<dir> is unreadable, and an unreadable file is not an
+empty one …" }`. An UNREADABLE keystore directory refuses. It used to return an
+empty array, so a user with a funded wallet was told they had none.
 
 ```bash
 logosctl call keystore_module list_accounts
-# → {"ok":true,"accounts":["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"]}
+# → {"ok":true,"accounts":["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"],"staged":[],"unexplained":[],"mismatched":[]}
 ```
 
 ---
@@ -387,6 +467,523 @@ logosctl call keystore_module delete_account <address> pw
 
 ---
 
+### Naming accounts and wallets
+
+Four methods: the two `set_` calls are **Tier D** *and* need a password (below), and the
+two `get_` calls are **ungated** (a name is not a secret, and a picker needs it). Both
+`set_` calls emit `accounts_changed` on success — a rename changes what every picker on
+the machine is showing, and the count in the payload does not move.
+
+| Method | Params | Returns |
+|--------|--------|---------|
+| `set_label` | `address: String, label: String, password: String` | `{ ok: true }` |
+| `get_labels` | — | `{ ok: true, labels: { "<address>": "<name>" } }` |
+| `set_group_label` | `params_json: String` — `{ group, label, address?, password? }` | `{ ok: true }` |
+| `get_group_labels` | — | `{ ok: true, labels: { "<groupId>": "<name>" } }` |
+
+```bash
+logosctl call keystore_module set_group_label \
+  '{"group":"g_0123456789abcdef0123456789abcdef","label":"Cold storage","address":"f39F…","password":"pw"}'
+# → {"ok":true}
+logosctl call keystore_module get_group_labels
+# → {"ok":true,"labels":{"g_0123456789abcdef0123456789abcdef":"Cold storage"}}
+```
+
+**Setting a name needs a password; clearing one never does.** A label is what a reader
+shows *in place of* an address, so writing one is a claim of custody — and until this
+landing it was the one keystore mutation with no proof behind it, while delete, export
+and change-password each had one. What is required depends on what the name speaks for:
+
+| What is named | To SET a name | To CLEAR one |
+|---------------|---------------|--------------|
+| an account | that account's own vault password | nothing |
+| a wallet with ≥1 account | `address` + `password` of **one of its own accounts** | nothing |
+| a wallet with no accounts but a key on disk | `password` of that **derivation key** (no `address`) | nothing |
+| a wallet that holds nothing | nothing — no accounts and no key, so it names nothing and can never gain anything to name | nothing |
+
+The wallet is priced by what it **holds**, from the one `Holdings` predicate `remove_group`
+refuses on — not by whether it happens to have accounts *today*. Holding any account is
+precisely the claim "this wallet is mine", and where there are accounts the **group**
+password is still *not* accepted: it proves you can *make* accounts, not that you own the
+ones the header speaks for. With **no** accounts that rejection has nothing to reach — there
+are none to own, and the only thing the name will come to stand for is the accounts that key
+mints — so the key's own password is exactly the right proof.
+
+This costs the free rename of a **stranded** key, which an earlier landing exempted as "the
+row you most need to name before deleting it, and the one whose password is most likely
+lost". The exemption rested on a stranded key never gaining a record, which is a promise
+made by the very bookkeeping that is already damaged — and this module's rule is that the
+*file* is the fact. Nothing that matters is lost: `forget_derivation` still deletes such a
+key with **no** password, and clearing a stale name still needs none.
+
+Refusals: `the password for this account is not correct` (identical for a wrong password
+and for an unreadable vault — a name is not worth an oracle that tells them apart),
+`naming a wallet that has accounts needs the password of one of them`, `that account
+does not belong to this wallet` (identical whether the address is unknown, malformed, or
+another wallet's, and it never echoes the value it was given — a swapped
+`(address, password)` pair must not put the password into an error string), `naming a
+wallet that keeps a derivation key needs that key's password`, and `the password for this
+wallet's derivation key is not correct`. The staged copy an interrupted import left opens
+the wallet just as the live key does, so it is proved against just the same.
+
+**This is defence in depth, not the boundary.** Tier D already admits exactly one caller,
+so an attacker able to call `set_label` at all *is* the custodian UI. What the password
+buys is parity with the other destructive mutations, against a different adversary: a
+human at an unlocked machine, or anything that can drive the UI without knowing a secret.
+The larger part of the impersonation risk is not here at all — it is that a reader renders
+a name *instead of* an address. The mitigation that removes it is showing both
+(`Treasury · 0x7099…79C8`) wherever an account is chosen.
+
+An empty or whitespace-only `label` **clears** the name; anything else is stored
+trimmed. `set_group_label` refuses a group nothing on disk knows about
+(`{"ok":false,"error":"invalid parameters: no such group: g_…"}`), and an id that is
+not a well-formed group id (`invalid parameters: invalid group id …`) — but it accepts
+a group named by *any* of the four facts the keystore holds: its record in `groups.json`, its key under
+`groups/`, an account whose provenance points at it, or a name already standing over it in
+`group-labels.json`. A wallet a reader can see is one it can name, and a **stranded** key,
+a lost record or a leftover name is exactly when it needs to.
+
+`get_group_labels` answers from `group-labels.json` alone, so it stays readable when
+`groups.json` is not — which is what lets a UI name the wallet it is asking the user
+whether to delete. The same name is also mirrored onto each row of `list_groups` as
+`label`, stranded rows included; a name a build before this one wrote into
+`groups.json` is still shown, and the first rename moves it out of the record so a
+cleared name cannot resurface.
+
+**No uniqueness rule.** Two wallets may carry one name. Which of them a reader is
+looking at is a question for whatever renders them — refusing the write would only
+stop it showing what the user actually did.
+
+**Refuses rather than reads as empty.** A present-but-unreadable `group-labels.json`
+fails every one of these calls, and `list_groups` with it — see *Three states, not
+two*. Writing over it would silently erase every name it held.
+
+---
+
+## HD account derivation (BIP-32 / BIP-44)
+
+### The path, and why it is not configurable
+
+```
+m / 44' / 60' / account' / change / index
+    │     │      │          │        └── address index.   NOT hardened. 0 ≤ index < 2^31
+    │     │      │          └─────────── 0 = external, 1 = change. NOT hardened.
+    │     │      └────────────────────── BIP-44 account.  HARDENED.  0 ≤ account < 2^31
+    │     └───────────────────────────── coin type 60 = Ethereum (SLIP-44). HARDENED.
+    └─────────────────────────────────── purpose 44 (BIP-44). HARDENED.
+```
+
+Hardening breaks the relation `k_parent = k_child − IL` at that level, because a
+hardened child's `IL` is derived from the parent *private* key. BIP-44 hardens the
+three levels whose compromise crosses a boundary a user cares about (purpose, coin,
+account) and leaves the two below open. Ethereum wallets rarely use `change = 1`,
+but **the level must be present**: `m/44'/60'/0'/0` is a different key from
+`m/44'/60'/0'/0/0`.
+
+**Purpose and coin type are never editable through the API.** A "custom path" that
+can change them is a way to make funds unrecoverable, dressed as a feature.
+
+**Paths are parsed by this module, never handed to the crate's parser**
+(`rust-lib/src/hd.rs`). `coins-bip32` filters an `m` segment *anywhere* in the
+string, so `"m/44'/60'/m/0/0"` parses there as a four-level path; and its
+`harden_index` is a bare `index + 2^31`, so `2147483648'` panics in debug and wraps
+in release. Both produce addresses no other wallet recovers. This module parses five
+components itself, checks each level, and reconstructs the canonical string.
+
+### Derivation groups
+
+A **group** is one `(mnemonic, BIP-39 passphrase, BIP-44 account)` triple. The
+storage choice is made once, at import, for the whole group — it cannot be per
+account, because the account key that derives index 3 derives index 5 as well.
+Claiming otherwise would be a lie about what is recoverable.
+
+| `storage` | What is kept | What that reaches |
+|-----------|--------------|-------------------|
+| `plain` (default) | nothing | — adding an account later needs the phrase again |
+| `extkey` | the **account** key `m/44'/60'/<account>'`, in its own scrypt vault | every address under that one Ethereum account: both chains, every index, past and future |
+
+**The root key is never stored, returned, or accepted.** No method emits one, and
+`decode_account_key` refuses any extended key that is not at depth 3 — a group
+opened from a root would silently reach every SLIP-44 coin and every BIP-44
+account. The account key produces exactly the addresses this module can ever
+produce, and nothing else.
+
+**No xpub is exposed, in any tier.** Below the account level BIP-44 is
+non-hardened, so an account xpub *plus any one derived private key* yields the
+parent xprv and with it every sibling — including addresses the user has not created
+yet. `export_keystore_json` makes exporting one account's vault easy and legitimate;
+today that costs one account, and an xpub in circulation would silently make it cost
+the whole account tree. There is also no consumer: this module has no network, and
+balance lookup lives in `eth_rpc_module`, which is handed explicit addresses.
+
+**The trade, stated in both directions.** `plain` has the smaller *at-rest*
+footprint: someone who copies the directory and guesses one account's password gets
+one account. `extkey` has the smaller *in-use* footprint: it runs `to_seed` exactly
+once, ever, while `plain` sends the phrase back through the UI and the IPC boundary
+for every future account, and `coins-bip39::to_seed` leaks two un-wiped heap strings
+per call. The default is `plain`, because the `extkey` benefit is a convenience and
+its cost is a security property.
+
+**Changing your mind.** `extkey` → `plain` is supported (`forget_derivation`) and is
+a real, cheap reduction in exposure. It stays reachable even when the group's record
+is missing or unreadable, because it is keyed on the key files rather than on the
+bookkeeping — and even when the key itself can no longer be opened, because deletion
+does not require reading what it deletes. `plain` → `extkey` is **impossible** — the material is not there — and
+the module does not pretend otherwise: the only honest offer is importing the phrase
+again with `storage: "extkey"`, which re-derives the same addresses.
+
+**Residual, stated rather than papered over.** The extended key cannot be fully
+wiped: `coins-bip32`'s `XKeyInfo` is `Copy` and carries an un-zeroized 32-byte chain
+code, so every derivation step leaves copies behind. A chain code alone is not a key;
+a chain code plus any child private key is the parent xprv. The base58 form is held
+in `Zeroizing` and live `XPriv` values are kept to a minimum.
+
+### Index tracking
+
+`nextIndex` lives per group in `groups.json` and is a **cache, not the authority**.
+It is recomputed on every use as
+`max(nextIndex, 1 + max index recorded in accounts.json for this group)`, so a
+corrupted or hand-edited sidecar can only *skip* an index — never hand out one
+already in use. A gap costs nothing; a collision is two vaults claiming one address.
+
+**Deleting an account retires its index; it is never reused.** A reused path may
+collide with an account that still holds funds, and re-deriving it under a fresh
+password creates two vaults' worth of ambiguity about which password opens what.
+Gaps are what every other wallet produces.
+
+**Gap scanning against the chain is deliberately absent.** Knowing whether an
+address has history requires an RPC, and this module has no network by construction
+(see [Security model](#security-model--invariants)). The shape that keeps the network
+where it already is:
+
+```
+keystore_module.preview_addresses  → addresses only, no keys, no writes, no network
+eth_rpc_module                     → "which of these have history?"
+keystore_module.derive_account_at  → create the ones the user picked
+```
+
+---
+
+### `derive_next_account(params_json: String) -> String`
+
+Add the next account of a derivation group, without the phrase. **Tier D.**
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `group` | string | no | Group id. May be omitted **only** when exactly one group can derive; with several the error names the candidates rather than picking one |
+| `groupPassword` | string | yes | Password for the group's derivation-key vault |
+| `password` | string | yes | Vault password for the **new** account (its own, not the group's) |
+| `change` | u32 | no (default `0`) | `0` external, `1` change |
+
+Walks past any index whose address is already held — an earlier raw-key import can
+occupy one — recording what it is on the way, and never overwriting a vault.
+
+**Success:** `{ "ok": true, "address": "0x…", "path": "m/44'/60'/0'/0/1", "group": "g_…", "index": 1, "origin": "derived" }`
+**Error:** `{ "ok": false, "error": "wallet g_… did not keep a derivation key — import its recovery phrase again to add an account" }`
+
+---
+
+### `derive_account_at(params_json: String) -> String`
+
+Add one account at an index the caller chose. **Tier D.**
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `group` | string | yes | Group id |
+| `groupPassword` | string | yes | Password for the derivation-key vault |
+| `password` | string | yes | Vault password for the new account |
+| `bip44Account` | u32 | no | Asserted against the group's own account level |
+| `change` | u32 | no (default `0`) | |
+| `index` | u32 | yes | Address index |
+
+A `bip44Account` different from the group's is refused **with the reason**: the
+stored key cannot reach another account because that level is hardened. An index
+already held is refused rather than overwriting the vault.
+
+---
+
+### `preview_addresses(params_json: String) -> String`
+
+What a group would derive — **addresses only**. No keys, no vaults written, no
+network. **Tier D**, because it enumerates the user's future addresses, which is a
+linkability leak even though it produces no key.
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `group` | string | yes | Group id |
+| `groupPassword` | string | yes | Password for the derivation-key vault |
+| `change` | u32 | no (default `0`) | |
+| `from` | u32 | no (default `0`) | First index |
+| `count` | u32 | no (default `10`, max **50**) | How many. Capped so this is not a free scrypt-plus-EC-multiply oracle |
+
+**Success:** `{ "ok": true, "group": "g_…", "addresses": [ { "index": 0, "path": "m/44'/60'/0'/0/0", "address": "0x…", "present": true }, … ] }`
+
+---
+
+### `create_unrelated_account(params_json: String) -> String`
+
+**The one door to a key this crate generates from randomness**, opened only when the
+caller says so. Not the only door to a key no phrase restores: `import_private_key` and
+`import_keystore_json` accept caller-supplied material and require no acknowledgement.
+**Tier D.**
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `password` | string | yes | Vault password |
+| `acknowledgeUnrecoverable` | bool | yes | Must be `true`. This is the safety property, not a formality |
+
+**Success:** `{ "ok": true, "address": "0x…", "origin": "random" }`
+**Refusal:** `{ "ok": false, "error": "an unrelated account is a key your recovery phrase will not restore — its only backup is a vault file you export and keep yourself. Pass acknowledgeUnrecoverable: true to create it anyway" }`
+
+**Enforced by construction.** The acknowledgement produces a value of type
+`ack::Unrecoverable`, and *generating the random key is what that constructor does*. The
+type's field is private to its module, so nothing else in the crate can build one, and the
+only function that persists a random key takes one by value. A code path that skipped the
+acknowledgement has no key to persist and does not compile. A unit test
+(`the_only_random_key_in_this_crate_is_the_acknowledged_one`) reads this crate's own source
+to assert `PrivateKeySigner::random()` appears in exactly one file: `ack.rs`.
+
+This is the property that replaced "no on-disk state mints". The predecessor had to be
+decided by looking at the directory, which is not decidable; this one is decided by the
+caller.
+
+**No on-disk state can withhold it either.** A stray file, an unreadable directory or a
+half-written key does not refuse this method. That is deliberate: refusing left the user
+with a keystore that could neither derive nor create, and nothing on disk changes what the
+caller was told.
+
+---
+
+### `forget_derivation(params_json: String) -> String`
+
+Stop keeping a group's derivation key: delete every path that id can occupy —
+`groups/<id>.json` and `groups/.stage-<id>/` — and flip the group to `plain`.
+**Tier D.** One-way — re-importing the phrase is the only way back. Emits
+`accounts_changed`.
+
+The accounts already derived are **untouched**: they keep signing exactly as before.
+What ends is adding *more* of them without the recovery phrase.
+
+**No password.** Deletion does not require the ability to *open* what it deletes. It
+used to: a vault whose password was lost, or whose bytes were corrupt, could then
+never be removed — and while it sat on disk it went on refusing every new account.
+The user could neither derive nor stop being derivable. Authorisation is the Tier D
+custodian gate, which is where it belongs; a password proves knowledge of the key,
+not intent to destroy it.
+
+Keyed on the key **files**, not on `groups.json`. Routing it through the bookkeeping
+meant a group whose record was lost or unreadable could not be named at all, so its
+whole-wallet key stayed on disk with no way to delete it — and the `extkey → plain`
+downgrade below had no way out. `list_derivation_keys` names such a key.
+
+| Field | Type | Required |
+|-------|------|----------|
+| `group` | string | yes |
+
+**Success:** `{ "ok": true, "group": "g_…", "storage": "plain", "recordUpdated": true,
+"stranded": false, "stagedRemoved": false }`
+
+`recordUpdated` is false when the key was deleted but `groups.json` could not be
+read or rewritten to downgrade the record. `ok: true` means exactly one thing — the
+key is gone — and `recordUpdated` says whether the bookkeeping followed. Reporting a
+deletion that *did* happen as a failure would invite a retry that finds nothing.
+`stranded` means there was no record to update. `stagedRemoved` means a copy left by
+an interrupted import was removed as well as, or instead of, the vault.
+
+---
+
+### `remove_group(params_json: String) -> String`
+
+Remove a wallet's **record** and its **name** — and nothing else. **Tier D.** Emits
+`accounts_changed`.
+
+This exists because a wallet could be listed and not be removable by anything. A group
+consists of up to four things: a record in `groups.json`, a name in `group-labels.json`,
+a derivation key at `groups/<id>.json` (and/or a staged copy), and zero or more accounts.
+`forget_derivation` removes the **key** and reports not-found when there is none — so a
+wallet that is not derivable and holds no accounts had only a record, and no method
+anywhere could take it off the screen.
+
+| Field | Type | Required |
+|-------|------|----------|
+| `group` | string | yes |
+
+**Success:** `{ "ok": true, "group": "g_…", "recordRemoved": true, "nameRemoved": true }`
+
+Both booleans are **reported rather than assumed**, in the shape of `forget_derivation`'s
+reply, so a half-completed removal is visible instead of reading as a clean one. If only a
+name entry survives from an earlier partial write, it is cleared and `recordRemoved` is
+`false`: the operation is total and self-healing. The record goes first and the name
+second — a name left over a vanished record is invisible cruft, while a vanished name over
+a row still on screen is a user-visible surprise.
+
+**It refuses while the wallet still holds anything.**
+
+| The wallet | Result |
+|------------|--------|
+| keeps a derivation key (live **or** staged) | `this wallet still keeps a derivation key — stop keeping it first` |
+| holds ≥1 account | `this wallet still holds N account(s); removing its record would leave them with nothing to name them — delete them first` |
+| has neither a record nor a name | `account not found: no such group: g_…` |
+| id is malformed | `invalid parameters: invalid group id "…"` |
+| `groups.json` / `accounts.json` / the scan is unreadable | the `Corrupt` refusal — never remove on an unread precondition |
+
+So a five-account derivable wallet takes six calls to remove, and that is the correct
+cost: five of those are spendable keys, each with its own password. The alternative —
+re-parenting the accounts to "origin not recorded" — would rewrite each one's provenance
+from `derived` to `unknown` and drop its path, deleting a true fact (that a phrase covers
+that account, and at which path) to make a row disappear. This module does not guess about
+recoverability, and rewriting `derived` to `unknown` is worse than a guess.
+
+**No password, and no acknowledgement.** Because "holds nothing" is the *precondition*,
+nothing signable can be destroyed here — so a password would protect nothing, and a third
+acknowledgement flag would devalue the two that mean something (`acknowledgeUnrecoverable`
+and `acknowledgeMayBeKeyMaterial` exist where key material is genuinely at stake).
+`forget_derivation` and `delete_account` remain the only writers in this module that
+delete key material, each keeping its own acknowledgement.
+
+What is lost is exactly: the wallet's name, its recorded path prefix (`m/44'/60'/N'`) and
+its `nextIndex`/`retired` bookkeeping. Re-importing the phrase does **not** bring the row
+back — it mints a new group id, so it makes a new wallet with no name.
+
+```bash
+logosctl call keystore_module remove_group '{"group":"g_0123456789abcdef0123456789abcdef"}'
+# → {"ok":true,"group":"g_…","recordRemoved":true,"nameRemoved":true}
+```
+
+---
+
+### `list_groups() -> String`
+
+**Ungated**, like `get_labels`: none of it is a secret, and a wallet showing an
+account picker needs it.
+
+```json
+{ "ok": true, "groups": [ { "id": "g_…", "storage": "extkey",
+  "pathPrefix": "m/44'/60'/0'", "nextIndex": 4, "usedIndices": [0, 2, 3],
+  "retiredIndices": [1], "usedPassphrase": true, "label": "Main",
+  "accountCount": 3, "derivable": true, "stranded": false } ] }
+```
+
+`usedPassphrase` is a **boolean, never the value**. `derivable` checks the vault
+*file*, not just the recorded choice, so a deleted key reads as "not derivable"
+rather than as a promise.
+
+`stranded` marks a derivation key on disk that **no record names**. It is listed
+rather than hidden: it cannot derive (there is no recorded path prefix to derive
+against) but it is live whole-wallet material, and hiding it is what made it
+undeletable. Its `pathPrefix` is empty; its `label` is whatever `group-labels.json` holds
+for it, and its `accountCount` is the accounts whose provenance still points at it — a key
+loses its record while the accounts it derived are still here, and both removal and renaming
+read that count as "does this wallet hold anything".
+
+`staged` marks a group whose key an interrupted import left at `groups/.stage-<id>/`.
+It is **not** promoted to the live key — a half-written file is not a vault — so it
+reads as not derivable, but it opens the whole wallet just the same: it refuses a
+random key, and `forget_derivation` removes it.
+
+**Refuses** if `groups.json` or `accounts.json` is present but unreadable — see
+*Three states, not two* below.
+
+---
+
+### `list_derivation_keys() -> String`
+
+What the `groups/` directory holds. **Ungated.** Reads that directory **only**, never
+`groups.json`, so it stays answerable when the bookkeeping is unreadable — which is
+what keeps a stranded key nameable, and therefore deletable.
+
+```json
+{ "ok": true, "groups": ["g_0123456789abcdef0123456789abcdef"],
+  "staged": [], "unexplained": [], "links": [] }
+```
+
+`groups` names every key on disk, at either the final path or the staging one — the
+set `forget_derivation` can reach. `staged` is the subset an interrupted import left
+behind. `unexplained` lists everything else this module did not write that **could be
+a derivation key**, anywhere under the keystore directory and relative to it — not
+only what sits under `groups/` (see *possible key material* below); the scan is total
+over ENTRIES — files, directories, symlinks and sockets alike — so every path is
+accounted for. `links` names any symlink as `<rel> -> <target>`: a link
+at `groups/` would put the key outside the keystore, so the write is refused and the
+link is reported with its destination, which is the only thing a scan of `<ks>/` can
+still say about material that left it.
+
+**The scan is the authority for every question asked of `groups/`** — what is derivable,
+what is deletable, and what is here that this keystore did not write. Those answers used
+to come from different reads, and a key at the staging path was invisible to one of them
+while being just as live. It no longer answers "may a random key be created": that is the
+caller's acknowledgement, not a property of the directory.
+
+---
+
+### `get_provenance() -> String`
+
+Where each account came from, for **every** account the keystore holds. **Ungated**,
+same reasoning as `list_groups`.
+
+```json
+{ "ok": true, "accounts": { "0xf39F…2266": { "origin": "derived", "group": "g_…",
+  "path": "m/44'/60'/0'/0/0", "index": 0, "derivable": true } } }
+```
+
+`origin` is one of `derived` | `imported-key` | `imported-json` | `random` |
+`unknown`. Accounts that predate this feature are reported **`unknown`, never
+guessed** — a guess about recoverability is the one lie this must not tell.
+
+---
+
+### `settle() -> String`
+
+Bring the keystore directory to a state the layout explains and report what is left.
+**Tier D** — it removes things. Emits `accounts_changed`.
+
+* Promotes a vault an interrupted write left at `.stage-<addr>/` when the real vault
+  is gone (the staged copy is then the ONLY copy of that key), reaps it when the real
+  vault is there.
+* Sweeps import scratch at `.stage-import-<nonce>/` — the caller's ciphertext, left
+  by a process killed mid-`import_keystore_json`.
+
+`list_accounts` settles as a side effect, but that is not enough on its own: a stage
+a crash left behind must not be waiting on something happening to list first.
+
+`swept` names the staging directories it removed and `promoted` the vaults it brought
+to their real path — what it *did*, not only what is left. A leftover that is only
+named after it has been swept was never nameable.
+
+```json
+{ "ok": true, "swept": [".stage-import-422cd79c…"], "promoted": [],
+  "unexplained": [], "links": [], "staged": [], "importStages": [] }
+```
+
+---
+
+### `remove_unexplained(params_json: String) -> String`
+
+Remove one path the scan reported as unexplained. **Tier D.** Emits `accounts_changed`.
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `path` | string | yes | Exactly a string `list_accounts`/`settle`/`list_derivation_keys` reported |
+| `acknowledgeMayBeKeyMaterial` | bool | yes | Refuses without it |
+
+Only a string the scan itself produced is accepted, so nothing outside the keystore
+directory can be named — this is not an arbitrary-delete primitive. The
+acknowledgement is required because unidentified material may **be** a live key:
+this module cannot read it, so it cannot promise otherwise.
+
+This is what makes the report actionable. Every shape a crash or a hand-edit leaves
+— a stray `backup.json`, a directory where a vault belongs, an empty directory where
+a derivation key belongs, a `groups/` that is a symlink — is nameable **and**
+removable by the same one call.
+
+**Success:** `{ "ok": true, "removed": true }`
+**Refusal:** `{ "ok": false, "error": "backup.json is material this keystore did not write and cannot read, so it may be a live key — acknowledge that to remove it anyway" }`
+
+```bash
+logosctl call keystore_module remove_unexplained '{"path":"backup.json","acknowledgeMayBeKeyMaterial":true}'
+```
+
+---
+
 ## Human-approved signing
 
 There is **no way to make this module sign anything except by a human approving
@@ -405,8 +1002,14 @@ Every request is classified by the **caller identity** the platform reports
 |------|---------|--------|
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | the configured **approver only** (default `signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
-| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `caller_identity` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `new_account`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label` | the configured **custodian only** (default `keystore_ui`) |
+| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `caller_identity` | ungated |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | the configured **custodian only** (default `keystore_ui`) |
+
+Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
+names and `gate::tier_d_admits(method, custodian, caller)` is the only decision.
+A method **missing** from that list is refused outright rather than falling through
+ungated — so the failure mode of forgetting to gate a new mutation is that it
+refuses everyone, loudly, instead of admitting everyone, silently.
 
 Tiers A, B and D all return the identical string `{"ok":false,"error":"not authorized"}`
 on refusal, so a caller cannot use the error text to probe which tier it failed.
@@ -749,8 +1352,13 @@ mistaken for a signable Ethereum digest.
 
 ### `caller_identity() -> String`
 
-Ungated observability: `{ ok, kind, identity, approver }` where `kind` is one of
-`unknown` | `host` | `module` | `derived` | `operator`.
+Ungated observability: `{ ok, kind, identity, approver, custodian, configError }`
+where `kind` is one of `unknown` | `host` | `module` | `derived` | `operator`.
+
+`configError` is empty in normal operation. It is non-empty when `keystore.json`
+exists but could not be read: both roles are then the empty string, which admits
+nobody, and this field is what says so rather than leaving every gated method
+failing for no stated reason.
 
 ### Events
 
@@ -763,12 +1371,28 @@ pub trait KeystoreModuleEvents {
 ```
 
 `accounts_changed(count)` is emitted (via the generated `emit_accounts_changed`)
-**whenever the set of persisted accounts changes** — after a successful
-`import_mnemonic`, `new_account`, `import_private_key`, `import_keystore_json`, or
-`delete_account`. `count` is the new total number of vaults
-(`Keystore::list_accounts().len()`). Subscribers (e.g. the wallet UI/backend) can
-use it to refresh their account list without polling. All event params are
-std-typed (`i64`).
+**after every mutation that changes what a reader displays** — the account set
+(`import_mnemonic`, `derive_next_account`, `derive_account_at`,
+`create_unrelated_account`, `import_private_key`, `import_keystore_json`,
+`delete_account`) and equally the names and wallets it is displayed under
+(`set_label`, `set_group_label`, `remove_group`, `forget_derivation`,
+`remove_unexplained`, `settle`). Only on the success path: a refusal changed
+nothing. `change_password` is deliberately silent — it re-encrypts a vault and moves
+nothing any reader shows.
+
+`count` is ADVISORY, not a change detector: a rename does not move it, so a
+subscriber that diffs counts sees nothing and must re-read. It is the total vaults
+(`Keystore::list_accounts()?.len()`), or **`-1` for "unknown"** when that listing
+failed. `-1` is not `0`: reporting a keystore we could not read as an empty one is
+exactly the defect removed from the layer below, and a subscriber that treats -1 as
+0 reintroduces it. Subscribers (`keystore_ui`, and `eth_wallet_backend`, which relays
+it to the wallet view) re-read their account list on it instead of polling. All event
+params are std-typed (`i64`).
+
+The rule is held by `rust-lib/tests/every_displayed_mutation_announces_itself.rs`,
+which reads `glue.rs` and fails if a listed mutator's success path stops emitting —
+the silent `set_label` that left the wallet showing a renamed account under its old
+name was exactly that.
 
 ---
 
@@ -804,6 +1428,110 @@ The `instance_persistence_path` is supplied by the Logos runtime
 (`RustModuleContext`), so each module instance gets its own isolated vault
 directory.
 
+### Directory layout
+
+`rust-lib/src/layout.rs` is the single authority for **every path this module may
+write**, and for the classification of everything found under the keystore
+directory. `Slot` is the only path builder and `Slot::rel` matches exhaustively, so
+a new path does not compile until it has been named; the scan is total, so a path
+that arrives by any other route is still reported rather than dropped.
+
+Two properties make that total rather than nearly total:
+
+* **`Root` is the only source of a path, including a temporary one.** A writer that
+  never *asks* for a path is not bound by "a new path must add a variant", and
+  `import_keystore_json` was exactly that: it took `std::env::temp_dir()`, so the
+  caller's ciphertext sat in a shared directory under a name no authority here could
+  reach and no restart ever swept. Scratch space is now a `Slot` like anything else,
+  and a unit test reads this crate's own source to assert nothing else can mint one.
+* **The classifier is total over ENTRIES, not over files.** Every entry reaching it
+  carries its kind — file, directory, symlink, socket — and a name recognised for one
+  kind is unexplained for the other three. A directory that is not recognised used to
+  be invisible, so an **empty directory** at `groups/<id>.json` was reported by
+  nothing at all.
+
+| Path | What it is |
+|------|------------|
+| `<addr>.json` | one account's scrypt vault |
+| `groups/<id>.json` | one group's derivation key |
+| `groups.json`, `accounts.json`, `labels.json`, `group-labels.json` | bookkeeping sidecars |
+| `.stage-<addr>/` | an account vault mid-write |
+| `groups/.stage-<id>/` | a derivation key mid-write |
+| `.stage-import-<nonce>/import.json` | the caller's vault, mid-`import_keystore_json` |
+| `.ks-stage-*` | a document mid-write (random name, so two processes cannot collide) |
+| `.lock` | cross-process exclusion for the bookkeeping read-modify-write |
+
+Anything else is **unexplained**, and reported by `list_accounts` whatever its
+severity.
+
+**Exactly one refusal is left in the scan, and it is about the report's honesty.** An
+unreadable **root** means the scan saw nothing at all, and answering "no accounts" to
+someone holding a funded wallet is a lie rather than a gap — so it fails as `Corrupt`.
+Every directory *below* the root is reported when it cannot be read (as *possible key
+material*, since a key could be inside) and the rest of the keystore is still answered.
+`groups/` used to refuse there too, which meant one unreadable directory made the store
+unlistable, unsignable and unrepairable at once — `remove_unexplained`, the way out, went
+through the same scan. That was the wedge, and it was only ever load-bearing for the mint
+guard that no longer exists.
+
+#### Possible key material
+
+The two severities are **a judgement about the material, never about the directory
+holding it**. They are a REPORT: since the acknowledgement became the safety property,
+nothing refuses on them, and the split is what a reader is shown. Without a password the
+evidence is:
+
+* its **name** — `g_<32 hex>.json`, a bare `g_<32 hex>`, or `.stage-g_<32 hex>`: a
+  name this module could only have written for a derivation key;
+* its **bytes** — a Web3 Secure Storage vault, which is the shape of an account key
+  and a derivation key alike, and telling the two apart needs the password;
+* whether it could be **looked inside at all** — a directory that cannot be
+  enumerated, or one deeper than the layout explains, is not an empty one.
+
+Sitting under `groups/` adds to that and never subtracts. Keying the split on that
+prefix alone was a defect: the same 594-byte vault one directory over
+(`groups.bak/g_<id>.json`, `.stage-g_<id>/g_<id>.json`, an unreadable directory, or
+renamed to `k.json`) was described by the scan and ignored by the decision that read it.
+Nothing reads it as a decision any more, which is why it no longer has to be complete to
+be correct — and why a stray path can be reported without wedging the store.
+
+The **use path asks the same authority**. `signer_for`, `has_address`,
+`delete_account`, `open_group_key` and every `derive_*` resolve through the scan
+rather than through `Path::exists`, which follows symlinks — so material can no
+longer be live and signable while the wallet reports it absent. If the authority does
+not name it, using it is refused and `remove_unexplained` names it instead.
+
+Staging directories are named after what they hold rather than randomly, so a copy
+a SIGKILL leaves behind is nameable, and therefore classifiable and deletable. A
+`.stage-<addr>` holding a vault is settled on the next read: **promoted** when the
+real vault is gone (it is the only copy of that key, and it goes through the same
+`check_kdf_params` ceiling first) and **reaped** when the real vault is present
+(`change_password` only reaches staging after the old vault has been proved
+intact). `.stage-import-<nonce>` is swept, never promoted: the vault it was being
+re-encrypted into either landed or did not. A `.ks-stage-*` document is reported but
+never reaped — a peer mid-write holds an open descriptor on one.
+
+The sweep runs as a side effect of listing **and** by name, as `settle()`. Anything
+it cannot explain is removable by name too, with `remove_unexplained()` — including a
+`groups/` that turned out to be a symlink, which is refused at the write (a key
+through it would land outside the keystore, where no scan of it could ever name what
+landed) and reported with its destination.
+
+### Concurrent access
+
+Mutations of the sidecars take an exclusive `flock` (`LockFileEx` on Windows, where
+it is mandatory rather than advisory) on `<keystore>/.lock` for the duration of one
+read-modify-write. Without it, two processes each adding an account both read, both
+insert, both rename, and one record is lost. It is a **refusal, not a wait**: after
+a second it gives up and says which lock it could not get, because blocking behind a
+hung peer while a user waits on a wallet is worse than a legible refusal. It is
+never held across a scrypt derivation, and never nested (`std` documents that
+re-locking one file from a single process may deadlock, so nesting is a hard error).
+
+Note this guards the keystore *directory*, which is separate from a runtime
+single-instance guard: two `logoscore` daemons with different `--config-dir` values
+can still point at one absolute data directory.
+
 ### On-disk vault files
 
 * **One file per account**, named `<lowercase-hex-address>.json` (no `0x`
@@ -811,8 +1539,78 @@ directory.
 * Each file is a **scrypt-encrypted keystore JSON** (Web3 Secure Storage format)
   produced by `eth-keystore::encrypt_key`. The 32-byte secp256k1 private key is
   the encrypted payload; the password is the scrypt secret.
-* `list_accounts` works purely by listing the directory and parsing filenames; no
-  vault is decrypted to enumerate accounts.
+* No vault is decrypted to enumerate accounts. Enumeration is one scan of the
+  directory (below), not a name-pattern filter with a silent else.
+* **Written staged-then-renamed**, like the group key. `eth_keystore::encrypt_key`
+  is one `File::create` straight to its destination — its whole public surface is
+  path-based, there is no encrypt-to-string — so an in-place write leaves a window
+  where a crash TRUNCATES the live vault. The only handle on that write is the
+  directory it writes into, so the module encrypts into `.stage-<addr>/` inside the
+  keystore directory (one filesystem, so the rename is atomic) and renames out. The
+  file is chmod 0600 while still inside the 0700 stage, so it is never briefly
+  world-readable at its real path.
+* **`groups/<group-id>.json`** — one scrypt vault per **derivation group**, holding
+  that group's account key `m/44'/60'/<account>'` as base58 `xprv…` text. Present
+  only for `storage: "extkey"` groups. Written staged-then-renamed (like
+  `change_password`, unlike `persist_signer`): `encrypt_key` writes through
+  `File::create` at the default umask, so restricting afterwards would leave a
+  window at 0644 at the real path. Directory 0700, file 0600. Its KDF parameters
+  are checked (`check_kdf_params`) before decryption, because it is still a file on
+  disk that a local attacker can swap for a scrypt bomb.
+* **`groups.json`** and **`accounts.json`** — sidecars beside `labels.json`, read
+  through **ungated** methods for the same stated reason: a derivation path is not a
+  secret, and an attacker holding the directory already reads the addresses off the
+  filenames. Neither ever contains a phrase, a passphrase or a key.
+* The group id is `g_` + 16 random bytes in hex. Deliberately **not** the extended
+  key's fingerprint, which is public-key-derived and would be a stable cross-machine
+  correlator for the same phrase. It is validated as an id before it reaches the
+  filesystem, so it cannot escape the keystore directory.
+* One honest admission: the *existence* of `groups/<id>.json` tells an attacker with
+  the directory which wallet is worth cracking. That is unavoidable — the file must
+  exist for the feature to exist.
+
+### Three states, not two
+
+Every JSON this module reads has **three** states, and they must stay distinct:
+
+| State | Meaning | Behaviour |
+|-------|---------|-----------|
+| **absent** | nothing configured yet | treated as empty — the green-field path |
+| **present and readable** | its contents | used |
+| **present and unreadable** | I/O error, truncation, malformed JSON, wrong schema | **refuses**, as `KeystoreError::Corrupt` |
+
+Collapsing the third into the first is how a guard fails open. `get_groups` used to
+do exactly that (`.ok().and_then(…ok()).unwrap_or_default()`), and the guard that used
+to stop an unrecoverable key being minted beside an HD wallet read the result — so
+truncating `groups.json` turned the refusal off. That guard is gone, but the rule it
+depended on stands on its own: `persist_signer` reads `groups.json` and `accounts.json`
+before **any** vault lands, so no key reaches disk with no record of where it came from.
+No attacker is needed; a crash or `ENOSPC` mid-write reaches that state on its own.
+
+Four reads had that shape, and all four now refuse:
+
+| Read | File | What treating it as empty would have said |
+|------|------|-------------------------------------------|
+| `Keystore::get_groups` | `groups.json` | "no wallets here" → a vault lands with no provenance, and `list_groups` hides a live wallet |
+| `Keystore::get_provenance` | `accounts.json` | "this account came from nowhere" |
+| `Keystore::get_labels` | `labels.json` | "no names" → the next `set_label` erases them all |
+| `Keystore::get_group_labels` | `group-labels.json` | "no wallet names" → the next `set_group_label` erases them all, and every wallet frame falls back to an address that moves |
+| glue `on_context_ready` | `keystore.json` | "not configured" → both roles revert to their **defaults**, re-granting approver and custodian to modules the deployer may have replaced |
+
+`keystore.json` fails closed rather than loud, because `on_context_ready` cannot
+return an error: an unreadable config sets both roles to the **empty string**, which
+`gate::holds_role` admits nobody for, and states the reason in
+`caller_identity().configError`.
+
+**Writes are staged and renamed.** `write_json` writes `<name>.json.tmp`, `sync_all`s
+it, restricts it to 0600 and renames it into place, so a crash or a full disk leaves
+the previous file intact rather than a truncated one. The same rule `write_group_vault`
+and `change_password` already followed.
+
+**The file is a cache; the material is the authority.** `list_derivation_keys` names a
+`groups/<id>.json` that no record names — deleting `groups.json` outright is legitimately
+"empty", and the key is still right there, so it stays nameable and therefore deletable.
+`nextIndex` is the same principle stated for indices (see [Index tracking](#index-tracking)).
 
 ### In-memory state
 
@@ -832,6 +1630,17 @@ state to leak — the defect this design replaced was exactly an `unlock` that p
 
 The only cross-call state is the approval ledger (`approval.rs`), which holds
 intents, render text and — briefly — signed *outputs*, never keys.
+
+**Seed and extended-key material is bounded the same way.** A BIP-39 seed exists only
+as an `hd::Seed`, which zeroizes on drop — so every path that builds one wipes it,
+including the error paths, because nothing else ever owns it. A group's extended key
+is decrypted for one call and dropped with it; there is no cached `XPriv`.
+
+**Residual, named rather than papered over:** `coins-bip32`'s `XKeyInfo` is `Copy`
+and holds an un-zeroized 32-byte `ChainCode`, so each derivation step leaves chain-code
+copies in memory, and `coins-bip39::to_seed` builds two heap strings of its own (the
+phrase, and `"mnemonic"` + passphrase) which it does not wipe. A chain code alone is
+not a key; a chain code plus any child private key is the parent xprv.
 
 ### Unsigned-transaction JSON (`UnsignedTx`)
 
@@ -975,6 +1784,27 @@ GitHub Pages.
 * `private_key_import_matches_address` — imported PK yields the expected address.
 * `create_mnemonic_lengths` — 12/24 words succeed, 13 fails.
 * `vault_roundtrip_and_listing` — import → `has_address`/`list_accounts`.
+* `every_on_disk_state_of_an_account_vault_answers_the_same_questions` — the
+  account half of the state table: thirteen on-disk states, each asserting what
+  `list_accounts`, signing, `change_password` and `delete_account` do, that every
+  path holding a live key is either at its real path or named in the report, that a
+  wrong password never signs, and that no state stops the keystore working.
+* `every_path_this_module_writes_is_classified` — drive one of every public
+  mutation, then walk the result: nothing unexplained, nothing staged, nothing left.
+* `every_shape_a_crash_can_leave_behind_is_reported` — the other half: a leftover
+  document stage, the old `groups.json.tmp`, the old `.rekey-<addr>/`, a hand-placed
+  backup, a directory where a vault belongs, a symlink. None may vanish.
+* `re_encrypting_a_vault_replaces_it_atomically_rather_than_truncating_it` — a
+  reader holding the old vault still reads it whole after a re-encryption, which is
+  only true of a rename.
+* `an_unreadable_keystore_directory_is_refused_rather_than_reported_as_an_empty_wallet`
+  — and its counterpart
+  `an_unreadable_directory_below_the_root_is_reported_rather_than_refusing_the_scan`,
+  which is the wedge this round removed.
+* `a_stray_path_is_reported_and_wedges_nothing` — an unreadable `groups/`, an unreadable
+  directory at the root, a vault-shaped file under a name that says nothing, and a plain
+  `.DS_Store`: each is reported by name, each leaves listing, signing, `settle` and an
+  acknowledged account working, and each is removable by name.
 * `there_is_no_unlocked_state_to_reuse` — the structural guarantee: nothing
   survives a signing call that a later caller could reuse.
 * `sign_message_recovers_signer` — EIP-191 signature recovers to the signer.
@@ -990,6 +1820,126 @@ GitHub Pages.
 * `hostile_kdf_params_are_rejected_before_any_derivation`,
   `the_vault_directory_and_files_are_not_group_or_world_readable`,
   `importing_a_vault_leaves_no_temp_copy_behind`.
+
+**HD derivation** (`rust-lib/src/hd.rs`, pure — no I/O, no runtime). Every expected
+value is from a published document, not from `coins-bip32`: a derivation that agrees
+only with itself is exactly the bug that makes funds unrecoverable elsewhere.
+
+* `bip32_published_vectors_reproduce_exactly` — BIP-32 test vectors **1, 2 and 3**
+  from the BIP-32 document, every listed chain, compared as serialized `xprv`
+  strings so the version bytes are covered too. Vectors 2 and 3 are not optional:
+  vector 1's root is verbatim the crate's own doc-string, so a suite containing only
+  it is the crate agreeing with itself.
+* `bip39_published_vectors_reproduce_seed_and_root` — eight rows of the reference
+  BIP-39 vector set (12/18/24 words), asserting the 64-byte seed **and** the root
+  xprv with passphrase `"TREZOR"`.
+* `ethereum_addresses_at_consecutive_indices_match_the_published_keys` — four
+  consecutive Anvil accounts, plus the private key at index 0, which is the anchor
+  tying the path to a *published key* rather than to our own arithmetic.
+* `a_bip39_passphrase_yields_a_completely_different_wallet` — a disjoint tree, and
+  a trailing space in the passphrase is a different wallet again.
+* `bip44_hardens_purpose_coin_and_account_and_nothing_below` — moving the hardening
+  by one level in either direction yields a different key.
+* `an_account_key_reaches_every_index_under_it` /
+  `an_account_key_cannot_reach_another_bip44_account` — the two halves of the
+  `extkey` blast-radius claim, made executable rather than prose.
+* `a_stored_account_key_is_an_xprv_never_a_zprv` — invisible in every address-level
+  test: the key bytes are identical and only the four version bytes differ.
+* `a_root_extended_key_is_refused_where_an_account_key_is_expected`.
+* `paths_that_would_derive_something_plausible_and_wrong_are_refused` — the `m`-anywhere
+  trap, the `2^31` hardening overflow, a missing root marker, another coin, hardening
+  in the wrong place, and the wrong number of levels.
+* `a_non_ascii_bip39_passphrase_is_refused_rather_than_silently_diverging`.
+* `an_empty_passphrase_derives_what_the_pre_hd_import_derived` — accounts imported
+  before this feature existed must not move.
+* `seed_material_is_wiped_on_success_and_on_every_error_path` — a thread-local drop
+  probe, so the wipe is observed rather than assumed, without reading freed memory.
+
+**Groups and provenance** (`rust-lib/src/keystore.rs`):
+
+* `an_extkey_group_derives_the_next_accounts_without_the_phrase` — and what is
+  stored is an account key at depth 3, not the root.
+* `the_only_door_to_a_random_key_requires_an_acknowledgement` — on an empty keystore,
+  a derivable wallet and a plain one alike: the refusal says what an unrelated account
+  IS, creates nothing, and the acknowledged call always succeeds.
+* `the_only_random_key_in_this_crate_is_the_acknowledged_one` — reads this crate's own
+  production source and asserts `PrivateKeySigner::random()` appears only in `ack.rs`.
+* `a_plain_group_cannot_derive_and_says_so` — and re-importing the phrase with the
+  key kept derives the **same** addresses, which is what makes that an honest offer.
+* `the_derivation_key_never_reaches_a_different_bip44_account`.
+* `a_deleted_index_is_retired_and_never_reused`.
+* `the_next_index_is_recomputed_from_the_recorded_accounts` — a corrupted cache can
+  skip, never collide; and an index occupied by a raw-key import is walked past.
+* `preview_writes_nothing_and_marks_what_is_already_held`.
+* `a_wrong_group_password_derives_nothing` — and does not destroy the key.
+* `forgetting_a_recorded_group_still_downgrades_it_and_says_so`,
+  `forget_derivation_downgrades_the_group_and_cannot_be_undone`.
+* `every_on_disk_state_of_a_derivation_key_answers_the_same_three_questions` — the
+  state table: final path, staging path, both, neither, corrupt, unreadable, wrong
+  password, a directory where the file belongs (empty, and holding the key), a stale
+  staging directory, an unexplained file, and a live key under an unexplained name.
+  Every `live` row is *measured* — the bytes are decrypted and derived from — and every
+  row asserts the same property: no random key without an acknowledgement, and no
+  on-disk state withholds one that was acknowledged.
+* `a_key_at_the_staging_path_is_reported_exactly_as_the_live_one_is`,
+  `a_blocked_rename_leaves_no_key_at_the_staging_path`,
+  `the_staging_directory_is_removed_even_when_the_write_panics`,
+  `a_key_that_cannot_be_opened_is_still_deletable`.
+* `a_group_id_cannot_escape_the_keystore_directory`.
+* `provenance_is_recorded_for_every_way_an_account_arrives` — and a pre-existing
+  account reads `unknown`, never a guess.
+* `a_group_records_that_a_passphrase_was_used_but_never_its_value` — neither sidecar
+  may carry the phrase, the passphrase or the key.
+* `the_group_vault_is_never_readable_by_anyone_else`,
+  `a_failed_import_leaves_no_half_made_group`,
+  `seed_material_is_built_once_and_wiped_by_every_keystore_entry_point`.
+
+**Wallet names** (`rust-lib/src/keystore.rs`):
+
+* `a_wallet_name_round_trips_and_clears_like_an_account_name` — the name given at import
+  lands in the document rather than the record, is trimmed, is mirrored onto `list_groups`,
+  reads back as neither an account nor a stray, and clears with an empty string.
+* `a_wallet_name_outlives_both_the_key_and_the_record_that_named_it` — a stranded row
+  still carries its name, and once the key is gone too the name is still readable and
+  still settable, because the accounts it derived are still on screen.
+* `a_name_for_a_wallet_that_never_existed_is_refused` — and no hostile id reaches the
+  filesystem.
+* `two_wallets_may_carry_one_name` — the duplicate is storable; distinguishing them is
+  the reader's job.
+* `a_name_an_older_build_left_in_the_record_is_read_and_then_moved_out_of_it` — a
+  cleared name cannot resurface from `groups.json`.
+
+**An unreadable file is not an empty one** (`rust-lib/src/keystore.rs`):
+
+* `a_groups_file_that_cannot_be_read_refuses_before_a_vault_lands` — driven over every
+  corrupt state in turn: truncated, partial JSON, wrong schema, wrong value type, not
+  JSON at all, and (unix) mode `0000`. Each asserts that both an acknowledged random key
+  and a raw-key import refuse, no vault landed, the derivation key survives, and the key
+  is still nameable and deletable.
+* `an_unreadable_accounts_file_refuses_before_the_vault_lands` — the refusal is in
+  `persist_signer`, so no key reaches disk without a record of where it came from.
+* `an_unreadable_labels_file_refuses_rather_than_erasing_every_name`.
+* `an_unreadable_wallet_names_file_refuses_rather_than_erasing_every_name` — the same
+  for `group-labels.json`, plus: `list_groups` refuses with it, and an import refuses
+  rather than landing a wallet it could not name.
+* `an_absent_sidecar_is_still_empty_and_only_the_unreadable_case_refuses` — the
+  green-field path is unchanged, and `{}` is a readable "nothing".
+* `a_derivation_key_on_disk_is_reported_even_with_no_record_of_it` — deleting
+  `groups.json` outright reads as legitimately empty, and the key must still be named.
+* `a_sidecar_is_replaced_atomically_so_a_crash_cannot_truncate_it` — a blocked
+  staging path leaves the destination byte-identical.
+* `a_derivation_key_whose_record_is_gone_can_still_be_named_and_deleted` and
+  `a_stranded_key_is_deletable_even_when_the_bookkeeping_is_unreadable` — the
+  stranded-key escape hatch, over every corrupt state; and the accounts already
+  derived keep signing afterwards.
+
+**Tier D gate** (`rust-lib/src/gate.rs`):
+
+* `tier_d_admits_only_the_custodian_for_every_mutation` — every name in the registry
+  against every shape of caller.
+* `every_hd_derivation_mutation_is_in_the_tier_d_registry`.
+* `a_method_the_registry_does_not_name_is_refused_even_for_the_custodian` — a
+  misspelled gate refuses; it never falls through.
 
 **Approval state machine** (`rust-lib/src/approval.rs`, pure and offline):
 
@@ -1064,11 +2014,61 @@ This module is the wallet's **secret-holding boundary**. Its security properties
    destroys the vault on a correct guess. Rate limiting on vault-decrypting methods
    is a named follow-up, deliberately out of scope for this landing.
 
+   **Deleting key material has exactly two writers**, and neither is reachable by
+   accident: `delete_account` (the account's own password) and `forget_derivation` (Tier D,
+   no password, because a key nobody can open is the one that most has to stay removable).
+   `remove_group` is deliberately *not* a third: it refuses while the wallet holds a key or
+   an account, so the only state it can act on is one where nothing signable exists.
+
 7. **Replay protection.** Every signed transaction binds the `chain_id` (EIP-155
    for legacy, the `chainId` field for EIP-1559), so a signed tx cannot be replayed
    on another chain. The chain is also shown to the human on its own render line.
 
-8. **The gate fails closed, and that was load-bearing while it had to be.** Where a
+8. **The derivation blast radius is bounded and stated.** An `extkey` group stores
+   the **account** key `m/44'/60'/<account>'`, never the root: it reaches every
+   address under one Ethereum account and nothing else, because the account level is
+   hardened. No xpub is exposed in any tier — an account xpub plus any one derived
+   private key yields the parent xprv, which would silently turn
+   `export_keystore_json` from a one-account loss into a whole-tree loss. The choice
+   between `plain` and `extkey` is per **group**, never per account, because the same
+   key derives every index under it.
+
+9. **A random key is never created without an acknowledgement.**
+   `create_unrelated_account` is the only way to obtain one, and the acknowledgement
+   produces the key — so a path that skipped it has nothing to persist and does not
+   compile. `new_account`, which minted one silently on a keystore that looked empty, is
+   removed: whether it was safe rested on a directory scan being complete, and that is
+   not decidable by inspection.
+
+11. **Known gap, tracked:** `acknowledgeUnrecoverable` is a *caller* assertion, not a *user*
+    one. Nothing here distinguishes "the human ticked a box" from "the caller wrote `true`" —
+    measured on the sibling `acknowledgeMayBeKeyMaterial`, which the custodian probe hardcodes,
+    so a command carrying no acknowledgement deleted a whole key directory. It holds today only
+    because Tier D admits exactly one module and that module *is* the screen
+    (`AddAccountSheet.qml` gates the button on the checkbox and passes that same value). That is
+    a trust assumption about the custodian, not a property of this crate.
+
+10. **Known gap, tracked:** `derive_next_account`, `derive_account_at` and
+    `preview_addresses` verify the group password by decrypting, so each is a second
+    *uncounted password oracle* alongside `delete_account` (item 6). It matters more
+    here: the group vault is a higher-value target than any single account vault.
+    Rate limiting on vault-decrypting methods stays the same named follow-up — named,
+    not silently inherited. `forget_derivation` left this list: it no longer decrypts
+    at all, which removes it as an oracle and makes an unopenable key deletable.
+
+    **`set_label` and `set_group_label` joined this list** when naming was made to prove
+    custody: both decrypt a vault, so both confirm a guessed password. Weaker than the rest
+    and stated rather than assumed — a correct guess writes a label, it does not destroy or
+    spend anything. But they are unmetered confirmations like the others, and a wallet
+    rename is reachable on *any* account of that wallet rather than only the one being
+    named, so an attacker holding the custodian surface can choose whichever vault has the
+    weakest password. Naming a wallet that has **no** accounts and a key decrypts the
+    **group** vault, which puts that one arm in the same class as the three calls above
+    rather than in the weaker account-vault class; it is the price of the name not being
+    settable by proving nothing. Clearing a name decrypts nothing and is therefore not an
+    oracle at all — which is one more reason it is exempt.
+
+11. **The gate fails closed, and that was load-bearing while it had to be.** Where a
    caller cannot be named, Tiers A and B refuse *everyone* — the failure mode is
    "nothing can be signed", never "anyone can sign". Identity is live now, so the
    gate admits legitimate callers rather than refusing all of them; the fail-closed

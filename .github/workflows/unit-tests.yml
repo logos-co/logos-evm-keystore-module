@@ -40,20 +40,134 @@ jobs:
           workspaces: rust-lib
 
       - name: cargo test --no-default-features
-        run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
+        # A run that executes ZERO tests reports success. That trap has bitten this repo
+        # twice, so the count is read back off the summary line and a zero fails the job.
+        run: |
+          set -o pipefail
+          cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked \
+            2>&1 | tee /tmp/unit.log
+          ran=$(grep -oE '^test result: ok\. [0-9]+ passed' /tmp/unit.log | awk '{s+=$4} END {print s+0}')
+          echo "tests executed: $ran"
+          [ "$ran" -gt 0 ] || { echo "ZERO tests ran — a green run that executed nothing"; exit 1; }
 
-      - name: The gate tests must actually be present
-        # A refusal suite that silently stops being compiled is worse than none: it reads as
-        # coverage. Assert the NAMES, not a count — a count still passes if someone deletes
-        # the hard test and adds an easier one.
+      - name: The gate and derivation tests must actually be present
+        # A refusal or recoverability suite that silently stops being compiled is worse than
+        # none: it reads as coverage. Assert the NAMES, not a count — a count still passes if
+        # someone deletes the hard test and adds an easier one. That argument applies with
+        # more force to the derivation vectors: they are what stops this module from deriving
+        # addresses no other wallet recovers.
         run: |
           out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
           for t in \
-            the_configured_holder_is_admitted_and_nobody_else_is \
-            an_empty_role_refuses_everyone_including_a_module_named_empty \
-            the_host_anchor_is_refused_however_the_role_is_configured \
-            unknown_derived_and_operator_callers_are_refused \
-            the_approver_and_custodian_roles_are_independent ; do
-            echo "$out" | grep -q "gate::tests::$t" || { echo "MISSING gate test: $t"; exit 1; }
+            gate::tests::the_configured_holder_is_admitted_and_nobody_else_is \
+            gate::tests::an_empty_role_refuses_everyone_including_a_module_named_empty \
+            gate::tests::the_host_anchor_is_refused_however_the_role_is_configured \
+            gate::tests::unknown_derived_and_operator_callers_are_refused \
+            gate::tests::the_approver_and_custodian_roles_are_independent \
+            gate::tests::tier_d_admits_only_the_custodian_for_every_mutation \
+            gate::tests::every_hd_derivation_mutation_is_in_the_tier_d_registry \
+            gate::tests::a_method_the_registry_does_not_name_is_refused_even_for_the_custodian \
+            hd::tests::bip32_published_vectors_reproduce_exactly \
+            hd::tests::bip39_published_vectors_reproduce_seed_and_root \
+            hd::tests::ethereum_addresses_at_consecutive_indices_match_the_published_keys \
+            hd::tests::a_bip39_passphrase_yields_a_completely_different_wallet \
+            hd::tests::bip44_hardens_purpose_coin_and_account_and_nothing_below \
+            hd::tests::an_account_key_reaches_every_index_under_it \
+            hd::tests::an_account_key_cannot_reach_another_bip44_account \
+            hd::tests::a_stored_account_key_is_an_xprv_never_a_zprv \
+            hd::tests::a_root_extended_key_is_refused_where_an_account_key_is_expected \
+            hd::tests::paths_that_would_derive_something_plausible_and_wrong_are_refused \
+            hd::tests::a_non_ascii_bip39_passphrase_is_refused_rather_than_silently_diverging \
+            hd::tests::an_empty_passphrase_derives_what_the_pre_hd_import_derived \
+            hd::tests::seed_material_is_wiped_on_success_and_on_every_error_path \
+            ack::tests::no_random_key_exists_without_the_acknowledgement \
+            keystore::tests::the_only_door_to_a_random_key_requires_an_acknowledgement \
+            keystore::tests::the_only_random_key_in_this_crate_is_the_acknowledged_one \
+            keystore::tests::the_derivation_key_never_reaches_a_different_bip44_account \
+            keystore::tests::a_deleted_index_is_retired_and_never_reused \
+            keystore::tests::the_next_index_is_recomputed_from_the_recorded_accounts \
+            keystore::tests::a_group_id_cannot_escape_the_keystore_directory \
+            keystore::tests::a_group_records_that_a_passphrase_was_used_but_never_its_value \
+            keystore::tests::a_failed_import_leaves_no_half_made_group \
+            keystore::tests::seed_material_is_built_once_and_wiped_by_every_keystore_entry_point \
+            keystore::tests::a_groups_file_that_cannot_be_read_refuses_before_a_vault_lands \
+            keystore::tests::a_derivation_key_on_disk_is_reported_even_with_no_record_of_it \
+            keystore::tests::an_unreadable_accounts_file_refuses_before_the_vault_lands \
+            keystore::tests::an_unreadable_labels_file_refuses_rather_than_erasing_every_name \
+            keystore::tests::an_unreadable_wallet_names_file_refuses_rather_than_erasing_every_name \
+            keystore::tests::a_wallet_name_round_trips_and_clears_like_an_account_name \
+            keystore::tests::naming_an_account_needs_its_password_and_clearing_the_name_does_not \
+            keystore::tests::naming_a_wallet_with_accounts_needs_one_of_their_passwords \
+            keystore::tests::a_wallet_with_nothing_under_it_is_named_without_a_secret \
+            keystore::tests::removing_a_wallet_takes_its_record_and_its_name_and_nothing_else \
+            keystore::tests::a_wallet_that_still_holds_anything_is_refused_rather_than_stripped \
+            keystore::tests::a_key_at_the_staging_path_blocks_removal_exactly_as_the_live_one_does \
+            keystore::tests::removing_a_wallet_that_is_not_there_says_so_and_a_half_removed_one_heals \
+            keystore::tests::an_unreadable_precondition_refuses_the_removal_rather_than_taking_the_record \
+            keystore::tests::a_wallet_name_outlives_both_the_key_and_the_record_that_named_it \
+            keystore::tests::a_name_for_a_wallet_that_never_existed_is_refused \
+            keystore::tests::a_name_an_older_build_left_in_the_record_is_read_and_then_moved_out_of_it \
+            keystore::tests::two_wallets_may_carry_one_name \
+            keystore::tests::an_absent_sidecar_is_still_empty_and_only_the_unreadable_case_refuses \
+            keystore::tests::a_failed_sidecar_write_leaves_the_old_bytes_and_nothing_staged \
+            keystore::tests::a_derivation_key_whose_record_is_gone_can_still_be_named_and_deleted \
+            keystore::tests::a_stranded_key_is_deletable_even_when_the_bookkeeping_is_unreadable \
+            keystore::tests::every_on_disk_state_of_a_derivation_key_answers_the_same_three_questions \
+            keystore::tests::a_key_at_the_staging_path_is_reported_exactly_as_the_live_one_is \
+            keystore::tests::a_blocked_rename_leaves_no_key_at_the_staging_path \
+            keystore::tests::the_staging_directory_is_removed_even_when_the_write_panics \
+            keystore::tests::a_key_that_cannot_be_opened_is_still_deletable \
+            keystore::tests::every_on_disk_state_of_an_account_vault_answers_the_same_questions \
+            keystore::tests::only_the_parent_directory_changes_and_the_answer_does_not \
+            keystore::tests::the_use_path_asks_the_authority_rather_than_the_filesystem \
+            layout::tests::severity_follows_what_the_material_could_be_and_not_where_it_sits \
+            layout::tests::a_vault_under_a_name_that_says_nothing_is_still_possible_key_material \
+            layout::tests::a_directory_the_scan_cannot_see_inside_is_possible_key_material \
+            layout::tests::no_path_lands_in_two_severity_buckets \
+            keystore::tests::every_path_this_module_writes_is_classified \
+            keystore::tests::a_process_killed_mid_import_leaves_its_scratch_inside_the_keystore \
+            keystore::tests::an_import_takes_its_scratch_from_root_and_leaves_none_of_it_behind \
+            keystore::tests::the_only_source_of_a_path_in_this_crate_is_root \
+            keystore::tests::a_vault_whose_key_is_not_its_filename_is_refused_rather_than_signed_for \
+            keystore::tests::a_settled_stage_is_removable_by_name_rather_than_only_by_listing \
+            keystore::tests::a_symlinked_key_directory_refuses_the_write_and_says_where_it_points \
+            keystore::tests::every_path_the_scan_reports_is_removable_by_name \
+            keystore::tests::every_shape_a_crash_can_leave_behind_is_reported \
+            keystore::tests::re_encrypting_a_vault_replaces_it_atomically_rather_than_truncating_it \
+            keystore::tests::an_unreadable_keystore_directory_is_refused_rather_than_reported_as_an_empty_wallet \
+            layout::tests::every_slot_that_names_a_path_is_recognised_again_by_the_scan \
+            layout::tests::the_classifier_is_total_over_entry_kinds \
+            layout::tests::every_entry_kind_the_filesystem_can_hand_back_is_reported \
+            layout::tests::anything_the_layout_did_not_write_is_unexplained_rather_than_dropped \
+            layout::tests::an_unreadable_keystore_directory_refuses_rather_than_reporting_an_empty_wallet \
+            layout::tests::an_unreadable_directory_below_the_root_is_reported_rather_than_refusing_the_scan \
+            keystore::tests::a_stray_path_is_reported_and_wedges_nothing \
+            layout::tests::the_lock_refuses_a_second_holder_rather_than_waiting_out_a_hung_peer \
+            layout::tests::nesting_the_lock_is_an_error_rather_than_a_deadlock \
+            atomic::tests::a_stage_is_removed_on_every_exit_this_process_can_take \
+            atomic::tests::a_blocked_promotion_leaves_nothing_staged \
+            atomic::tests::a_document_is_never_written_in_place_and_never_briefly_world_readable \
+            every_mutation_a_reader_can_see_announces_itself_on_the_success_path \
+            nothing_else_announces_and_no_read_path_does \
+            a_rename_announces_even_though_it_moves_no_count \
+            a_deleted_announcement_is_rejected \
+            an_announcement_moved_to_the_refusal_path_is_rejected \
+            an_unconditional_announcement_ahead_of_the_match_is_rejected ; do
+            echo "$out" | grep -q "$t" || { echo "MISSING test: $t"; exit 1; }
             echo "  present: $t"
           done
+
+      - name: Every contract method must be documented
+        # docs/specs.md is a full API reference that nothing validates, so it drifts
+        # silently. This is the cheap tripwire: a method that exists in the contract but
+        # appears nowhere in the spec is a documentation bug caught at the commit that
+        # introduced it, not six months later.
+        run: |
+          # Trait DECLARATIONS only: they end in `;`, while the impl's own helpers end in `{`.
+          methods=$(grep -E '^    fn [a-z_]+\(.*;$' rust-lib/src/glue.rs | grep -oE 'fn [a-z_]+' | awk '{print $2}' | sort -u)
+          missing=0
+          for m in $methods; do
+            grep -q "\`$m\`" docs/specs.md || { echo "UNDOCUMENTED: $m"; missing=1; }
+          done
+          echo "checked $(echo "$methods" | wc -w) contract methods"
+          exit $missing
