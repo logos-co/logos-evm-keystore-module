@@ -8,6 +8,9 @@ pub trait KeystoreCustodianModule: Send + 'static {
     /// the acknowledgement is the point: `create <pw> false` must refuse from the custodian
     /// itself, which is what makes the property provable from outside the process.
     fn create(&mut self, password: String, acknowledge: bool) -> String;
+    /// Generate a recovery phrase. Tier D, and the only method here that persists nothing —
+    /// so it proves the gate admits the custodian without leaving a key behind to prove it.
+    fn mnemonic(&mut self, words: i64) -> String;
     /// Import a raw private key — the most sensitive Tier D method there is.
     fn import_key(&mut self, priv_hex: String, password: String) -> String;
     /// Delete an account. Ungated for everyone before Tier D, and an unmetered password
@@ -78,6 +81,10 @@ impl KeystoreCustodianModule for KeystoreCustodianModuleImpl {
     fn create(&mut self, password: String, acknowledge: bool) -> String {
         let p = json!({ "password": password, "acknowledgeUnrecoverable": acknowledge });
         pass(modules().keystore_module.create_unrelated_account(&p.to_string()))
+    }
+
+    fn mnemonic(&mut self, words: i64) -> String {
+        pass(modules().keystore_module.create_mnemonic(words))
     }
 
     fn import_key(&mut self, priv_hex: String, password: String) -> String {
