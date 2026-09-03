@@ -25,8 +25,11 @@ alloy = { version = "1", default-features = false, features = [
     "std", "consensus", "eips", "rlp", "signers", "signer-local", "signer-mnemonic", "k256",
 ] }
 eth-keystore = "0.5"
-# coins-bip39 (BIP39/BIP32) is used via alloy's re-export (alloy::signers::local::
-# coins_bip39) so there is exactly one version in the graph.
+# coins-bip39 (BIP39) is used via alloy's re-export (alloy::signers::local::
+# coins_bip39) so there is exactly one version in the graph. coins-bip32 has to be
+# direct: alloy-signer-local re-exports only coins_bip39, and HD derivation needs the
+# extended-key type itself. It unifies with the copy coins-bip39 already pulls in.
+coins-bip32 = "0.12"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,6 +41,9 @@ zeroize = "1"
 # SHA-256 for the approval commitment. Deliberately NOT keccak256: a bundle id
 # must never be mistakable for a signable Ethereum digest.
 sha2 = "0.10"
+# Atomic writes. Promoted from dev-dependencies: it was already in the lock graph, so this
+# adds zero nodes, and its NamedTempFile creates at 0600 rather than at the umask.
+tempfile = "3"
 
 # The Logos runtime SDK is staged by the builder as a sibling crate. It is
 # optional + enabled by the default `logos_module` feature so `cargo test
@@ -49,5 +55,3 @@ logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
 default = ["logos_module"]
 logos_module = ["dep:logos-rust-sdk"]
 
-[dev-dependencies]
-tempfile = "3"
