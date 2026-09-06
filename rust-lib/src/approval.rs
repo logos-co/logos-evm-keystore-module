@@ -33,7 +33,23 @@ type Result<T> = std::result::Result<T, KeystoreError>;
 
 /// How long an offered record waits for an approver to acknowledge it. After
 /// the ack there is deliberately NO deadline: a human is deciding.
-pub const ACK_DEADLINE: Duration = Duration::from_millis(3000);
+///
+/// 3s was right while the approver was always ALREADY OPEN: `approval_offered`
+/// fires, the signer refreshes, and the human's own time is spent after the ack,
+/// where nothing is counting. An app-to-app intent inverts that. The shell
+/// confirms every cross-app dispatch with the user BEFORE the provider is told
+/// anything, and then loads it if it is not running — so a human decision and an
+/// app launch both now sit in front of the acknowledgement, in a window that was
+/// sized for one event round trip. Measured: a couple of seconds spent choosing
+/// in the shell's own dialog is enough to expire the record, and the requester
+/// gets `expired_no_ack` for a signer that was about to answer.
+///
+/// 60s covers the realistic path and matches the shell's own 45s activation
+/// bound with margin. It cannot cover every path — the chooser has no timeout of
+/// its own, so a user who walks away mid-dialog still expires — and that is the
+/// right outcome, reported rather than papered over. What the caps below bound
+/// is flooding; this constant only bounds how long an unattended offer lingers.
+pub const ACK_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Caps. A requester cannot flood the approver's queue.
 pub const MAX_PENDING_PER_REQUESTER: usize = 4;
