@@ -31,25 +31,30 @@ use crate::keystore::{
 
 type Result<T> = std::result::Result<T, KeystoreError>;
 
-/// How long an offered record waits for an approver to acknowledge it. After
-/// the ack there is deliberately NO deadline: a human is deciding.
+/// GARBAGE COLLECTION for an offer whose requester will never come back. Not
+/// flow control, and deliberately not named as though it were.
 ///
-/// 3s was right while the approver was always ALREADY OPEN: `approval_offered`
-/// fires, the signer refreshes, and the human's own time is spent after the ack,
-/// where nothing is counting. An app-to-app intent inverts that. The shell
-/// confirms every cross-app dispatch with the user BEFORE the provider is told
-/// anything, and then loads it if it is not running — so a human decision and an
-/// app launch both now sit in front of the acknowledgement, in a window that was
-/// sized for one event round trip. Measured: a couple of seconds spent choosing
-/// in the shell's own dialog is enough to expire the record, and the requester
-/// gets `expired_no_ack` for a signer that was about to answer.
+/// This was `ACK_DEADLINE`, 3 seconds, and that was right while the approver was
+/// always ALREADY OPEN: `approval_offered` fires, the signer refreshes, and the
+/// human's own time is spent after the ack, where nothing counts. An app-to-app
+/// intent inverts it — the shell confirms every cross-app dispatch with the user
+/// and then LOADS the provider, both before the provider is told anything, so a
+/// human decision and an app launch moved in front of the acknowledgement.
 ///
-/// 60s covers the realistic path and matches the shell's own 45s activation
-/// bound with margin. It cannot cover every path — the chooser has no timeout of
-/// its own, so a user who walks away mid-dialog still expires — and that is the
-/// right outcome, reported rather than papered over. What the caps below bound
-/// is flooding; this constant only bounds how long an unattended offer lingers.
-pub const ACK_DEADLINE: Duration = Duration::from_secs(60);
+/// The lesson was not "make the number bigger". It is that a timer here cannot
+/// tell "nobody is coming" from "someone is coming, slowly": at 3s it answered
+/// the second wrongly, and at 60s it would still hang for a minute on the
+/// crashed signer it exists to catch. Neither is a liveness signal, and this
+/// module has none to consult — with an intent in flight the signer is often not
+/// loaded yet, so early silence and absence look identical from here.
+///
+/// The party that KNOWS is the requester: its dispatch either completes or
+/// fails, exactly once. So prompt cleanup belongs there — it calls
+/// `cancel_approval` the moment the path is closed — and what is left for this
+/// constant is the one case a requester cannot clean up after: its own death.
+/// That is why it is long. Shortening it to chase a crashed *approver* would
+/// re-introduce the bug above; that case is the requester's to report.
+pub const ABANDONED_OFFER_TTL: Duration = Duration::from_secs(60);
 
 /// Caps. A requester cannot flood the approver's queue.
 pub const MAX_PENDING_PER_REQUESTER: usize = 4;
@@ -140,7 +145,7 @@ pub struct Approvals {
     /// instant cannot collide.
     seq: u64,
     /// Overridable so the expiry path is testable without sleeping.
-    ack_deadline: Duration,
+    abandoned_offer_ttl: Duration,
 }
 
 impl Default for Approvals {
@@ -169,22 +174,23 @@ pub struct Summary {
 
 impl Approvals {
     pub fn new() -> Self {
-        Self { records: Vec::new(), seq: 0, ack_deadline: ACK_DEADLINE }
+        Self { records: Vec::new(), seq: 0, abandoned_offer_ttl: ABANDONED_OFFER_TTL }
     }
 
-    /// Override the ack deadline. Shortening it only ever fails closed sooner.
-    pub fn set_ack_deadline(&mut self, d: Duration) {
-        self.ack_deadline = d;
+    /// Override the abandoned-offer TTL. Shortening it only ever fails closed
+    /// sooner, which is what the expiry test relies on.
+    pub fn set_abandoned_offer_ttl(&mut self, d: Duration) {
+        self.abandoned_offer_ttl = d;
     }
 
-    /// Demote any `Rendered` record whose ack deadline has passed, and settle
-    /// `Offered` records that nobody claimed. Lazy: run at the head of every
+    /// Demote any `Rendered` record whose deadline has passed, and settle
+    /// `Offered` records nobody ever came for. Lazy: run at the head of every
     /// entry point, so the call a stale record would otherwise block is exactly
     /// the call that clears it. No background thread.
     fn sweep(&mut self) {
         let now = Instant::now();
         for r in &mut self.records {
-            if r.state == State::Offered && now.duration_since(r.offered_at) > self.ack_deadline {
+            if r.state == State::Offered && now.duration_since(r.offered_at) > self.abandoned_offer_ttl {
                 r.state = State::Settled(Outcome::ExpiredNoAck);
             }
             if matches!(r.state, State::Settled(_)) && r.settled_at.is_none() {
@@ -760,7 +766,7 @@ mod tests {
     #[test]
     fn an_unacknowledged_request_expires_and_says_why() {
         let (_d, _ks, mut ap) = fixture();
-        ap.set_ack_deadline(Duration::from_millis(0));
+        ap.set_abandoned_offer_ttl(Duration::from_millis(0));
         let (h, r) = ap.request("wallet_backend", &tx_intent("0x1")).unwrap();
         std::thread::sleep(Duration::from_millis(5));
         let (state, reason) = ap.status(&h, &r).unwrap();
