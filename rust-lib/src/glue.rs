@@ -156,7 +156,9 @@ pub trait KeystoreModule: Send + 'static {
     fn pending(&mut self) -> String;
     /// Claim a request for display. Returns the lines to show VERBATIM plus the
     /// commitment to echo back. Demotes any other rendered request, so exactly
-    /// one thing can be on screen. `{ ok, handle, bundle_id, requester, render_lines }`.
+    /// one thing can be on screen. `claim_lines` is the requester's own account of
+    /// what this is for; `render_lines` is what is actually signed. An approver must
+    /// keep them apart. `{ ok, handle, bundle_id, requester, claim_lines, render_lines }`.
     fn acknowledge(&mut self, handle: String) -> String;
     /// The human said yes. One key derivation, every leg signed, then wiped.
     /// `bundle_id` must be the value that was displayed. `{ ok, signed }`.
@@ -958,7 +960,8 @@ impl KeystoreModule for KeystoreModuleImpl {
         match self.approvals.acknowledge(&handle) {
             Ok(r) => json!({
                 "ok": true, "handle": r.handle, "bundle_id": r.bundle_id,
-                "requester": r.requester, "render_lines": r.render_lines,
+                "requester": r.requester, "claim_lines": r.claim_lines,
+                "render_lines": r.render_lines,
             })
             .to_string(),
             Err(e) => err(e),

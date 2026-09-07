@@ -130,6 +130,7 @@ struct Record {
     requester: String,
     intent: Intent,
     bundle_id: [u8; 32],
+    claim_lines: Vec<String>,
     render_lines: Vec<String>,
     state: State,
     offered_at: Instant,
@@ -154,11 +155,15 @@ impl Default for Approvals {
     }
 }
 
-/// What `acknowledge` hands an approver.
+/// What `acknowledge` hands an approver, in two groups it must not merge.
 pub struct Rendered {
     pub handle: String,
     pub bundle_id: String,
+    /// Who asked. Authoritative — the caller's own identity, not a field it filled in.
     pub requester: String,
+    /// What that requester SAYS this is for. Its text, carried for the human.
+    pub claim_lines: Vec<String>,
+    /// What is actually signed, and the commitment over it. The keystore's own words.
     pub render_lines: Vec<String>,
 }
 
@@ -248,7 +253,7 @@ impl Approvals {
         check_displayable(&intent.purpose, "purpose")?;
 
         let bundle_id = commitment(&intent)?;
-        let render_lines = render(&intent, &bundle_id)?;
+        let (claim_lines, render_lines) = render(&intent, &bundle_id)?;
 
         self.seq += 1;
         let handle = format!("ksh_{}", token_hex(self.seq));
@@ -260,6 +265,7 @@ impl Approvals {
             requester: requester.to_string(),
             intent,
             bundle_id,
+            claim_lines,
             render_lines,
             state: State::Offered,
             offered_at: Instant::now(),
@@ -316,6 +322,7 @@ impl Approvals {
             handle: r.handle.clone(),
             bundle_id: hex::encode(r.bundle_id),
             requester: r.requester.clone(),
+            claim_lines: r.claim_lines.clone(),
             render_lines: r.render_lines.clone(),
         })
     }
@@ -499,12 +506,16 @@ fn commitment(intent: &Intent) -> Result<[u8; 32]> {
 /// The lines an approver shows, VERBATIM. Produced here because this is the
 /// only party that has parsed the intent — an approver cannot tell
 /// requester-supplied text from the signer's own.
-fn render(intent: &Intent, bundle_id: &[u8; 32]) -> Result<Vec<String>> {
+fn render(intent: &Intent, bundle_id: &[u8; 32]) -> Result<(Vec<String>, Vec<String>)> {
+    // Two lists rather than one, so an approver can separate them WITHOUT parsing text.
+    // The prefix stays on the claim for an approver that flattens them anyway.
+    let mut claim = Vec::new();
+    if !intent.purpose.trim().is_empty() {
+        claim.push(format!("Purpose (claimed by the requester): {}", intent.purpose.trim()));
+    }
+
     let mut out = Vec::new();
     out.push(format!("Account: {}", intent.address.trim()));
-    if !intent.purpose.trim().is_empty() {
-        out.push(format!("Purpose (claimed by the requester): {}", intent.purpose.trim()));
-    }
     out.push(format!("Commitment: {}", hex::encode(bundle_id)));
     out.push(format!("{} item(s) to sign:", intent.legs.len()));
 
@@ -548,7 +559,7 @@ fn render(intent: &Intent, bundle_id: &[u8; 32]) -> Result<Vec<String>> {
             }
         }
     }
-    Ok(out)
+    Ok((claim, out))
 }
 
 /// Render a hex-or-decimal numeric field as both, so a human is not asked to
@@ -708,6 +719,41 @@ mod tests {
         let (h3, _) = ap.request("c", &tx_intent("0x2")).unwrap();
         let v3 = ap.acknowledge(&h3).unwrap();
         assert_ne!(v1.bundle_id, v3.bundle_id);
+    }
+
+    #[test]
+    fn the_requesters_account_of_the_request_is_kept_out_of_what_is_signed() {
+        // Two lists, so an approver separates them structurally. A purpose sitting in the
+        // same monospace block as the legs is a requester writing on the keystore's screen.
+        let (_d, _ks, mut ap) = fixture();
+        let intent = format!(
+            r#"{{"address":"{ACCT0}","purpose":"Send 1 ETH to Alice","legs":[
+                {{"kind":"tx","chain_id":1,"tx":{{
+                    "to":"{ACCT0}","value":"0x0","nonce":"0x1","gas_limit":"0x5208",
+                    "data":"0x","fee_mode":"eip1559",
+                    "max_fee_per_gas":"0x1","max_priority_fee_per_gas":"0x1"}}}}]}}"#
+        );
+        let (h, _) = ap.request("wallet_backend", &intent).unwrap();
+        let v = ap.acknowledge(&h).unwrap();
+
+        let claim = v.claim_lines.join("\n");
+        let signed = v.render_lines.join("\n");
+        assert!(claim.contains("Send 1 ETH to Alice"), "{claim}");
+        assert!(!signed.contains("Send 1 ETH to Alice"), "the claim leaked into {signed}");
+        assert!(
+            claim.contains("claimed by the requester"),
+            "an approver that flattens the lists must still see whose words these are: {claim}"
+        );
+        assert!(signed.contains("Commitment:") && signed.contains("Account:"), "{signed}");
+    }
+
+    #[test]
+    fn a_request_with_no_purpose_claims_nothing() {
+        let (_d, _ks, mut ap) = fixture();
+        let bare = tx_intent("0x1").replace(r#""purpose":"send","#, "");
+        let (h, _) = ap.request("wallet_backend", &bare).unwrap();
+        let v = ap.acknowledge(&h).unwrap();
+        assert!(v.claim_lines.is_empty(), "an empty purpose is no claim, not a blank one");
     }
 
     #[test]
