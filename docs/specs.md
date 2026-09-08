@@ -146,8 +146,8 @@ sequenceDiagram
 
     SU->>KS: acknowledge(handle)
     Note right of KS: Tier A — refuses anyone but the approver.<br/>Demotes any other Rendered record.
-    KS-->>SU: { bundle_id, requester, render_lines }
-    SU->>H: render_lines VERBATIM + bundle_id
+    KS-->>SU: { bundle_id, requester, claim_lines, render_lines }
+    SU->>H: both lists VERBATIM, kept apart + bundle_id
     Note over H: no timeout on the human
 
     H->>SU: vault password
@@ -233,7 +233,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `ack_result` | `handle, receipt: String` | `bool` | no |
 | `cancel_approval` | `handle, receipt: String` | `bool` | no |
 | `pending` | — | `{ ok, pending: [..] }` | no |
-| `acknowledge` | `handle: String` | `{ ok, bundle_id, requester, render_lines }` | no |
+| `acknowledge` | `handle: String` | `{ ok, bundle_id, requester, claim_lines, render_lines }` | no |
 | `approve` | `handle, bundle_id, password: String` | `{ ok, signed_count: n }` | no |
 | `reject` | `handle: String` | `bool` | no |
 | `caller_identity` | — | `{ ok, kind, identity, approvers, custodians }` | no |
@@ -1366,7 +1366,15 @@ request order. Idempotent until `ack_result`.
 ### `acknowledge(handle: String) -> String`
 
 **Tier A.** Claim a request for display:
-`{ ok, handle, bundle_id, requester, render_lines }`.
+`{ ok, handle, bundle_id, requester, claim_lines, render_lines }`.
+
+The lines come in **two lists an approver must not merge**. `claim_lines` is the
+requester's own account of what the request is for — its text, carried for the human
+and worth nothing as evidence. `render_lines` is what is actually signed, plus the
+commitment over it. The split is structural rather than a prefix an approver could
+drop, and it is made here because this module is the only party that parsed the
+intent. `requester` is authoritative: it is the caller's identity, not a field it
+filled in.
 
 `render_lines` are authored **by this module** from the parsed intent and **must be
 displayed verbatim** — not reformatted, elided, truncated or re-ordered. keystore is
