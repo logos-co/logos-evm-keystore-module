@@ -1298,7 +1298,7 @@ than integrity, and they should survive any future change to how identity is del
 ```
 request_approval ──▶ Offered ──acknowledge──▶ Rendered ──approve──▶ Settled(Approved)
        │                 │                        │           └────▶ Settled(Rejected)
-       │                 └──(no ack in 3000 ms)──▶ Settled(ExpiredNoAck)
+       │                 └──(no ack in 60 s)─────▶ Settled(ExpiredNoAck)
        └──cancel_approval─────────────────────────────────────────▶ Settled(Cancelled)
 ```
 
@@ -1310,9 +1310,16 @@ request_approval ──▶ Offered ──acknowledge──▶ Rendered ──app
 * **At most one record is `Rendered`.** `acknowledge` demotes any other rendered
   request, so exactly one thing can be on screen — this is what binds the text the
   human read to the `approve` call that follows.
-* **The 3000 ms window is on the *event* path only.** It bounds how long the
-  approver has to acknowledge receipt, not how long the human has to decide. Once
-  `Rendered`, there is **no timeout on the human**.
+* **The 60 s window is garbage collection, not flow control.** It is on the
+  *event* path only: it bounds how long an unacknowledged offer lingers, not how
+  long the human has to decide — once `Rendered`, there is **no timeout on the
+  human**. It was 3 s while the approver was always already open; an app-to-app
+  intent puts a shell confirmation and a provider launch in front of the ack, and
+  no timer here can tell "nobody is coming" from "someone is coming, slowly".
+  Prompt cleanup is the requester's, which knows — it calls `cancel_approval`
+  the moment its dispatch fails — and the TTL covers the one case it cannot: its
+  own death. Shortening it to chase a crashed *approver* would re-introduce the
+  bug; that case is the requester's to report.
 * **Settled records are retained** for 120 s so a requester polling `approval_status`
   learns *why* a request ended (`expired_no_ack`, `rejected`, `cancelled`) rather
   than getting `not_found`.
@@ -1808,10 +1815,20 @@ logosctl --config-dir . daemon start --detach
 sleep 3
 logosctl module load keystore_module
 logosctl module show keystore_module        # note: no unlock/sign_* methods exist
-logosctl call keystore_module create_mnemonic 12
-logosctl call keystore_module import_private_key <privkey> pw   # → {address}
-logosctl call keystore_module list_accounts
 logosctl call keystore_module caller_identity          # → {"kind":"host", ...}
+logosctl call keystore_module list_accounts            # ungated read
+
+# Tier D is UNREACHABLE from the CLI too: it is the host anchor, not a named module,
+# and admitting it would make `logosctl call` a legal way to import a key.
+logosctl call keystore_module create_mnemonic 12                # → {"ok":false,"error":"not authorized"}
+logosctl call keystore_module import_private_key <privkey> pw   # → {"ok":false,"error":"not authorized"}
+
+# Mutation goes through a configured custodian — here the doc-test's fixture
+# (doctests/custodian-probe). configure is TOTAL, so the approver is restated.
+logosctl call keystore_module configure '{"approvers":"evm_signer_ui","custodians":"keystore_custodian"}'
+logosctl module load keystore_custodian
+logosctl call keystore_custodian import_key <privkey> pw        # → {address}
+logosctl call keystore_module list_accounts                     # now lists it
 
 # Tier A and Tier B are UNREACHABLE from the CLI, by design:
 logosctl call keystore_module pending                  # → {"ok":false,"error":"not authorized"}
@@ -1821,6 +1838,13 @@ logosctl daemon stop
 The bundled `capability_module` (shipped with `logosctl`) handles the load-time
 auth handshake, which is why it is seeded into `./modules` before installing this
 module.
+
+Outside the doc-test the custodian is `evm_keystore_cli`
+([logos-co/logos-evm-keystore-cli](https://github.com/logos-co/logos-evm-keystore-cli)),
+which relays every Tier D method under its own identity with the keystore's own
+names and parameters — so the admitted spelling of the refused line above is
+`logosctl call evm_keystore_cli import_private_key <privkey> pw`, after a
+`configure` that names it custodian.
 
 ### How the doc-test exercises it
 
