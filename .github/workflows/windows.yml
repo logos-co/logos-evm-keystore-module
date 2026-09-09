@@ -1,0 +1,32 @@
+name: Windows
+
+# The entire per-repo cost of Windows CI. The Nix install and cache, the
+# target-existence guard, the cold-cache refusal, the PE-format and
+# import-closure gates, and the artifact hand-off all live once in
+# logos-co/logos-windows-ci.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: default
+      # MEASURED 144 cold derivations on 2026-09-08, not guessed. 200 rather
+      # than the 160 its siblings use: 144 is close enough that one added crate
+      # would trip a tighter ceiling spuriously. The default 30 exists to refuse
+      # an unprimed mingw QT closure, and none of the 144 is Qt -- they are this
+      # repo's own crate set (secp256k1, scrypt, BIP39/32) plus the
+      # logos-qt-sdk/qt-host/protocol libs a sibling's run built but could not
+      # push, $ATTIC_TOKEN_CI being empty. Restore the cache push and this
+      # collapses; until then the guard measures repo size, not cache health.
+      cold-derivation-budget: 200
+      # NO SMOKE, and that is a reported coverage gap rather than a pass. A
+      # module plugin has no entry point, and the harness runs the Windows leg
+      # inside stage/, so anything that could load it would have to be a target
+      # of this flake. That belongs in a consumer's job.
