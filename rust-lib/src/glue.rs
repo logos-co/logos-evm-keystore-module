@@ -27,7 +27,7 @@ pub trait KeystoreModule: Send + 'static {
     /// Name who holds the two roles: `{ approver?, custodian? }` → `{ ok, approver,
     /// custodian }`. TOTAL — a role the document does not name is held by nobody — and it
     /// takes effect at once, on a module that has been serving the built-in defaults
-    /// (`signer_ui`, `keystore_ui`) since it loaded. A malformed document is refused and
+    /// (`evm_signer_ui`, `evm_keystore_ui`) since it loaded. A malformed document is refused and
     /// the roles in force are left untouched.
     ///
     /// UNGATED, deliberately and for now: any caller can name itself custodian and then

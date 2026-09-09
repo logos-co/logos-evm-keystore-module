@@ -1,7 +1,7 @@
 {
   "name": "keystore_custodian",
   "version": "1.0.0",
-  "description": "Doc-test fixture: a Tier D custodian. Stands in for keystore_ui so the account-mutation gate can be proven headlessly, from both sides.",
+  "description": "Doc-test fixture: a Tier D custodian. Stands in for evm_keystore_ui so the account-mutation gate can be proven headlessly, from both sides.",
   "author": "Logos Core Team",
   "type": "core",
   "interface": "cdylib",
