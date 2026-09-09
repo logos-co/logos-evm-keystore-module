@@ -62,7 +62,7 @@ The module is two layers that are deliberately decoupled by a Cargo feature:
 flowchart TB
     subgraph Callers["Callers (over Logos bridge)"]
         BE["wallet_backend_module<br/>(requester: request_approval)"]
-        SU["signer_ui<br/>(the ONLY approver)"]
+        SU["evm_signer_ui<br/>(the ONLY approver)"]
         LC["logosctl daemon<br/>(Tier C only)"]
     end
 
@@ -125,7 +125,7 @@ result of a `Rendered` request a human approved.
 This module is a **leaf** — it makes **no outbound calls** to any other module
 and opens no sockets. The interesting flow is therefore how a **caller drives it**.
 The canonical flow has **three** parties, not two: a **requester** that may ask
-but never approve, the **approver** (`signer_ui`) that renders and takes the vault
+but never approve, the **approver** (`evm_signer_ui`) that renders and takes the vault
 password, and the human. `logosctl` can reach Tier C only.
 
 ```mermaid
@@ -133,11 +133,11 @@ sequenceDiagram
     autonumber
     participant BE as wallet_backend_module (requester)
     participant KS as keystore_module (this repo)
-    participant SU as signer_ui (the ONLY approver)
+    participant SU as evm_signer_ui (the ONLY approver)
     participant H as the human
     participant DISK as scrypt vault dir
 
-    Note over KS: on_context_ready(ctx) → Keystore::new(...)<br/>roles default to signer_ui / keystore_ui until configure() names them
+    Note over KS: on_context_ready(ctx) → Keystore::new(...)<br/>roles default to evm_signer_ui / evm_keystore_ui until configure() names them
 
     BE->>KS: request_approval({ address, purpose, legs })
     Note right of KS: caller must be a NAMED module (Tier B)
@@ -166,7 +166,7 @@ sequenceDiagram
 
 The signed values the backend collects are what it hands to `eth_rpc_module` for
 `eth_sendRawTransaction`. The keystore itself never performs that broadcast — it
-has no network code at all. Note the password crosses **only** the `signer_ui` →
+has no network code at all. Note the password crosses **only** the `evm_signer_ui` →
 `keystore` edge: the requester never sees it, never sees `render_lines`, and
 cannot produce a signature.
 
@@ -247,7 +247,7 @@ Name who holds the two roles. `config_json` is `{ approvers?, custodians? }`; th
 `{ ok: false, error }`. It takes effect on the next call — nothing is reloaded.
 
 **A role is a set.** Each key takes one name or a list of them, because a terminal signer
-has to approve *alongside* `signer_ui` rather than by displacing it. Blanks and repeats are
+has to approve *alongside* `evm_signer_ui` rather than by displacing it. Blanks and repeats are
 normalised out, so `is_empty()` and "admits nobody" can never disagree. The pre-list
 `approver`/`custodian` spelling is refused as an unknown key — the right way for a stale
 configuration to fail, since accepting it silently would empty both roles.
@@ -265,7 +265,7 @@ force are untouched — there is no partial apply. The unknown-key rule exists b
 the total rule a typo (`custodain`) would otherwise empty **both** roles: fail-closed, but
 silent about why everything started refusing.
 
-**Until it is called, the built-in defaults stand** — `signer_ui` approves, `keystore_ui`
+**Until it is called, the built-in defaults stand** — `evm_signer_ui` approves, `evm_keystore_ui`
 mutates. A module nobody configures is not inert.
 
 #### It is deliberately ungated, for now
@@ -1053,10 +1053,10 @@ Every request is classified by the **caller identity** the platform reports
 
 | Tier | Methods | Admits |
 |------|---------|--------|
-| **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `signer_ui`) |
+| **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
 | **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `caller_identity` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | a configured **custodian** (default `keystore_ui`) |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | a configured **custodian** (default `evm_keystore_ui`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
 names and `gate::tier_d_admits(method, custodian, caller)` is the only decision.
@@ -1075,7 +1075,7 @@ for the allocator. Gating `delete_account` also closes an unmetered password ora
 any module could guess at the vault password there, and a correct guess DESTROYED the account.
 
 An **empty** custodian admits nobody. That is the same fail-closed direction Tier A took
-before `signer_ui` shipped: an unconfigured role means the surface that should hold it does
+before `evm_signer_ui` shipped: an unconfigured role means the surface that should hold it does
 not exist yet, and the capability is then unavailable rather than universal.
 
 **Who sets the roles is itself ungated.** `configure` names both, and nothing stops a caller
@@ -1209,7 +1209,7 @@ So a policy that is *registered* is now enforced against a real identity; a targ
 **Why keystore does not simply register one.** `registerRestriction` is **per-target,
 not per-method**. This module deliberately needs a *wide* Tier B (any named module may
 *request*) and a *narrow* Tier A (exactly one may *approve*). A blanket allowlist
-naming only `signer_ui` would lock out every legitimate requester —
+naming only `evm_signer_ui` would lock out every legitimate requester —
 `wallet_backend_module` among them. So the tier gate inside this module stays the
 mechanism that separates asking from approving, and the access policy is a coarse
 complement for deployments that want to bound the requester set. Operators who want
@@ -1271,7 +1271,7 @@ property is not continuously verified.
 With identity live and impersonation closed, Tier A means what it is meant to mean: the
 caller *is* the configured approver package. Two limits remain worth stating plainly.
 
-**`module:signer_ui` names a plugin package, not a human.** A `ui_qml` plugin's QML view
+**`module:evm_signer_ui` names a plugin package, not a human.** A `ui_qml` plugin's QML view
 and its `ui-host` backend are one identity by design, and this module cannot distinguish
 them — it must not pretend to. What the entry asserts is that *the operator designated
 this package as the code permitted to approve*. It does not assert that a human saw
@@ -1453,7 +1453,7 @@ subscriber that diffs counts sees nothing and must re-read. It is the total vaul
 (`Keystore::list_accounts()?.len()`), or **`-1` for "unknown"** when that listing
 failed. `-1` is not `0`: reporting a keystore we could not read as an empty one is
 exactly the defect removed from the layer below, and a subscriber that treats -1 as
-0 reintroduces it. Subscribers (`keystore_ui`, and `eth_wallet_backend`, which relays
+0 reintroduces it. Subscribers (`evm_keystore_ui`, and `eth_wallet_backend`, which relays
 it to the wallet view) re-read their account list on it instead of polling. All event
 params are std-typed (`i64`, `String`).
 
