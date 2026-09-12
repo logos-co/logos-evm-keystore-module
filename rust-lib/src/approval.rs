@@ -79,6 +79,10 @@ pub enum Leg {
     /// A raw 32-byte digest. Opaque by construction: `purpose` is the only
     /// thing that can be shown, and it is a claim by the requester.
     Digest { digest: String, purpose: String },
+    /// EIP-712 typed data, as the standard JSON `{ types, primaryType, domain, message }`.
+    /// Unlike a digest it is NOT opaque: the domain and every field of the message are
+    /// shown, and the signing hash is computed here, never trusted from the requester.
+    TypedData { typed_data: serde_json::Value },
 }
 
 /// What a requester submits.
@@ -368,6 +372,9 @@ impl Approvals {
                 Leg::Tx { chain_id, tx } => sign_parsed_tx(&signer, tx, *chain_id)?,
                 Leg::Message { text } => sign_message_with(&signer, text)?,
                 Leg::Digest { digest, .. } => sign_digest_with(&signer, digest)?,
+                Leg::TypedData { typed_data } => {
+                    sign_digest_with(&signer, &typed_data_signing_hash(typed_data)?)?
+                }
             });
         }
         drop(signer);
@@ -497,6 +504,12 @@ fn commitment(intent: &Intent) -> Result<[u8; 32]> {
                 h.update(b"\x1f");
                 h.update(purpose.as_bytes());
             }
+            Leg::TypedData { typed_data } => {
+                // The EIP-712 signing hash covers the domain, the types and every field, so
+                // it is the commitment: two documents that hash alike sign alike.
+                h.update(b"typed_data\n");
+                h.update(typed_data_signing_hash(typed_data)?.as_bytes());
+            }
         }
         h.update(b"\n");
     }
@@ -557,9 +570,149 @@ fn render(intent: &Intent, bundle_id: &[u8; 32]) -> Result<(Vec<String>, Vec<Str
                 out.push(format!("      Digest: {}", digest.trim()));
                 out.push("      This signer cannot show you what this authorises.".into());
             }
+            Leg::TypedData { typed_data } => {
+                out.push(format!("  [{n}] Sign EIP-712 typed data"));
+                render_typed_data(typed_data, &mut out)?;
+                out.push(format!("      Signing hash: {}", typed_data_signing_hash(typed_data)?));
+            }
         }
     }
     Ok((claim, out))
+}
+
+/// The EIP-712 signing hash of a typed-data document, `0x`-hex. Parsed by alloy's own
+/// implementation of the standard; a document it cannot type is refused here, before
+/// anything is rendered or committed to.
+pub fn typed_data_signing_hash(v: &serde_json::Value) -> Result<String> {
+    check_typed_fields(v)?;
+    let td: alloy::dyn_abi::TypedData = serde_json::from_value(v.clone())
+        .map_err(|e| KeystoreError::InvalidParams(format!("typed_data: {e}")))?;
+    let hash = td
+        .eip712_signing_hash()
+        .map_err(|e| KeystoreError::InvalidParams(format!("typed_data: {e}")))?;
+    Ok(format!("0x{}", hex::encode(hash)))
+}
+
+/// The message must carry EXACTLY the fields its type declares, at every level. The
+/// standard hashes the declared fields and ignores the rest, so an undeclared field would
+/// be shown to the human and signed by nobody — a line on screen that the signature does
+/// not cover. Refused rather than hidden: a requester that sends one is not to be trusted
+/// with the rest either.
+fn check_typed_fields(v: &serde_json::Value) -> Result<()> {
+    let bad = |why: String| KeystoreError::InvalidParams(format!("typed_data: {why}"));
+    let types = v.get("types").and_then(|t| t.as_object()).ok_or_else(|| bad("no types".into()))?;
+    let primary = v.get("primaryType").and_then(|p| p.as_str()).ok_or_else(|| bad("no primaryType".into()))?;
+    let message = v.get("message").ok_or_else(|| bad("no message".into()))?;
+    fn walk(
+        types: &serde_json::Map<String, serde_json::Value>,
+        ty: &str,
+        value: &serde_json::Value,
+        depth: usize,
+        bad: &dyn Fn(String) -> KeystoreError,
+    ) -> Result<()> {
+        if depth > 16 {
+            return Err(bad("nested deeper than 16 levels".into()));
+        }
+        // An array type: check every element against the element type.
+        if let Some(open) = ty.find('[') {
+            let elem = &ty[..open];
+            let items = value.as_array().ok_or_else(|| bad(format!("{ty}: not an array")))?;
+            for item in items {
+                walk(types, elem, item, depth + 1, bad)?;
+            }
+            return Ok(());
+        }
+        let Some(fields) = types.get(ty).and_then(|f| f.as_array()) else {
+            return Ok(()); // an atomic type; alloy checks the value
+        };
+        let obj = value.as_object().ok_or_else(|| bad(format!("{ty}: not an object")))?;
+        let declared: Vec<(&str, &str)> = fields
+            .iter()
+            .filter_map(|f| Some((f.get("name")?.as_str()?, f.get("type")?.as_str()?)))
+            .collect();
+        for key in obj.keys() {
+            if !declared.iter().any(|(n, _)| n == key) {
+                return Err(bad(format!("{ty} does not declare a field `{key}`")));
+            }
+        }
+        for (name, fty) in declared {
+            let Some(inner) = obj.get(name) else {
+                return Err(bad(format!("{ty} is missing its field `{name}`")));
+            };
+            walk(types, fty, inner, depth + 1, bad)?;
+        }
+        Ok(())
+    }
+    walk(types, primary, message, 0, &bad)
+}
+
+/// What a human sees of a typed-data document: the domain it binds to, the type being
+/// signed, and every field of the message with its value — nested structs and arrays
+/// indented under their field. Every string is checked for display before it is shown.
+fn render_typed_data(v: &serde_json::Value, out: &mut Vec<String>) -> Result<()> {
+    let domain = v.get("domain").cloned().unwrap_or(serde_json::Value::Null);
+    let mut domain_bits = Vec::new();
+    for key in ["name", "version", "chainId", "verifyingContract", "salt"] {
+        if let Some(x) = domain.get(key) {
+            let shown = json_scalar(x)?;
+            domain_bits.push(format!("{key}={shown}"));
+        }
+    }
+    out.push(format!(
+        "      Domain: {}",
+        if domain_bits.is_empty() { "(none)".to_string() } else { domain_bits.join(", ") }
+    ));
+    let primary = v.get("primaryType").and_then(|p| p.as_str()).unwrap_or("?");
+    check_displayable(primary, "primaryType")?;
+    out.push(format!("      Type: {primary}"));
+    out.push("      Message:".into());
+    match v.get("message") {
+        Some(serde_json::Value::Object(m)) => render_json_fields(m, 8, out)?,
+        _ => out.push("        (none)".into()),
+    }
+    Ok(())
+}
+
+fn json_scalar(x: &serde_json::Value) -> Result<String> {
+    Ok(match x {
+        serde_json::Value::String(s) => {
+            check_displayable(s, "typed data field")?;
+            s.clone()
+        }
+        serde_json::Value::Null => "null".into(),
+        other => other.to_string(),
+    })
+}
+
+fn render_json_fields(
+    m: &serde_json::Map<String, serde_json::Value>,
+    indent: usize,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    let pad = " ".repeat(indent);
+    for (k, x) in m {
+        check_displayable(k, "typed data field name")?;
+        match x {
+            serde_json::Value::Object(inner) => {
+                out.push(format!("{pad}{k}:"));
+                render_json_fields(inner, indent + 2, out)?;
+            }
+            serde_json::Value::Array(items) => {
+                out.push(format!("{pad}{k}: {} item(s)", items.len()));
+                for (i, item) in items.iter().enumerate() {
+                    match item {
+                        serde_json::Value::Object(inner) => {
+                            out.push(format!("{pad}  [{i}]"));
+                            render_json_fields(inner, indent + 4, out)?;
+                        }
+                        other => out.push(format!("{pad}  [{i}] {}", json_scalar(other)?)),
+                    }
+                }
+            }
+            other => out.push(format!("{pad}{k}: {}", json_scalar(other)?)),
+        }
+    }
+    Ok(())
 }
 
 /// Render a hex-or-decimal numeric field as both, so a human is not asked to
@@ -788,6 +941,74 @@ mod tests {
         assert!(all.contains("OPAQUE"), "{all}");
         assert!(all.contains("cannot show you what this authorises"), "{all}");
         assert!(all.contains("claimed by the requester"), "purpose must be marked a claim: {all}");
+    }
+
+    // EIP-712's own example: the Mail struct, whose signing hash is the standard's published
+    // test vector. Every field of it must be on screen, and the hash must be OURS.
+    fn mail_typed_data() -> &'static str {
+        r#"{"types":{"EIP712Domain":[{"name":"name","type":"string"},{"name":"version","type":"string"},{"name":"chainId","type":"uint256"},{"name":"verifyingContract","type":"address"}],"Person":[{"name":"name","type":"string"},{"name":"wallet","type":"address"}],"Mail":[{"name":"from","type":"Person"},{"name":"to","type":"Person"},{"name":"contents","type":"string"}]},"primaryType":"Mail","domain":{"name":"Ether Mail","version":"1","chainId":1,"verifyingContract":"0xCcCCccccCCCCcCCCCCCcCCCCCCCCcCCCCCCCcccC"},"message":{"from":{"name":"Cow","wallet":"0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826"},"to":{"name":"Bob","wallet":"0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB"},"contents":"Hello, Bob!"}}"#
+    }
+    const MAIL_SIGNING_HASH: &str = "0xbe609aee343fb3c4b28e1df9e632fca64fcfaede20f02e86244efddf30957bd2";
+
+    #[test]
+    fn typed_data_is_hashed_here_and_shown_field_by_field() {
+        let (_d, ks, mut ap) = fixture();
+        assert_eq!(typed_data_signing_hash(&serde_json::from_str(mail_typed_data()).unwrap()).unwrap(), MAIL_SIGNING_HASH);
+        let intent = format!(
+            r#"{{"address":"{ACCT0}","purpose":"Sign in to Ether Mail","legs":[{{"kind":"typed_data","typed_data":{}}}]}}"#,
+            mail_typed_data()
+        );
+        let (h, r) = ap.request("some_dapp", &intent).unwrap();
+        let v = ap.acknowledge(&h).unwrap();
+        let all = v.render_lines.join("\n");
+        assert!(all.contains("[1] Sign EIP-712 typed data"), "{all}");
+        assert!(all.contains("Domain: name=Ether Mail, version=1, chainId=1, verifyingContract=0xCcCCccccCCCCcCCCCCCcCCCCCCCCcCCCCCCCcccC"), "{all}");
+        assert!(all.contains("Type: Mail"), "{all}");
+        assert!(all.contains("        from:\n          name: Cow\n          wallet: 0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826"), "{all}");
+        assert!(all.contains("        contents: Hello, Bob!"), "{all}");
+        assert!(all.contains(&format!("Signing hash: {MAIL_SIGNING_HASH}")), "{all}");
+        assert!(!all.contains("OPAQUE"), "typed data is not opaque: {all}");
+
+        // One approval, one signature — and it is a signature over OUR hash by the account.
+        assert_eq!(ap.approve(&ks, &h, &v.bundle_id, "pw").unwrap(), 1);
+        let signed = ap.fetch_result(&h, &r).unwrap();
+        assert_eq!(signed.len(), 1);
+        let bytes = hex::decode(signed[0].trim_start_matches("0x")).unwrap();
+        assert_eq!(bytes.len(), 65);
+        let sig = alloy::primitives::Signature::try_from(bytes.as_slice()).unwrap();
+        let hash = alloy::primitives::B256::from_slice(&hex::decode(MAIL_SIGNING_HASH.trim_start_matches("0x")).unwrap());
+        let who = sig.recover_address_from_prehash(&hash).unwrap();
+        assert_eq!(format!("{who}"), ACCT0);
+    }
+
+    #[test]
+    fn typed_data_the_standard_cannot_type_is_refused_before_it_is_shown() {
+        let (_d, _ks, mut ap) = fixture();
+        // A message field the declared type does not have.
+        let bad = mail_typed_data().replace(r#""contents":"Hello, Bob!""#, r#""contents":"Hello, Bob!","extra":1"#);
+        let intent = format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"typed_data","typed_data":{bad}}}]}}"#);
+        assert!(ap.request("some_dapp", &intent).is_err());
+        // A control character in a field is refused like one in a message.
+        let sneaky = mail_typed_data().replace("Hello, Bob!", "Hello,\u{202e} Bob!");
+        let intent = format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"typed_data","typed_data":{sneaky}}}]}}"#);
+        assert!(ap.request("some_dapp", &intent).is_err());
+        // A document that is not typed data at all.
+        let intent = format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"typed_data","typed_data":{{"hello":"world"}}}}]}}"#);
+        assert!(ap.request("some_dapp", &intent).is_err());
+    }
+
+    #[test]
+    fn two_typed_data_legs_that_hash_alike_commit_alike() {
+        let (_d, _ks, mut ap) = fixture();
+        let a = format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"typed_data","typed_data":{}}}]}}"#, mail_typed_data());
+        // Same document, keys reordered: the same signing hash, so the same bundle id.
+        let reordered = mail_typed_data().replace(r#""primaryType":"Mail","domain""#, r#""domain""#)
+            .replace(r#"},"message""#, r#"},"primaryType":"Mail","message""#);
+        assert_ne!(reordered, mail_typed_data());
+        let b = format!(r#"{{"address":"{ACCT0}","legs":[{{"kind":"typed_data","typed_data":{reordered}}}]}}"#);
+        let (h1, _) = ap.request("x", &a).unwrap();
+        let (h2, _) = ap.request("y", &b).unwrap();
+        assert_eq!(ap.acknowledge(&h1).unwrap().bundle_id, ap.acknowledge(&h2).unwrap().bundle_id);
     }
 
     #[test]

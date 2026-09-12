@@ -23,6 +23,7 @@ crate-type = ["staticlib", "rlib"]
 # Offline Ethereum crypto. Narrow alloy features — no provider/rpc/network I/O.
 alloy = { version = "1", default-features = false, features = [
     "std", "consensus", "eips", "rlp", "signers", "signer-local", "signer-mnemonic", "k256",
+    "dyn-abi", "eip712",
 ] }
 eth-keystore = "0.5"
 # coins-bip39 (BIP39) is used via alloy's re-export (alloy::signers::local::

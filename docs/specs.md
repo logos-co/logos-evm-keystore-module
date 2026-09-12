@@ -1333,10 +1333,23 @@ request_approval ──▶ Offered ──acknowledge──▶ Rendered ──app
 The intent is `{ address, purpose, legs: [...] }`, where each leg is one of:
 
 ```jsonc
-{ "kind": "tx",      "chain_id": 1, "tx": { …UnsignedTx… } }
-{ "kind": "message", "text": "…" }
-{ "kind": "digest",  "digest": "0x…32 bytes…", "purpose": "…" }
+{ "kind": "tx",         "chain_id": 1, "tx": { …UnsignedTx… } }
+{ "kind": "message",    "text": "…" }
+{ "kind": "digest",     "digest": "0x…32 bytes…", "purpose": "…" }
+{ "kind": "typed_data", "typed_data": { "types": …, "primaryType": "…", "domain": …, "message": … } }
 ```
+
+A `typed_data` leg is EIP-712, in the standard's own JSON. It is **not** opaque: the
+module parses it with alloy's implementation of the standard, computes the signing
+hash itself — never trusting one from the requester — and renders the domain, the
+primary type and every field of the message, nested structs and arrays indented
+under their field. A document the standard cannot type (a field the declared type
+does not have, a missing type) is refused at `request_approval`, before anything is
+rendered or committed to, and so is a field carrying a control or bidi character.
+The commitment covers the signing hash, so two documents that hash alike commit
+alike whatever their key order. The result is the 65-byte signature over that hash
+(what Permit2 and the Universal Router take), which `fetch_result` returns like any
+other leg's.
 
 A **bundle** of several legs is **one human decision**: all legs are signed, or
 none are. `purpose` is requester-supplied and is always rendered as *claimed by the
@@ -1390,7 +1403,8 @@ requester-supplied text from its own; it escapes control characters, bidi contro
 and zero-width characters before they enter a line.
 
 The full calldata is always shown in full and **never elided**. A `digest` leg
-renders an explicit admission that the signer cannot show what it authorises.
+renders an explicit admission that the signer cannot show what it authorises; a
+`typed_data` leg shows the whole document instead, and its signing hash beside it.
 
 ### `approve(handle: String, bundle_id: String, password: String) -> String`
 
