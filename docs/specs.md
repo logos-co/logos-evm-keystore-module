@@ -215,6 +215,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `list_groups` | — | `{ ok, groups: [..] }` | no |
 | `list_derivation_keys` | — | `{ ok, groups: [id, ..], staged: [id, ..], unexplained: [path, ..], links: [..] }` | no |
 | `get_provenance` | — | `{ ok, accounts: {..} }` | no |
+| `get_account_wallets` | — | `{ ok, wallets: { <address>: { wallet, index? } } }` | no |
 | `settle` | — | `{ ok, swept, promoted, unexplained, links, staged, importStages }` | removes leftovers |
 | `remove_unexplained` | `params_json: String` | `{ ok, removed }` | removes one reported path |
 | `import_private_key` | `priv_hex: String, password: String` | `{ ok, address }` | yes → event |
@@ -984,6 +985,24 @@ guessed** — a guess about recoverability is the one lie this must not tell.
 
 ---
 
+### `get_account_wallets() -> String`
+
+The canonical account-to-wallet join for account pickers. **Ungated.** It combines
+the account provenance and wallet-name documents inside the Keystore, so each consumer
+does not have to recreate ownership rules independently.
+
+```json
+{ "ok": true, "wallets": { "0xf39F…2266": { "wallet": "Main", "index": 0 } } }
+```
+
+Only accounts whose provenance names a derivation group with a non-empty wallet label
+appear. Imported, unknown, and unnamed accounts are omitted rather than assigned a
+guessed wallet. `index` is omitted when provenance does not carry one. An unreadable
+provenance or wallet-name document returns an error instead of pretending there are no
+wallets.
+
+---
+
 ### `settle() -> String`
 
 Bring the keystore directory to a state the layout explains and report what is left.
@@ -1055,7 +1074,7 @@ Every request is classified by the **caller identity** the platform reports
 |------|---------|--------|
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
-| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `caller_identity` — and, for now, `configure` | ungated |
+| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity` — and, for now, `configure` | ungated |
 | **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | a configured **custodian** (default `evm_keystore_ui`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the

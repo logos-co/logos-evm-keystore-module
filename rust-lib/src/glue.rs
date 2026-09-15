@@ -88,6 +88,11 @@ pub trait KeystoreModule: Send + 'static {
     fn list_derivation_keys(&mut self) -> String;
     /// Where each account came from, `{ ok, accounts: { <address>: {...} } }`. UNGATED.
     fn get_provenance(&mut self) -> String;
+    /// Wallet ownership for account pickers,
+    /// `{ ok, wallets: { <address>: { wallet, index? } } }`. UNGATED. This is the
+    /// canonical join of account provenance and wallet names, so every consumer groups
+    /// accounts the same way.
+    fn get_account_wallets(&mut self) -> String;
     /// Bring the keystore directory to a state the layout explains, and report both what it
     /// DID and what is left: `{ ok, swept, promoted, unexplained, links, staged, importStages }`.
     /// Tier D — it removes things. A leftover only named after it has been swept was never
@@ -659,6 +664,17 @@ impl KeystoreModule for KeystoreModuleImpl {
                     .collect();
                 json!({ "ok": true, "accounts": accounts }).to_string()
             }
+            Err(e) => err(e),
+        }
+    }
+
+    fn get_account_wallets(&mut self) -> String {
+        let res = match self.ks() {
+            Ok(ks) => ks.account_wallets(),
+            Err(e) => return err(e),
+        };
+        match res {
+            Ok(wallets) => json!({ "ok": true, "wallets": wallets }).to_string(),
             Err(e) => err(e),
         }
     }
