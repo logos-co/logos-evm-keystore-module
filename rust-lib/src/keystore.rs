@@ -988,6 +988,16 @@ pub struct AccountProvenance {
     pub derivable: bool,
 }
 
+/// The wallet identity attached to one account. This is deliberately smaller than
+/// `AccountProvenance`: consumers that only need to group accounts should not each grow
+/// their own join between provenance and wallet labels.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AccountWallet {
+    pub wallet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+}
+
 /// Everything `import_mnemonic` needs. A struct because six of these are optional and
 /// three of them are secrets — a positional call would make a swapped pair invisible.
 pub struct ImportRequest<'a> {
@@ -1924,6 +1934,27 @@ impl Keystore {
             .collect())
     }
 
+    /// Join account provenance with the wallet names document. Accounts without a named
+    /// derivation group are intentionally absent: there is no wallet identity to assert for
+    /// an imported or otherwise ungrouped account.
+    pub fn account_wallets(&self) -> Result<BTreeMap<String, AccountWallet>> {
+        let labels = self.get_group_labels()?;
+        Ok(self
+            .provenance_view()?
+            .into_iter()
+            .filter_map(|account| {
+                let label = labels.get(&account.provenance.group)?;
+                if label.trim().is_empty() {
+                    return None;
+                }
+                Some((
+                    account.address.to_string(),
+                    AccountWallet { wallet: label.clone(), index: account.provenance.index },
+                ))
+            })
+            .collect())
+    }
+
     /// Retire an index so it is never handed out again. A reused path may collide with an
     /// account that still holds funds; a gap costs nothing.
     fn retire(&self, address: &Address) -> Result<()> {
@@ -2762,6 +2793,29 @@ mod tests {
     }
 
     #[test]
+    fn account_wallets_is_the_canonical_join_of_provenance_and_wallet_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, group) = with_group(dir.path());
+        let next = ks.derive_next_account(Some(&group), "gp", "pw2", 0).unwrap();
+        let ungrouped = ks.create_unrelated_account("loose", acked()).unwrap();
+
+        let wallets = ks.account_wallets().unwrap();
+        assert_eq!(wallets.len(), 2);
+        assert_eq!(
+            wallets[&ACCT0.to_string()],
+            AccountWallet { wallet: "Main".into(), index: Some(0) }
+        );
+        assert_eq!(
+            wallets[&next.address.to_string()],
+            AccountWallet { wallet: "Main".into(), index: Some(1) }
+        );
+        assert!(!wallets.contains_key(&ungrouped.to_string()));
+
+        ks.set_group_label(&rename(&group, "")).unwrap();
+        assert!(ks.account_wallets().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_name_for_a_wallet_that_never_existed_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (ks, _) = with_group(dir.path());
@@ -2803,6 +2857,7 @@ mod tests {
         std::fs::write(dir.path().join("group-labels.json"), "{\"x\": ").unwrap();
 
         assert!(ks.get_group_labels().is_err());
+        assert!(ks.account_wallets().is_err(), "the join must not turn a corrupt names file into no wallets");
         assert!(ks.list_groups().is_err(), "an unreadable name is not an unnamed wallet");
         // Naming a wallet would otherwise write a fresh map over the torn one, silently
         // losing every name it held — and an import would quietly land a nameless wallet.

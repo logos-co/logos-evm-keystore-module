@@ -41,6 +41,7 @@ const SILENT: &[&str] = &[
     "export_keystore_json",
     "change_password",
     "list_accounts",
+    "get_account_wallets",
     "get_labels",
     "get_group_labels",
     "list_groups",
