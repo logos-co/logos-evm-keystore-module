@@ -1,6 +1,6 @@
 {
   "name": "keystore_module",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Keystore: scrypt vaults, BIP39/BIP32 HD derivation, secp256k1 signing. No network; private keys never leave the module.",
   "author": "Logos Core Team",
   "type": "core",
