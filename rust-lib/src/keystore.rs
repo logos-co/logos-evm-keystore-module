@@ -3863,7 +3863,9 @@ mod tests {
         let table = state_table();
         assert!(table.len() >= 21, "the table lost rows: {}", table.len());
         for state in table {
-            let dir = tempfile::tempdir().unwrap();
+            // Some rows move key material to `<ks>/..`: keep that inside a directory this row owns.
+            let own = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir_in(own.path()).unwrap();
             let (ks, group) = with_group(dir.path());
             // groups.json is removed so the directory scan answers alone, with no record to
             // agree with. It is what the scan REPORTS that is measured here; what makes a
@@ -4383,7 +4385,9 @@ mod tests {
         assert!(table.len() >= 17, "the table lost rows: {}", table.len());
         for state in table {
             let name = state.name;
-            let dir = tempfile::tempdir().unwrap();
+            // Some rows move key material to `<ks>/..`: keep that inside a directory this row owns.
+            let own = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir_in(own.path()).unwrap();
             let ks = Keystore::new(dir.path());
             let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
             assert_eq!(addr, ACCT0);
