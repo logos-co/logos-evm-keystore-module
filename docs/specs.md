@@ -1422,6 +1422,10 @@ the only party that parsed the intent and therefore the only one that can tell
 requester-supplied text from its own; it escapes control characters, bidi controls
 and zero-width characters before they enter a line.
 
+A transaction leg shows the fee it signs: the max fee and max priority fee per gas (or the
+legacy gas price), read by the parser signing uses, in wei and gwei, and `Fee at most`, the gas
+limit times that price. A zero priority fee is flagged, and so is a fee signing would refuse.
+
 The full calldata is always shown in full and **never elided**. A `digest` leg
 renders an explicit admission that the signer cannot show what it authorises; a
 `typed_data` leg shows the whole document instead, and its signing hash beside it.

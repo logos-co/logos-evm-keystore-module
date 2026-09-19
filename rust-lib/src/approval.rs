@@ -24,9 +24,11 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
+use alloy::primitives::U256;
+
 use crate::keystore::{
-    check_displayable, sign_digest_with, sign_message_with, sign_parsed_tx, Keystore, KeystoreError,
-    UnsignedTx,
+    check_displayable, parse_u128, sign_digest_with, sign_message_with, sign_parsed_tx, Keystore,
+    KeystoreError, UnsignedTx,
 };
 
 type Result<T> = std::result::Result<T, KeystoreError>;
@@ -554,6 +556,7 @@ fn render(intent: &Intent, bundle_id: &[u8; 32]) -> Result<(Vec<String>, Vec<Str
                 out.push(format!("      Value: {}", norm_num(&tx.value)));
                 out.push(format!("      Nonce: {}", norm_num(&tx.nonce)));
                 out.push(format!("      Gas limit: {}", norm_num(&tx.gas_limit)));
+                fee_lines(tx, &mut out);
                 let data = tx.data.trim();
                 if data.is_empty() || data == "0x" {
                     out.push("      Data: (none)".into());
@@ -739,6 +742,53 @@ fn norm_num(s: &str) -> String {
         },
         None => t.to_string(),
     }
+}
+
+/// The fee a transaction leg signs, read by the same parser signing uses, and the most its gas
+/// can cost. A zero tip is flagged: validators have no reason to include such a transaction.
+fn fee_lines(tx: &UnsignedTx, out: &mut Vec<String>) {
+    let per_gas = match tx.fee_mode.trim() {
+        "" | "eip1559" => {
+            out.push(format!("      Max fee per gas: {}", wei_per_gas(&tx.max_fee_per_gas)));
+            out.push(format!("      Max priority fee per gas: {}", wei_per_gas(&tx.max_priority_fee_per_gas)));
+            if parse_u128(&tx.max_priority_fee_per_gas, "").ok() == Some(0) {
+                out.push("      ** ZERO PRIORITY FEE — this may never be included **".into());
+            }
+            parse_u128(&tx.max_fee_per_gas, "").ok()
+        }
+        "legacy" => {
+            out.push(format!("      Gas price: {}", wei_per_gas(&tx.gas_price)));
+            parse_u128(&tx.gas_price, "").ok()
+        }
+        other => {
+            out.push(format!("      ** UNSUPPORTED FEE MODE {other:?} — this cannot be signed **"));
+            None
+        }
+    };
+    if let (Some(gas), Some(price)) = (parse_u128(&tx.gas_limit, "").ok(), per_gas) {
+        let most = U256::from(gas) * U256::from(price);
+        out.push(format!("      Fee at most: {most} wei ({} of the native coin)", decimal(most, 18)));
+    }
+}
+
+fn wei_per_gas(s: &str) -> String {
+    match parse_u128(s, "") {
+        Ok(v) => format!("{v} wei ({} gwei)", decimal(U256::from(v), 9)),
+        Err(_) => format!("{} (unreadable: this cannot be signed)", s.trim()),
+    }
+}
+
+/// `v` scaled down by `places` decimal digits, exactly, without trailing zeros.
+fn decimal(v: U256, places: usize) -> String {
+    let digits = v.to_string();
+    let (int, frac) = if digits.len() > places {
+        digits.split_at(digits.len() - places)
+    } else {
+        ("0", digits.as_str())
+    };
+    let frac = format!("{frac:0>places$}");
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() { int.to_string() } else { format!("{int}.{frac}") }
 }
 
 // ── small helpers ───────────────────────────────────────────────────────────
@@ -935,6 +985,82 @@ mod tests {
         assert!(all.contains("CONTRACT CREATION"), "{all}");
         assert!(all.contains("0xdeadbeefcafe"), "calldata must not be elided: {all}");
         assert!(all.contains("Selector: 0xdeadbeef"), "{all}");
+    }
+
+    fn fee_render(fee: &str) -> String {
+        let (_d, _ks, mut ap) = fixture();
+        let intent = format!(
+            r#"{{"address":"{ACCT0}","legs":[{{"kind":"tx","chain_id":1,"tx":{{
+                "to":"{ACCT0}","value":"0x0","nonce":"0x1","gas_limit":"0x5208","data":"0x",{fee}}}}}]}}"#
+        );
+        let (h, _) = ap.request("wallet_backend", &intent).unwrap();
+        ap.acknowledge(&h).unwrap().render_lines.join("\n")
+    }
+
+    // The fees are signed, so they are shown, with the most the gas can cost. Hex and decimal
+    // read alike, as signing reads them.
+    #[test]
+    fn the_render_shows_the_fee_it_signs_and_its_ceiling() {
+        let all = fee_render(r#""fee_mode":"eip1559","max_fee_per_gas":"0xbd0b858e","max_priority_fee_per_gas":"169400000""#);
+        assert!(all.contains("Max fee per gas: 3171648910 wei (3.17164891 gwei)"), "{all}");
+        assert!(all.contains("Max priority fee per gas: 169400000 wei (0.1694 gwei)"), "{all}");
+        assert!(all.contains("Fee at most: 66604627110000 wei (0.00006660462711 of the native coin)"), "{all}");
+        assert!(!all.contains("ZERO PRIORITY FEE"), "{all}");
+        assert!(!all.contains("Gas price"), "{all}");
+    }
+
+    #[test]
+    fn a_zero_tip_is_flagged_however_it_is_spelled() {
+        for tip in [r#""max_priority_fee_per_gas":"0x0""#, r#""max_priority_fee_per_gas":"0""#, ""] {
+            let fee = format!(r#""max_fee_per_gas":"0x1"{}{tip}"#, if tip.is_empty() { "" } else { "," });
+            let all = fee_render(&fee);
+            assert!(all.contains("Max priority fee per gas: 0 wei (0 gwei)"), "{tip}: {all}");
+            assert!(all.contains("** ZERO PRIORITY FEE — this may never be included **"), "{tip}: {all}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_leg_shows_its_gas_price_instead() {
+        let all = fee_render(r#""fee_mode":"legacy","gas_price":"7""#);
+        assert!(all.contains("Gas price: 7 wei (0.000000007 gwei)"), "{all}");
+        assert!(all.contains("Fee at most: 147000 wei (0.000000000000147 of the native coin)"), "{all}");
+        assert!(!all.contains("Max fee per gas"), "{all}");
+    }
+
+    // Neither can be signed, and the render says so rather than showing a figure for it.
+    #[test]
+    fn a_fee_signing_would_refuse_is_flagged_and_prices_nothing() {
+        let all = fee_render(r#""fee_mode":"eip4844","max_fee_per_gas":"0x1""#);
+        assert!(all.contains(r#"** UNSUPPORTED FEE MODE "eip4844" — this cannot be signed **"#), "{all}");
+        assert!(!all.contains("Fee at most"), "{all}");
+        let all = fee_render(r#""max_fee_per_gas":"lots","max_priority_fee_per_gas":"0x1""#);
+        assert!(all.contains("Max fee per gas: lots (unreadable: this cannot be signed)"), "{all}");
+        assert!(!all.contains("Fee at most"), "{all}");
+    }
+
+    // What the human read is what the signature covers: the signed transaction decodes to the
+    // fees the render showed.
+    #[test]
+    fn the_signed_transaction_carries_the_fees_the_render_showed() {
+        use alloy::consensus::{Transaction as _, TxEnvelope};
+        use alloy::eips::eip2718::Decodable2718;
+        let (_d, ks, mut ap) = fixture();
+        let intent = format!(
+            r#"{{"address":"{ACCT0}","legs":[{{"kind":"tx","chain_id":1,"tx":{{
+                "to":"{ACCT0}","value":"0x0","nonce":"0x1","gas_limit":"0x5208","data":"0x",
+                "max_fee_per_gas":"0xbd0b858e","max_priority_fee_per_gas":"169400000"}}}}]}}"#
+        );
+        let (h, r) = ap.request("wallet_backend", &intent).unwrap();
+        let v = ap.acknowledge(&h).unwrap();
+        let all = v.render_lines.join("\n");
+        assert!(all.contains("Max fee per gas: 3171648910 wei"), "{all}");
+        assert!(all.contains("Max priority fee per gas: 169400000 wei"), "{all}");
+        assert_eq!(ap.approve(&ks, &h, &v.bundle_id, "pw").unwrap(), 1);
+        let raw = hex::decode(ap.fetch_result(&h, &r).unwrap()[0].trim_start_matches("0x")).unwrap();
+        let tx = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
+        assert_eq!(tx.max_fee_per_gas(), 3171648910);
+        assert_eq!(tx.max_priority_fee_per_gas(), Some(169400000));
+        assert_eq!(tx.gas_limit(), 21000);
     }
 
     #[test]
