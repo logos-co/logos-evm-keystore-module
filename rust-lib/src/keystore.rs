@@ -109,7 +109,7 @@ pub struct UnsignedTx {
     pub gas_price: String,
 }
 
-fn parse_u128(s: &str, what: &str) -> Result<u128> {
+pub(crate) fn parse_u128(s: &str, what: &str) -> Result<u128> {
     let s = s.trim();
     if s.is_empty() {
         return Ok(0);
