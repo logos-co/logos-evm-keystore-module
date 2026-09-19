@@ -20,8 +20,9 @@ BIP-32 HD derivation, consumed through alloy's re-export).
 
 ### Where it sits in the EVM wallet system
 
-The EVM wallet is built from seven repositories that talk to each other as
-process-isolated Logos modules over a typed RPC bridge:
+The EVM wallet and the apps beside it are built from repositories that talk to each
+other as process-isolated Logos modules over a typed RPC bridge. The ones around this
+module:
 
 | Repo | Role | Talks to |
 |------|------|----------|
@@ -30,14 +31,18 @@ process-isolated Logos modules over a typed RPC bridge:
 | `logos-evm-eth-rpc-module` | Multi-chain JSON-RPC transport (`concurrency: multi`) | net-proxy |
 | `logos-evm-token-list-module` | Token-list fetch/merge per chain | net-proxy |
 | `logos-evm-uniswap-module` | Uniswap V2/V3/V4 price oracle + swap building (`concurrency: multi`) | eth-rpc |
-| `logos-evm-wallet-backend-module` | Coordinator + tx builder (alloy) | keystore, eth-rpc, token-list, uniswap |
-| `logos-evm-wallet-ui` | Universal C++ `ui_qml` app | wallet-backend |
+| `logos-evm-tx-sender-module` | Prices, signs through this module, broadcasts and follows every send (the requester) | keystore, eth-rpc, fee |
+| `logos-eth-wallet-backend` | The wallet's backend: accounts, balances, history, sends | keystore (accounts), eth-rpc, token-list, evm-assets, fee, tx-sender |
+| `logos-uniswap-backend` | The Uniswap app's backend | keystore (accounts), eth-rpc, token-list, evm-assets, fee, uniswap, tx-sender |
+| `logos-eth-wallet-ui`, `logos-uniswap-ui` | Universal C++ `ui_qml` apps | their backend |
+| `logos-evm-signer-ui` | The approver: renders an approval and takes the vault password | keystore |
+| `logos-evm-keystore-ui` | The custodian: creates, imports and exports keys | keystore |
 
 This module is a **leaf**: it declares **no dependencies** (`"dependencies": []`)
-and calls no other module. It is driven *by* the `logos-evm-wallet-backend-module`
-coordinator (which *requests* an approval as the signing leg of its
-send pipeline, and never handles a vault password) or directly by the headless `logosctl`
-runtime. Keeping the keystore a dependency-free leaf is deliberate: the component
+and calls no other module. It is driven *by* `tx_sender_module`, which *requests* an
+approval as the signing leg of every send and never handles a vault password; by the app
+backends, which read accounts and labels; by the approver and the custodian; or directly
+by the headless `logosctl` runtime. Keeping the keystore a dependency-free leaf is deliberate: the component
 that holds private keys has the smallest possible attack surface and pulls in no
 network-capable code.
 
@@ -61,7 +66,7 @@ The module is two layers that are deliberately decoupled by a Cargo feature:
 ```mermaid
 flowchart TB
     subgraph Callers["Callers (over Logos bridge)"]
-        BE["wallet_backend_module<br/>(requester: request_approval)"]
+        BE["tx_sender_module<br/>(requester: request_approval)"]
         SU["evm_signer_ui<br/>(the ONLY approver)"]
         LC["logosctl daemon<br/>(Tier C only)"]
     end
@@ -131,7 +136,7 @@ password, and the human. `logosctl` can reach Tier C only.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant BE as wallet_backend_module (requester)
+    participant BE as tx_sender_module (requester)
     participant KS as keystore_module (this repo)
     participant SU as evm_signer_ui (the ONLY approver)
     participant H as the human
@@ -155,16 +160,16 @@ sequenceDiagram
     KS->>DISK: decrypt vault (scrypt) → signer (a local)
     Note right of KS: re-parse intent, re-derive commitment,<br/>compare to bundle_id, sign every leg, ZEROIZE
     KS-->>SU: { ok, signed_count: n }   %% a COUNT — the approver never gets the signatures
-    KS--)BE: event approval_settled(handle, "approved")
+    KS--)BE: event approval_settled(handle, "approved")   %% tx_sender polls approval_status instead
 
     BE->>KS: fetch_result(handle, receipt)
     KS-->>BE: { ok, signed: [...] }   %% idempotent until ack_result
     BE->>KS: ack_result(handle, receipt)
 
-    Note over BE: backend broadcasts raw tx via eth_rpc_module<br/>(keystore never touches the network)
+    Note over BE: tx_sender broadcasts the raw tx via eth_rpc_module<br/>(keystore never touches the network)
 ```
 
-The signed values the backend collects are what it hands to `eth_rpc_module` for
+The signed values tx_sender collects are what it hands to `eth_rpc_module` for
 `eth_sendRawTransaction`. The keystore itself never performs that broadcast — it
 has no network code at all. Note the password crosses **only** the `evm_signer_ui` →
 `keystore` edge: the requester never sees it, never sees `render_lines`, and
@@ -1229,7 +1234,7 @@ So a policy that is *registered* is now enforced against a real identity; a targ
 not per-method**. This module deliberately needs a *wide* Tier B (any named module may
 *request*) and a *narrow* Tier A (exactly one may *approve*). A blanket allowlist
 naming only `evm_signer_ui` would lock out every legitimate requester —
-`wallet_backend_module` among them. So the tier gate inside this module stays the
+`tx_sender_module` among them. So the tier gate inside this module stays the
 mechanism that separates asking from approving, and the access policy is a coarse
 complement for deployments that want to bound the requester set. Operators who want
 both should register the requester set as the restriction and leave the approver
