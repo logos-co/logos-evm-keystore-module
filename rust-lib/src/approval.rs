@@ -101,7 +101,7 @@ pub struct Intent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// Offered to approvers; not yet claimed.
+    /// Offered to approvers and not on screen: never acknowledged, or demoted by another.
     Offered,
     /// An approver has fetched the render and is showing it to a human.
     Rendered,
@@ -139,6 +139,9 @@ struct Record {
     state: State,
     offered_at: Instant,
     settled_at: Option<Instant>,
+    /// Acknowledged at least once. An approver came for it, so the abandoned-offer
+    /// sweep never collects it, even after a demotion.
+    claimed: bool,
     /// Signatures, once approved. Erased on ack_result.
     results: Option<Vec<String>>,
 }
@@ -199,7 +202,10 @@ impl Approvals {
     fn sweep(&mut self) {
         let now = Instant::now();
         for r in &mut self.records {
-            if r.state == State::Offered && now.duration_since(r.offered_at) > self.abandoned_offer_ttl {
+            if r.state == State::Offered
+                && !r.claimed
+                && now.duration_since(r.offered_at) > self.abandoned_offer_ttl
+            {
                 r.state = State::Settled(Outcome::ExpiredNoAck);
             }
             if matches!(r.state, State::Settled(_)) && r.settled_at.is_none() {
@@ -274,6 +280,7 @@ impl Approvals {
             state: State::Offered,
             offered_at: Instant::now(),
             settled_at: None,
+            claimed: false,
             results: None,
         });
         Ok((handle, receipt))
@@ -320,7 +327,10 @@ impl Approvals {
                     o.as_str()
                 )))
             }
-            _ => r.state = State::Rendered,
+            _ => {
+                r.state = State::Rendered;
+                r.claimed = true;
+            }
         }
         Ok(Rendered {
             handle: r.handle.clone(),
@@ -1060,5 +1070,26 @@ mod tests {
         let huge = format!(r#"{{"address":"{ACCT0}","purpose":"{}","legs":[]}}"#, "a".repeat(MAX_INTENT_BYTES));
         assert!(ap.request("x", &huge).is_err());
         assert!(ap.request("x", &format!(r#"{{"address":"{ACCT0}","legs":[]}}"#)).is_err());
+    }
+
+    #[test]
+    fn a_displaced_record_is_not_collected_as_an_abandoned_offer() {
+        let (_d, ks, mut ap) = fixture();
+        ap.set_abandoned_offer_ttl(Duration::from_millis(50));
+        let (h1, r1) = ap.request("wallet_backend", &tx_intent("0x1")).unwrap();
+        ap.acknowledge(&h1).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(ap.status(&h1, &r1).unwrap().0, "rendered");
+        // A second request displaces it, and the human spends a while on that one.
+        let (h2, _r2) = ap.request("uniswap_ui", &tx_intent("0x2")).unwrap();
+        ap.acknowledge(&h2).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            ap.status(&h1, &r1).unwrap(),
+            ("offered", None),
+            "displacement must leave the first record queued, not expired"
+        );
+        let v1 = ap.acknowledge(&h1).expect("the displaced record can be shown again");
+        assert_eq!(ap.approve(&ks, &h1, &v1.bundle_id, "pw").unwrap(), 1);
     }
 }
