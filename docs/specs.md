@@ -1331,14 +1331,15 @@ request_approval ──▶ Offered ──acknowledge──▶ Rendered ──app
   human read to the `approve` call that follows.
 * **The 60 s window is garbage collection, not flow control.** It is on the
   *event* path only: it bounds how long an unacknowledged offer lingers, not how
-  long the human has to decide — once `Rendered`, there is **no timeout on the
+  long the human has to decide — once acknowledged, there is **no timeout on the
   human**. It was 3 s while the approver was always already open; an app-to-app
   intent puts a shell confirmation and a provider launch in front of the ack, and
   no timer here can tell "nobody is coming" from "someone is coming, slowly".
   Prompt cleanup is the requester's, which knows — it calls `cancel_approval`
   the moment its dispatch fails — and the TTL covers the one case it cannot: its
   own death. Shortening it to chase a crashed *approver* would re-introduce the
-  bug; that case is the requester's to report.
+  bug; that case is the requester's to report. Being demoted by another
+  acknowledge does not put a record back in the window.
 * **Settled records are retained** for 120 s so a requester polling `approval_status`
   learns *why* a request ended (`expired_no_ack`, `rejected`, `cancelled`) rather
   than getting `not_found`.
@@ -2096,6 +2097,8 @@ only with itself is exactly the bug that makes funds unrecoverable elsewhere.
 * `a_bundle_is_one_decision_over_several_legs`.
 * `an_unacknowledged_request_expires_and_says_why` — a requester learns the
   reason, rather than seeing the record vanish.
+* `a_displaced_record_is_not_collected_as_an_abandoned_offer` — a record another
+  acknowledge demotes stays approvable; only an offer nobody came for expires.
 * `the_render_shows_full_calldata_and_flags_contract_creation`,
   `an_opaque_digest_is_rendered_as_opaque`.
 * `a_requester_cannot_flood_the_queue`,

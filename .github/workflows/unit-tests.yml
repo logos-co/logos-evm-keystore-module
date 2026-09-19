@@ -167,6 +167,7 @@ jobs:
             atomic::tests::a_stage_is_removed_on_every_exit_this_process_can_take \
             atomic::tests::a_blocked_promotion_leaves_nothing_staged \
             atomic::tests::a_document_is_never_written_in_place_and_never_briefly_world_readable \
+            approval::tests::a_displaced_record_is_not_collected_as_an_abandoned_offer \
             every_mutation_a_reader_can_see_announces_itself_on_the_success_path \
             nothing_else_announces_and_no_read_path_does \
             a_rename_announces_even_though_it_moves_no_count \
