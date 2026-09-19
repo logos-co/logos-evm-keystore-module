@@ -195,10 +195,10 @@ impl Approvals {
         self.abandoned_offer_ttl = d;
     }
 
-    /// Demote any `Rendered` record whose deadline has passed, and settle
-    /// `Offered` records nobody ever came for. Lazy: run at the head of every
-    /// entry point, so the call a stale record would otherwise block is exactly
-    /// the call that clears it. No background thread.
+    /// Settle `Offered` records nobody ever came for, and drop settled records
+    /// past retention whose signatures, if any, were collected. Lazy: run at the
+    /// head of every entry point, so the call a stale record would otherwise
+    /// block is exactly the call that clears it. No background thread.
     fn sweep(&mut self) {
         let now = Instant::now();
         for r in &mut self.records {

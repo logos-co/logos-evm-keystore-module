@@ -2229,11 +2229,13 @@ state (the approval ledger, vault files) and are fast (local scrypt + signing, n
 network latency), so there is no benefit to concurrent dispatch and serial
 execution avoids data races on the ledger without extra locking.
 
-Serial dispatch is also what lets the lease be a **lazy sweep** rather than a
-reaper thread: a stale `Rendered` record is demoted on the next Tier A/Tier B
-call — precisely the call it would otherwise block. That is why
-`concurrency: "multi"` is *not* needed here, despite `approve()` running a
-deliberately slow scrypt derivation inside the call.
+Serial dispatch is also what lets cleanup be a **lazy sweep** rather than a
+reaper thread: an offer nobody came for is settled `expired_no_ack` on the next
+Tier A/Tier B call — precisely the call it would otherwise block — and a settled
+record is dropped once its retention passes and any signatures in it have been
+collected. A `Rendered` record has no timer; only another acknowledge demotes it.
+That is why `concurrency: "multi"` is *not* needed here, despite `approve()`
+running a deliberately slow scrypt derivation inside the call.
 
 This contrasts with the wallet's `concurrency: "multi"` modules
 (`eth_rpc_module`, `uniswap_module`), which fan out network-bound RPC calls
