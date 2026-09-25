@@ -109,8 +109,10 @@ impl Roles {
 /// The caller, reduced to what a gate is allowed to care about.
 ///
 /// `HostAnchor` is deliberately distinct from a named module rather than folded into it: it
-/// is one undifferentiated bag covering the shells, `core_service` and every relayed CLI
-/// token, so a tier that admitted it would admit an unbounded set rather than a party.
+/// is one undifferentiated bag, so a tier that admitted it would admit an unbounded set
+/// rather than a party. Once capability_module is the runtime's token authority it is the
+/// runtime alone: shells and `core_service` call as named modules and a CLI session as an
+/// `Operator`. Before that it also covers them and every relayed CLI token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Caller {
     Unknown,
