@@ -1140,6 +1140,11 @@ sequencing is worth keeping because it looked like unrelated work:
    on the credential store but not on the caller-keyed one, so `"core"` arriving there
    would have been spelled as a module.
 
+**Once capability_module is the runtime's token authority** (logos-liblogos#227), the
+table's first two rows change: a `logosctl` call arrives as `{"kind":"operator",…}`
+(`Operator`), and a shell such as Basecamp calls as the named module `basecamp`, so it
+reaches Tier B like any other named module. `HostAnchor` is then the runtime alone.
+
 **`HostAnchor` is refused at Tier A and Tier B, and that is deliberate.** The CLI now
 reports honestly as the host rather than as `unknown`, and is still refused — which is
 the intended property, not a gap. The rule does not depend on any past defect:
