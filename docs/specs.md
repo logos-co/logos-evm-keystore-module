@@ -1140,10 +1140,11 @@ sequencing is worth keeping because it looked like unrelated work:
    on the credential store but not on the caller-keyed one, so `"core"` arriving there
    would have been spelled as a module.
 
-**Once capability_module is the runtime's token authority** (logos-liblogos#227), the
-table's first two rows change: a `logosctl` call arrives as `{"kind":"operator",…}`
-(`Operator`), and a shell such as Basecamp calls as the named module `basecamp`, so it
-reaches Tier B like any other named module. `HostAnchor` is then the runtime alone.
+**With capability_module as the runtime's token authority** (logos-liblogos#227, and
+required by every runtime since logos-liblogos#228), the table's first two rows
+change: a `logosctl` call arrives as `{"kind":"operator",…}` (`Operator`), and a shell
+such as Basecamp calls as the named module `basecamp`, so it reaches Tier B like any
+other named module. `HostAnchor` is then the runtime alone.
 
 **`HostAnchor` is refused at Tier A and Tier B, and that is deliberate.** The CLI now
 reports honestly as the host rather than as `unknown`, and is still refused — which is
@@ -1223,32 +1224,40 @@ longer true** and the correction matters: the allowlist is now consulted against
 derived `callerName`:
 
 ```cpp
-auto it = m_restrictions.find(moduleName);
-if (it != m_restrictions.end() && it->second.count(callerName) == 0) { /* deny */ }
+// Access-policy gate, fed by the runtime through the engine interface.
+if (!authority.allows(callerName, moduleName)) { /* deny */ }
 ```
+
+The restrictions reach capability only from the runtime. liblogos derives them from its
+access policy (`enforce` mode) and sends the whole document through capability's engine
+interface on every attach, load and unload; a new document also revokes the pair tokens
+it now denies. The `registerRestriction` method that preceded it, which authenticated a
+self-presented trust-root token, is gone (logos-capability-module#34). The engine
+interface is not reachable over IPC, so no module can write the policy.
 
 The residual gap is documented in the code and is a rollout decision, not an oversight:
 
-> `TODO(access-policy): still fail-OPEN — a target with no registered restriction is
-> unrestricted. Intentional for back-compat during rollout.`
+> `TODO(access-policy): still fail-OPEN — a target with no restriction is unrestricted.
+> Intentional for back-compat during rollout; the end state is deny-by-default once every
+> deployment ships a policy.`
 
-So a policy that is *registered* is now enforced against a real identity; a target with
-**no** policy remains reachable by any named module.
+So a policy the runtime set is enforced against a real identity; a target with **no**
+policy remains reachable by any named module.
 
-**Why keystore does not simply register one.** `registerRestriction` is **per-target,
-not per-method**. This module deliberately needs a *wide* Tier B (any named module may
+**Why keystore does not rely on it.** The access policy is **per-target, not
+per-method**. This module deliberately needs a *wide* Tier B (any named module may
 *request*) and a *narrow* Tier A (exactly one may *approve*). A blanket allowlist
 naming only `evm_signer_ui` would lock out every legitimate requester —
 `tx_sender_module` among them. So the tier gate inside this module stays the
 mechanism that separates asking from approving, and the access policy is a coarse
 complement for deployments that want to bound the requester set. Operators who want
-both should register the requester set as the restriction and leave the approver
+both should name the requester set in the runtime's access policy and leave the approver
 distinction to the tier gate.
 
 ### What identity still does not guarantee
 
 Identity being live changes what the gate can *do*; it does not make the name a
-cryptographic fact. Five residuals, each of which bounds a claim this document makes.
+cryptographic fact. Four residuals, each of which bounds a claim this document makes.
 
 **1. The name is *token-bound*, not verified.** `logos_caller_scope.h` says so in its
 own words — token-bound is *"the strongest honest word … chosen over 'verified' or
@@ -1278,12 +1287,6 @@ than this gate was defending.
 *"ignoring leftover fromModuleName=…"* and proceeds. The binding is unaffected — that is
 what matters — but there is no counter and no event, so an operator cannot observe
 attempts programmatically. Worth a metric upstream.
-
-**5. `registerRestriction` was not converted.** It still authenticates by a
-self-presented `authToken` compared against the trust-root tokens rather than by
-`currentCaller()`. That is a *secret*, not a name, so it is a different class from the
-hole that was closed — but it means the policy-writing path did not move with the
-policy-checking path.
 
 One quieter failure mode is worth knowing because it is *not* the one that was fixed:
 the `Q_INVOKABLE currentCallerJson` **declaration** is unguarded while its **body** is
