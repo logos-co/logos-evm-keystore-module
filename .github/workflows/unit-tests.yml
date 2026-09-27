@@ -73,20 +73,16 @@ jobs:
         run: |
           out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
           for t in \
-            gate::tests::the_configured_holder_is_admitted_and_nobody_else_is \
+            gate::tests::the_role_holder_is_admitted_and_nobody_else_is \
             gate::tests::an_empty_role_refuses_everyone_including_a_module_named_empty \
-            gate::tests::the_host_anchor_is_refused_however_the_role_is_configured \
-            gate::tests::unknown_derived_and_operator_callers_are_refused \
+            gate::tests::the_host_anchor_is_refused_whatever_the_role \
+            gate::tests::unknown_derived_and_operator_callers_do_not_hold_a_role \
             gate::tests::the_approver_and_custodian_roles_are_independent \
-            gate::tests::the_built_in_defaults_are_in_force_until_something_configures_them \
-            gate::tests::configuring_both_roles_moves_the_gate_to_the_named_modules \
-            gate::tests::a_role_the_configuration_does_not_name_admits_nobody \
-            gate::tests::a_malformed_configuration_is_refused_and_the_roles_in_force_survive_it \
-            gate::tests::a_role_admits_every_holder_it_names_and_nobody_else \
-            gate::tests::blanks_and_repeats_are_normalised_out_of_a_role \
-            gate::tests::tier_d_admits_only_the_custodian_for_every_mutation \
+            gate::tests::unscoped_the_built_in_roles_decide \
+            gate::tests::a_scoped_call_is_admitted_by_the_grant_it_passed \
+            gate::tests::only_the_runtimes_true_mark_counts_as_scoped \
             gate::tests::every_hd_derivation_mutation_is_in_the_tier_d_registry \
-            gate::tests::a_method_the_registry_does_not_name_is_refused_even_for_the_custodian \
+            gate::tests::a_method_the_registry_does_not_name_is_refused_even_scoped \
             hd::tests::bip32_published_vectors_reproduce_exactly \
             hd::tests::bip39_published_vectors_reproduce_seed_and_root \
             hd::tests::ethereum_addresses_at_consecutive_indices_match_the_published_keys \
