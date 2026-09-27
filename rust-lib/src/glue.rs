@@ -24,15 +24,6 @@ use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, Keystore, Stora
 /// module method. Private keys never appear in any signature — only addresses,
 /// signed payloads, and (re-encrypted) keystore JSON cross the boundary.
 pub trait KeystoreModule: Send + 'static {
-    /// Name who holds the two roles: `{ approver?, custodian? }` → `{ ok, approver,
-    /// custodian }`. TOTAL — a role the document does not name is held by nobody — and it
-    /// takes effect at once, on a module that has been serving the built-in defaults
-    /// (`evm_signer_ui`, `evm_keystore_ui`) since it loaded. A malformed document is refused and
-    /// the roles in force are left untouched.
-    ///
-    /// UNGATED, deliberately and for now: any caller can name itself custodian and then
-    /// mutate the keystore. Protecting it is deferred, not refuted — see docs/specs.md.
-    fn configure(&mut self, config_json: String) -> String;
     /// Generate a fresh BIP-39 mnemonic of `words` (12/15/18/21/24) — `{ ok, phrase }`.
     fn create_mnemonic(&mut self, words: i64) -> String;
     /// Derive + persist an account from a mnemonic, creating its derivation group. params
@@ -156,7 +147,7 @@ pub trait KeystoreModule: Send + 'static {
     /// The requester gave up.
     fn cancel_approval(&mut self, handle: String, receipt: String) -> bool;
 
-    // ── Tier A: the configured approver only ────────────────────────────
+    // ── Tier A: the approver only ───────────────────────────────────────
     /// Queue summaries — never leg detail. `{ ok, pending: [...] }`.
     fn pending(&mut self) -> String;
     /// Claim a request for display. Returns the lines to show VERBATIM plus the
@@ -171,8 +162,9 @@ pub trait KeystoreModule: Send + 'static {
     /// The human said no.
     fn reject(&mut self, handle: String) -> bool;
 
-    /// Observability: what this module currently sees as its caller. Ungated
-    /// and side-effect-free — identity cannot report its own absence.
+    /// Observability: what this module currently sees as its caller, and whether the
+    /// runtime checked the call against a method-list grant (`scoped`). Ungated and
+    /// side-effect-free — identity cannot report its own absence.
     fn caller_identity(&mut self) -> String;
     /// Framework hook — defaulted, so it is NOT part of the IPC contract.
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
@@ -202,8 +194,6 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 struct KeystoreModuleImpl {
     ks: Option<Keystore>,
     approvals: Approvals,
-    /// Who may approve and who may mutate. Defaults from load, replaced by `configure`.
-    roles: gate::Roles,
 }
 
 impl KeystoreModuleImpl {
@@ -235,24 +225,25 @@ fn not_authorized() -> String {
 }
 
 impl KeystoreModuleImpl {
-    /// Tier A: the configured approver, and nothing else.
+    /// Tier A: a call the deployer's policy granted this method (`scoped`), or the built-in
+    /// approver.
     ///
-    /// `HostAnchor` is refused deliberately. It is one undifferentiated bag
-    /// covering the shells, `core_service` and every relayed CLI token, so
-    /// admitting it here would make a plain `logosctl call … approve` a legal
-    /// bypass of the human.
+    /// `HostAnchor` is refused deliberately. It is one undifferentiated bag, so admitting it
+    /// here would make a plain `logosctl call … approve` a legal bypass of the human.
     fn is_approver(&self) -> bool {
-        gate::holds_any_role(&self.roles.approvers, &Self::caller())
+        gate::approver_admits(&Self::caller(), Self::scoped())
     }
 
-    /// Tier D: the configured custodian, for a method `gate::TIER_D_METHODS` names.
-    ///
-    /// `HostAnchor` is refused for the same reason as Tier A — it is one undifferentiated
-    /// bag covering the shells and every relayed CLI token, so admitting it would make a
-    /// plain `logosctl call … import_private_key` a legal way in. A method missing from the
-    /// registry is refused outright rather than falling through ungated.
+    /// Tier D: for a method `gate::TIER_D_METHODS` names, a call the policy granted it
+    /// (`scoped`) or the built-in custodian. A method missing from the registry is refused
+    /// outright rather than falling through ungated.
     fn may_mutate(&self, method: &str) -> bool {
-        gate::tier_d_admits(method, &self.roles.custodians, &Self::caller())
+        gate::tier_d_admits(method, &Self::caller(), Self::scoped())
+    }
+
+    /// Whether the runtime checked this call against a method-list grant.
+    fn scoped() -> bool {
+        gate::scoped_from_caller_json(logos_rust_sdk::current_caller_json().as_deref())
     }
 
     /// The live caller, reduced to the pure form the gate reasons about.
@@ -386,15 +377,6 @@ impl KeystoreModule for KeystoreModuleImpl {
     fn on_context_ready(&mut self, ctx: &RustModuleContext) {
         let base = std::path::Path::new(&ctx.instance_persistence_path);
         self.ks = Some(Keystore::new(base.join("keystore")));
-    }
-
-    fn configure(&mut self, config_json: String) -> String {
-        match self.roles.configure(&config_json) {
-            Ok(()) => json!({ "ok": true, "approvers": self.roles.approvers,
-                              "custodians": self.roles.custodians })
-            .to_string(),
-            Err(e) => err(e),
-        }
     }
 
     fn create_mnemonic(&mut self, words: i64) -> String {
@@ -907,9 +889,6 @@ impl KeystoreModule for KeystoreModuleImpl {
         let Some(requester) = self.named_caller() else {
             return not_authorized();
         };
-        if self.roles.approvers.is_empty() {
-            return not_authorized();
-        }
         match self.approvals.request(&requester, &intent_json) {
             Ok((handle, receipt)) => {
                 emit_approval_offered(&handle);
@@ -1031,8 +1010,8 @@ impl KeystoreModule for KeystoreModuleImpl {
             logos_rust_sdk::LogosCaller::Derived { parent, leaf } => ("derived", format!("{parent}.{leaf}")),
             logos_rust_sdk::LogosCaller::Operator { name } => ("operator", name.clone()),
         };
-        json!({ "ok": true, "kind": kind, "identity": name,
-                "approvers": self.roles.approvers, "custodians": self.roles.custodians })
+        json!({ "ok": true, "kind": kind, "identity": name, "scoped": Self::scoped(),
+                "approvers": [gate::DEFAULT_APPROVER], "custodians": [gate::DEFAULT_CUSTODIAN] })
         .to_string()
     }
 }

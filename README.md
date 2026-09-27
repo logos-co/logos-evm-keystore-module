@@ -12,23 +12,16 @@ Built on well-established crates: [`alloy`](https://github.com/alloy-rs/alloy)
 
 ## Contract (`KeystoreModule`)
 
-**Configuration:** `configure` names who holds the two roles —
-`{ approvers?, custodians? }` → `{ ok, approvers, custodians }`. Each role is a **set**, so
-a terminal signer can approve alongside `evm_signer_ui` rather than by displacing it; write one
-name or a list of them. It is **total**: a role the document does not name is held by
-nobody, and an empty set admits no caller. Until it is called the built-in defaults stand
-(`evm_signer_ui` approves, `evm_keystore_ui` mutates), so a deployment that configures nothing still
-works. A malformed document is refused whole and
-leaves the roles in force untouched.
+**Who may approve and mutate:** the deployer's access policy. A call the runtime checked
+against a method list in a version 2 policy (`"scoped": true` in its caller document) is
+admitted to that method's tier, so a deployment adds a terminal signer or a headless
+custodian by granting it those methods. Any other call gets the built-in roles:
+`evm_signer_ui` approves and `evm_keystore_ui` mutates. The module takes no configuration
+for this, and no method changes it; see
+[`docs/specs.md`](docs/specs.md#who-may-approve-and-mutate-the-deployers-policy), which also
+warns what granting `approve` means.
 
-Configuration arrives by **method call**, never as a file in the module's persistence
-directory: that directory belongs to the module instance, may be sandboxed away from every
-other process, and does not exist until the module has written to it. `configure` is
-**ungated for now** — any caller can name itself custodian — which is a deliberate,
-temporary exposure rather than an oversight; see
-[`docs/specs.md`](docs/specs.md#configureconfig_json-string---string).
-
-**Accounts (Tier D — the custodian only):** `create_mnemonic`, `import_mnemonic`,
+**Accounts (Tier D — the custodian, or a caller granted the method):** `create_mnemonic`, `import_mnemonic`,
 `create_unrelated_account`, `import_private_key`, `import_keystore_json`,
 `export_keystore_json`, `change_password`, `set_label`, `set_group_label`,
 `delete_account`.
@@ -109,8 +102,8 @@ take; the scan covers the one it cannot.
 
 **Signing** goes through the human-approval tiers — `request_approval` /
 `approval_status` / `fetch_result` / `ack_result` / `cancel_approval` for any named
-module, and `pending` / `acknowledge` / `approve` / `reject` for the configured
-approver. There is no `unlock`, no signer cache, and no method that signs on demand.
+module, and `pending` / `acknowledge` / `approve` / `reject` for the approver (or a
+caller the policy granted them). There is no `unlock`, no signer cache, and no method that signs on demand.
 
 Events: `accounts_changed`, `approval_offered`, `approval_settled`. All structured
 values cross the IPC boundary as JSON strings. `accounts_changed` fires after every
