@@ -142,7 +142,7 @@ sequenceDiagram
     participant H as the human
     participant DISK as scrypt vault dir
 
-    Note over KS: on_context_ready(ctx) → Keystore::new(...)<br/>roles default to evm_signer_ui / evm_keystore_ui until configure() names them
+    Note over KS: on_context_ready(ctx) → Keystore::new(...)<br/>the built-in roles, evm_signer_ui / evm_keystore_ui, plus what the deployer's policy grants
 
     BE->>KS: request_approval({ address, purpose, legs })
     Note right of KS: caller must be a NAMED module (Tier B)
@@ -208,7 +208,6 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 
 | Method | Params | Returns | Mutates accounts? |
 |--------|--------|---------|-------------------|
-| `configure` | `config_json: String` | `{ ok, approvers, custodians }` | no — sets who may |
 | `create_mnemonic` | `words: i64` | `{ ok, phrase }` | no |
 | `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin }` | yes → event |
 | `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
@@ -242,59 +241,48 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `acknowledge` | `handle: String` | `{ ok, bundle_id, requester, claim_lines, render_lines }` | no |
 | `approve` | `handle, bundle_id, password: String` | `{ ok, signed_count: n }` | no |
 | `reject` | `handle: String` | `bool` | no |
-| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians }` | no |
+| `caller_identity` | — | `{ ok, kind, identity, scoped, approvers, custodians }` | no |
 
 ---
 
-### `configure(config_json: String) -> String`
+### Who may approve and mutate: the deployer's policy
 
-Name who holds the two roles. `config_json` is `{ approvers?, custodians? }`; the reply is
-`{ ok, approvers, custodians }` echoing what is now in force, or the usual
-`{ ok: false, error }`. It takes effect on the next call — nothing is reloaded.
+Tiers A and D decide in two ways, and the module takes no configuration for either:
 
-**A role is a set.** Each key takes one name or a list of them, because a terminal signer
-has to approve *alongside* `evm_signer_ui` rather than by displacing it. Blanks and repeats are
-normalised out, so `is_empty()` and "admits nobody" can never disagree. The pre-list
-`approver`/`custodian` spelling is refused as an unknown key — the right way for a stale
-configuration to fail, since accepting it silently would empty both roles.
+- **A call the deployer's policy granted.** The runtime marks a call `"scoped": true` when
+  it checked it against a method list in the access policy (version 2), for exactly the
+  method called. Such a call is admitted to Tier A or Tier D: the policy already named its
+  caller for that method, and the runtime refused every other method before this module ran.
+  This is how a deployment adds `evm_signer_cli` as an approver, or a headless custodian:
+  by granting those methods.
+- **Anything else** gets the built-in roles: `evm_signer_ui` approves and `evm_keystore_ui`
+  mutates. That covers older runtimes and runtimes with no rule for the keystore.
 
-**Total, not a patch.** The document is the whole answer to who holds these roles, so one
-it does not name is held by **nobody**: `gate::holds_any_role` refuses an empty set, and
-every method of that tier then refuses everyone. Half a configuration inheriting the other half
-from a default is how a deployer who replaced one surface goes on granting the old one.
-Whitespace is not a module name, so a blank string means nobody rather than an unmatchable
-somebody.
+A `"*"` grant, or a list-form rule, is **not** scoped: it only lets the caller through to
+the keystore's own check. Only the keystore's runtime writes the mark, from the grant it
+matched; a caller cannot claim it.
 
-**Refusals leave the gate where it stood.** A document that is not a JSON object, carries an
-unknown key, or types a role as anything but a string is refused whole and the roles in
-force are untouched — there is no partial apply. The unknown-key rule exists because under
-the total rule a typo (`custodain`) would otherwise empty **both** roles: fail-closed, but
-silent about why everything started refusing.
+```jsonc
+{"version": 2, "mode": "explicit",
+ "restrictions": {
+   "keystore_module": {"allowedCallers": {
+     "evm_signer_ui":   ["pending", "acknowledge", "approve", "reject"],
+     "evm_signer_cli":  ["pending", "acknowledge", "approve", "reject"],
+     "evm_keystore_ui": "*",
+     "*":     ["request_approval", "approval_status", "fetch_result", "ack_result", "cancel_approval",
+               "list_accounts", "has_address", "get_labels", "list_groups", "caller_identity"],
+     "@op:*": ["list_accounts", "has_address", "caller_identity"]
+   }}}}
+```
 
-**Until it is called, the built-in defaults stand** — `evm_signer_ui` approves, `evm_keystore_ui`
-mutates. A module nobody configures is not inert.
+> **Granting `approve` takes a human out of the approval.** Tier A exists so that a human
+> reads what is about to be signed and types the vault password. Grant `pending`,
+> `acknowledge`, `approve` and `reject` only to a signer surface that does exactly that;
+> granting them to anything else lets that caller sign whatever is requested.
 
-#### It is deliberately ungated, for now
-
-Any caller can call `configure`, name **itself** custodian, and then mutate the keystore.
-That is a real exposure and it is a deliberate, temporary one: protecting this call is
-**deferred, not refuted**.
-
-The design this replaced put the two role names in `<persistence>/keystore.json`, read once
-in `on_context_ready`, on the stated ground that *who may mutate the keystore is
-configuration, not a method — a `set_custodian` call would be a remotely-writable answer to
-"who may import a key."* That reasoning still holds; what did not hold was the delivery. A
-module's persistence directory is owned by the module instance and may be sandboxed with no
-other process able to reach it, so configuration cannot be **placed** there from outside —
-and in practice it did not even exist until the module had written to it, which put the
-config out of reach at exactly the moment it was needed. Configuration has to arrive by
-method call.
-
-What is still owed is the protection the file gave for free: an answer to "who may set
-policy" that is not simply "whoever calls first". Claim-once semantics, a caller gate, or a
-platform-level configuration channel are all candidates; none is implemented here. Until one
-is, treat the roles as advisory against a hostile co-resident module and load-bearing against
-an honest one.
+The policy is the deployer's, set when the runtime starts (`logos_core_set_access_policy`,
+`access_policy:` in `logosctl`'s daemon config, `--access-policy` in Basecamp). There is no
+method that changes it, so no caller can make itself an approver or a custodian.
 
 ---
 
@@ -1077,13 +1065,13 @@ Every request is classified by the **caller identity** the platform reports
 
 | Tier | Methods | Admits |
 |------|---------|--------|
-| **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
+| **A** | `pending`, `acknowledge`, `approve`, `reject` | a call the policy granted the method (`scoped`), or the built-in **approver** `evm_signer_ui` |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
-| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | a configured **custodian** (default `evm_keystore_ui`) |
+| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity` | ungated |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `remove_group`, `settle`, `remove_unexplained` | a call the policy granted the method (`scoped`), or the built-in **custodian** `evm_keystore_ui` |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
-names and `gate::tier_d_admits(method, custodian, caller)` is the only decision.
+names and `gate::tier_d_admits(method, caller, scoped)` is the only decision.
 A method **missing** from that list is refused outright rather than falling through
 ungated — so the failure mode of forgetting to gate a new mutation is that it
 refuses everyone, loudly, instead of admitting everyone, silently.
@@ -1098,13 +1086,9 @@ carried — a mnemonic, a private key, a vault JSON, a password — is zeroized 
 for the allocator. Gating `delete_account` also closes an unmetered password oracle: before,
 any module could guess at the vault password there, and a correct guess DESTROYED the account.
 
-An **empty** custodian admits nobody. That is the same fail-closed direction Tier A took
-before `evm_signer_ui` shipped: an unconfigured role means the surface that should hold it does
-not exist yet, and the capability is then unavailable rather than universal.
-
-**Who sets the roles is itself ungated.** `configure` names both, and nothing stops a caller
-naming itself — so Tier D currently keeps an honest deployer's policy rather than enforcing
-one against a hostile co-resident module. See [`configure`](#configureconfig_json-string---string).
+Beyond the built-in roles, only the deployer's policy admits a caller to Tier A or D, by
+granting it the method (see [Who may approve and mutate](#who-may-approve-and-mutate-the-deployers-policy)).
+No method of this module changes who may.
 
 ### Caller identity — live, and what it reports
 
@@ -1301,7 +1285,7 @@ property is not continuously verified.
 ### What the gate does and does not guarantee
 
 With identity live and impersonation closed, Tier A means what it is meant to mean: the
-caller *is* the configured approver package. Two limits remain worth stating plainly.
+caller *is* the approver package, or one the deployer's policy granted Tier A's methods. Two limits remain worth stating plainly.
 
 **`module:evm_signer_ui` names a plugin package, not a human.** A `ui_qml` plugin's QML view
 and its `ui-host` backend are one identity by design, and this module cannot distinguish
@@ -1475,14 +1459,13 @@ mistaken for a signable Ethereum digest.
 
 ### `caller_identity() -> String`
 
-Ungated observability: `{ ok, kind, identity, approvers, custodians }` where `kind` is one
-of `unknown` | `host` | `module` | `derived` | `operator`.
+Ungated observability: `{ ok, kind, identity, scoped, approvers, custodians }` where `kind`
+is one of `unknown` | `host` | `module` | `derived` | `operator`.
 
-`approvers` and `custodians` are the names currently in force — the built-in defaults, or
-whatever `configure` last set. An **empty** list means that role is held by nobody and every
-method of its tier refuses, which is what this field exists to make visible. (It used to
-carry a `configError` naming an unreadable `keystore.json`; there is no config file any
-more, so that state cannot occur and the field is gone.)
+`scoped` is whether the runtime checked this call against a method-list grant, which is what
+admits a caller the built-in roles do not name. `approvers` and `custodians` are the built-in
+roles, `["evm_signer_ui"]` and `["evm_keystore_ui"]`; the policy's grants are the runtime's
+and are not listed here.
 
 ### Events
 
@@ -1537,7 +1520,7 @@ name was exactly that.
 | Field | Value | Notes |
 |-------|-------|-------|
 | `name` | `keystore_module` | Module id used by `logosctl`/`lgpm` |
-| `version` | `1.0.0` | |
+| `version` | `0.1.0` | |
 | `type` | `core` | Core (non-UI) module |
 | `interface` | `cdylib` | Rust-first cdylib module |
 | `category` | `wallet` | |
@@ -1565,9 +1548,9 @@ directory.
 **Nothing is read from that directory as configuration.** It is owned by the module
 instance and may be sandboxed away from every other process, so nothing outside can be
 relied on to write there — and it does not exist until this module has written to it.
-The two role names arrive by method call
-([`configure`](#configureconfig_json-string---string)); everything else the module needs it
-either defaults or computes.
+Who may approve and mutate comes from the runtime's access policy
+([Who may approve and mutate](#who-may-approve-and-mutate-the-deployers-policy)); everything
+else the module needs it either defaults or computes.
 
 ### Directory layout
 
@@ -1739,9 +1722,8 @@ Four reads had that shape, and all four now refuse:
 
 A fifth read used to sit in this table: `on_context_ready` read the role names from
 `<persistence>/keystore.json`, and an unreadable one emptied both roles rather than
-reverting to defaults. That read is gone — the roles arrive by
-[`configure`](#configureconfig_json-string---string) — and with it the whole class: a call
-either parses or is refused, and a refused one changes nothing.
+reverting to defaults. That read is gone — the built-in roles are fixed and everything else
+is the runtime's access policy — and with it the whole class.
 
 **Writes are staged and renamed.** `write_json` writes `<name>.json.tmp`, `sync_all`s
 it, restricts it to 0600 and renames it into place, so a crash or a full disk leaves
@@ -1861,22 +1843,30 @@ nix build '.#lgx' -o keystore-lgx
 mkdir -p modules && cp -RL ./logos/modules/. ./modules/   # bundled capability_module
 ./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file keystore-lgx/*.lgx
 
-# 3. Start the daemon, load, and drive
+# 3. Start the daemon under the deployer's policy, load, and drive. The fixture
+#    custodian is granted the account methods; operators get "*", which reaches the
+#    keystore but grants no method, so its own check still refuses them.
+mkdir -p daemon && cat > daemon/config.yaml <<'EOF'
+access_policy: |
+  {"version": 2, "mode": "explicit",
+   "restrictions": {"keystore_module": {"allowedCallers": {
+     "keystore_custodian": ["import_private_key", "list_accounts", "..."],
+     "@op:*": "*"}}}}
+EOF
 logosctl --config-dir . daemon start --detach
 sleep 3
 logosctl module load keystore_module
 logosctl module show keystore_module        # note: no unlock/sign_* methods exist
-logosctl call keystore_module caller_identity          # → {"kind":"host", ...}
+logosctl call keystore_module caller_identity          # → {"kind":"operator", "scoped":false, ...}
 logosctl call keystore_module list_accounts            # ungated read
 
-# Tier D is UNREACHABLE from the CLI too: it is the host anchor, not a named module,
-# and admitting it would make `logosctl call` a legal way to import a key.
+# Tier D is UNREACHABLE from the CLI too: an operator is not the custodian, and "*"
+# grants it no method, so admitting it would make `logosctl call` a way to import a key.
 logosctl call keystore_module create_mnemonic 12                # → {"ok":false,"error":"not authorized"}
 logosctl call keystore_module import_private_key <privkey> pw   # → {"ok":false,"error":"not authorized"}
 
-# Mutation goes through a configured custodian — here the doc-test's fixture
-# (doctests/custodian-probe). configure is TOTAL, so the approver is restated.
-logosctl call keystore_module configure '{"approvers":"evm_signer_ui","custodians":"keystore_custodian"}'
+# Mutation goes through a custodian the policy granted the methods — here the
+# doc-test's fixture (doctests/custodian-probe).
 logosctl module load keystore_custodian
 logosctl call keystore_custodian import_key <privkey> pw        # → {address}
 logosctl call keystore_module list_accounts                     # now lists it
@@ -1894,8 +1884,8 @@ Outside the doc-test the custodian is `evm_keystore_cli`
 ([logos-co/logos-evm-keystore-cli](https://github.com/logos-co/logos-evm-keystore-cli)),
 which relays every Tier D method under its own identity with the keystore's own
 names and parameters — so the admitted spelling of the refused line above is
-`logosctl call evm_keystore_cli import_private_key <privkey> pw`, after a
-`configure` that names it custodian.
+`logosctl call evm_keystore_cli import_private_key <privkey> pw`, once the policy grants
+`evm_keystore_cli` those methods.
 
 ### How the doc-test exercises it
 
@@ -2159,7 +2149,7 @@ This module is the wallet's **secret-holding boundary**. Its security properties
    every unlock a permanent, unattributable signing oracle.
 
 5. **A signature requires a human.** No method signs outside `approve()`, and
-   `approve()` is reachable only by the configured approver. `render == sign` is
+   `approve()` is reachable only by the approver, or a surface the deployer's policy grants it. `render == sign` is
    enforced rather than assumed: the intent is re-parsed and its commitment
    re-derived *inside* `approve()` and compared against the `bundle_id` that was
    displayed, so a requester cannot get one thing rendered and another signed.
