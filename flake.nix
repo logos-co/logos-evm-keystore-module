@@ -3,6 +3,12 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
+    # logos.wallets/1 (wallets.lidl): the signer manager, bound at runtime, since it depends on
+    # this module and this module can't depend on it.
+    logos-signer-interface = {
+      url = "github:logos-co/logos-signer-interface/ca091a9330d455a5b60b80537e34dc535d1e6503";
+      flake = false;
+    };
   };
 
   outputs = inputs@{ self, logos-module-builder, ... }:

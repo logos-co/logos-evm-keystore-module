@@ -27,7 +27,12 @@ pub mod ack;
 pub mod hd;
 
 pub use ack::Unrecoverable;
-pub use keystore::{BitcoinGroup, BitcoinImport, KeepPhrase, KeptPhrase, Keystore, KeystoreError, WalletStart};
+pub use keystore::{
+    BitcoinGroup, BitcoinImport, Enrolment, KeepPhrase, KeptPhrase, Keystore, KeystoreError, WalletStart, IMPORTED_SEED,
+};
+
+/// A seed's unlock key: what unlocks the wallet's data in every app, kept behind its password.
+pub mod unlockkey;
 
 // The Logos module contract + glue. Feature-gated so the crypto core above can
 // be exercised with `cargo test --no-default-features`; the builder compiles it

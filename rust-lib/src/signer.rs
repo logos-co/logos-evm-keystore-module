@@ -12,10 +12,11 @@ use bitcoin::key::{Keypair, TapTweak};
 use bitcoin::secp256k1::{Message, Secp256k1};
 use zeroize::Zeroizing;
 
-use logos_signer_interface::jobs::JobTable;
+use logos_signer_interface::jobs::{JobTable, KeyJobs};
+use logos_signer_interface::unlock::is_reserved;
 use logos_signer_interface::wire::{
     Account, Chain, Collects, ErrorCode, Family, HashItem, JobState, JobStatus, Payload, RequestKind, Result,
-    Scheme, SignRequest, Signature, SignerError, SignerInfo,
+    Scheme, Secret, SignRequest, Signature, SignerError, SignerInfo, UnlockKey, UnlockKeyRequest,
 };
 use logos_signer_interface::{Signer, INTERFACE};
 
@@ -76,6 +77,17 @@ impl Target {
 enum Material {
     Evm(PrivateKeySigner),
     Bitcoin(AccountSecret),
+}
+
+/// The xpub a request brings has to be this wallet's; the keystore signs with its own.
+fn check_brought(target: &Target, xpub: Option<&str>) -> Result<()> {
+    let (Target::Bitcoin { acct, .. }, Some(xpub)) = (target, xpub) else { return Ok(()) };
+    let brought = bitcoin::bip32::Xpub::from_str(xpub.trim()).map_err(|e| invalid(format!("xpub: {e}")))?;
+    let same = brought.public_key == acct.xpub.public_key && brought.chain_code == acct.xpub.chain_code;
+    if !same {
+        return Err(invalid("the request's xpub is not this wallet's"));
+    }
+    Ok(())
 }
 
 fn open(ks: &Keystore, target: &Target, password: &str) -> Result<Material> {
@@ -205,6 +217,9 @@ fn check_items(target: &Target, items: &[HashItem]) -> Result<Vec<([u8; 32], Opt
                         ));
                     }
                     let path = item.path.as_deref().ok_or_else(|| invalid("a Bitcoin item names its path"))?;
+                    if is_reserved(path) {
+                        return Err(invalid("nothing signs under the unlock keys' purpose"));
+                    }
                     let parsed = DerivationPath::from_str(path).map_err(|e| invalid(format!("path {path:?}: {e}")))?;
                     let at = acct
                         .relative(&parsed)
@@ -290,6 +305,7 @@ pub struct KeystoreSigner<'a> {
     pub ks: &'a Keystore,
     pub unlocks: &'a mut Unlocks,
     pub jobs: &'a mut JobTable,
+    pub keys: &'a mut KeyJobs,
 }
 
 impl KeystoreSigner<'_> {
@@ -364,6 +380,7 @@ pub fn info() -> SignerInfo {
         request_kinds: vec![RequestKind::Hash],
         shows_request: false,
         collects: Collects::Password,
+        unlock_key: true,
     }
 }
 
@@ -378,6 +395,10 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
     let provenance = ks.get_provenance().map_err(from_keystore)?;
     let names = ks.get_group_labels().map_err(from_keystore)?;
     let groups = ks.get_groups().map_err(from_keystore)?;
+    let seed_of = |address: &str| {
+        let group = by_address(&provenance, address).map(|p| p.group.clone()).unwrap_or_default();
+        Keystore::seed_of(&groups, &group, address)
+    };
     // The wallet an EVM account comes from: its group's fingerprint, else one another group of the
     // same seed recorded. An imported key belongs to no wallet.
     let wallet_of = |gid: &str| {
@@ -401,6 +422,8 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
             fingerprint: by_address(&provenance, &key).and_then(|p| wallet_of(&p.group)),
             address: Some(addr.to_string()),
             xpub: None,
+            key: None,
+            seed: Some(seed_of(&addr.to_string())),
             label: by_address(&labels, &key).cloned().filter(|l| !l.is_empty()),
             available: true,
         });
@@ -421,6 +444,8 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
             fingerprint: Some(acct.fingerprint.to_string()),
             address: None,
             xpub: Some(acct.xpub.to_string()),
+            key: None,
+            seed: Some(Keystore::seed_of(&groups, &id, "")),
             label: names.get(&id).cloned().filter(|l| !l.is_empty()),
             available: true,
         });
@@ -443,6 +468,7 @@ impl Signer for KeystoreSigner<'_> {
             return Err(SignerError::new(ErrorCode::Unsupported, "the keystore signs hashes only"));
         };
         let checked = check_items(&target, items)?;
+        check_brought(&target, request.xpub.as_deref())?;
         let material = match &request.secret {
             Some(s) => open(self.ks, &target, s.expose())?,
             None => self.from_unlock(&target)?,
@@ -464,6 +490,34 @@ impl Signer for KeystoreSigner<'_> {
 
     fn cancel(&mut self, job: &str) -> Result<()> {
         self.jobs.cancel(job)
+    }
+
+    /// Done at once: the wallet's password opens its unlock root, or the imported key it is.
+    fn unlock_key(&mut self, request: UnlockKeyRequest) -> Result<String> {
+        let Some(secret) = &request.secret else {
+            return Err(SignerError::new(ErrorCode::Locked, "a keystore wallet unlocks with its password"));
+        };
+        let outcome = self.ks.unlock_key(&request.seed, request.index, secret.expose()).map_err(|e| match e {
+            KeystoreError::NotFound(_) => SignerError::new(ErrorCode::WrongSeed, "this keystore holds no such seed"),
+            other => from_keystore(other),
+        });
+        // A seed it doesn't hold is refused before a job exists, as a wrong secret is.
+        let key = outcome?;
+        let job = self.keys.start(JobState::Working);
+        self.keys.finish(&job, Ok(UnlockKey { key: Secret::new(hex::encode(key)) }))?;
+        Ok(job)
+    }
+
+    fn unlock_key_status(&mut self, job: &str) -> Result<JobStatus> {
+        self.keys.status(job)
+    }
+
+    fn unlock_key_result(&mut self, job: &str) -> Result<UnlockKey> {
+        self.keys.take(job)
+    }
+
+    fn cancel_unlock_key(&mut self, job: &str) -> Result<()> {
+        self.keys.cancel(job)
     }
 }
 
@@ -506,7 +560,8 @@ mod tests {
     fn the_keystore_passes_the_signer_conformance_suite() {
         let (_dir, ks) = keystore();
         let (mut unlocks, mut jobs) = (Unlocks::default(), JobTable::new());
-        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs };
+        let mut keys = KeyJobs::new();
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
         let fx = Fixture { secret: Some(Secret::new("pw")), wrong_secret: Some(Secret::new("nope")) };
         conformance::run(&mut s, &fx, &mut no_device);
     }
@@ -517,6 +572,7 @@ mod tests {
             account: account.id.clone(),
             payload: Payload::Hash { items: items.clone() },
             secret: secret.map(Secret::new),
+            xpub: None,
         };
         (req, items)
     }
@@ -525,7 +581,8 @@ mod tests {
     fn an_unlock_signs_without_the_password_until_its_count_runs_out() {
         let (_dir, ks) = keystore();
         let (mut unlocks, mut jobs) = (Unlocks::default(), JobTable::new());
-        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs };
+        let mut keys = KeyJobs::new();
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
         for account in s.accounts().unwrap() {
             let (req, _) = hash_request(&account, None);
             assert_eq!(s.sign(req).unwrap_err().code, ErrorCode::Locked, "{}", account.id);
@@ -547,7 +604,8 @@ mod tests {
     fn an_unlock_ends_when_its_time_passes_or_on_lock() {
         let (_dir, ks) = keystore();
         let (mut unlocks, mut jobs) = (Unlocks::default(), JobTable::new());
-        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs };
+        let mut keys = KeyJobs::new();
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
         let accounts = s.accounts().unwrap();
         s.unlock(&accounts[0].id, "pw", Some(Duration::from_secs(900)), None).unwrap();
         s.unlock(&accounts[1].id, "pw", None, None).unwrap();
@@ -567,7 +625,8 @@ mod tests {
     fn a_password_signs_without_touching_an_unlocks_count() {
         let (_dir, ks) = keystore();
         let (mut unlocks, mut jobs) = (Unlocks::default(), JobTable::new());
-        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs };
+        let mut keys = KeyJobs::new();
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
         let account = s.accounts().unwrap().remove(0);
         s.unlock(&account.id, "pw", None, Some(1)).unwrap();
         let (req, _) = hash_request(&account, Some("pw"));
@@ -579,7 +638,8 @@ mod tests {
     fn a_database_key_comes_from_the_password_or_an_unlock_only() {
         let (_dir, ks) = keystore();
         let (mut unlocks, mut jobs) = (Unlocks::default(), JobTable::new());
-        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs };
+        let mut keys = KeyJobs::new();
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
         let accounts = s.accounts().unwrap();
         let wallet = accounts.iter().find(|a| a.family == Family::Bitcoin).unwrap();
         let key = s.database_key(&wallet.id, Some("pw")).unwrap();
@@ -596,7 +656,8 @@ mod tests {
     fn a_scheme_or_path_that_is_not_the_accounts_is_refused_before_any_vault_opens() {
         let (_dir, ks) = keystore();
         let (mut unlocks, mut jobs) = (Unlocks::default(), JobTable::new());
-        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs };
+        let mut keys = KeyJobs::new();
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
         for account in s.accounts().unwrap() {
             let (mut req, mut items) = hash_request(&account, Some("wrong"));
             items[0].scheme = match account.family {
@@ -652,5 +713,64 @@ mod tests {
         assert!(segwit.xpub.as_deref().unwrap().starts_with("tpub"));
         let (acct, _) = ks.bitcoin_account(&segwit.id).unwrap();
         assert_eq!(segwit.fingerprint.as_deref(), Some(acct.fingerprint.to_string().as_str()));
+    }
+
+    fn unlock_key_of(s: &mut KeystoreSigner<'_>, seed: &str, index: u32, pw: Option<&str>) -> Result<String> {
+        let job = s.unlock_key(UnlockKeyRequest { seed: seed.into(), index, secret: pw.map(Secret::new) })?;
+        Ok(s.unlock_key_result(&job)?.key.expose().to_string())
+    }
+
+    #[test]
+    fn a_seeds_branches_name_one_seed_and_give_the_unlock_key_a_card_would() {
+        let (_dir, ks) = keystore();
+        let (mut unlocks, mut jobs, mut keys) = (Unlocks::default(), JobTable::new(), KeyJobs::new());
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
+        let listed = s.accounts().unwrap();
+        let bitcoin: Vec<&Account> = listed.iter().filter(|a| a.family.is_bitcoin()).collect();
+        assert_eq!(bitcoin.len(), 2);
+        let seed = bitcoin[0].seed.clone().unwrap();
+        assert_eq!(bitcoin[1].seed.as_deref(), Some(seed.as_str()), "segwit and taproot of one phrase: one seed");
+        let imported = listed.iter().find(|a| a.family == Family::Evm).unwrap();
+        assert_eq!(imported.seed.as_deref(), Some(format!("key:{}", imported.id.to_ascii_lowercase()).as_str()));
+
+        // The interface's mock holds the same phrase, as a card would: the same key at each index.
+        let mut card = logos_signer_interface::mock::MockSigner::new(Default::default());
+        let card_seed = card.accounts().unwrap()[0].seed.clone().unwrap();
+        for n in [0, 1] {
+            let job = card.unlock_key(UnlockKeyRequest { seed: card_seed.clone(), index: n, secret: None }).unwrap();
+            let want = card.unlock_key_result(&job).unwrap().key.expose().to_string();
+            assert_eq!(unlock_key_of(&mut s, &seed, n, Some("pw")).unwrap(), want, "index {n}");
+        }
+        assert_eq!(unlock_key_of(&mut s, &seed, 0, Some("nope")).unwrap_err().code, ErrorCode::WrongSecret);
+        assert_eq!(unlock_key_of(&mut s, &seed, 0, None).unwrap_err().code, ErrorCode::Locked);
+        assert_eq!(unlock_key_of(&mut s, "s_unknown", 0, Some("pw")).unwrap_err().code, ErrorCode::WrongSeed);
+    }
+
+    #[test]
+    fn the_unlock_key_follows_the_password_and_the_enrolment_names_the_wallet() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let derived = ks
+            .import_mnemonic_ex(&crate::keystore::ImportRequest {
+                phrase: PHRASE,
+                bip39_passphrase: "",
+                index: 0,
+                password: "first",
+                storage: crate::keystore::Storage::Plain,
+                bip44_account: 0,
+                change: 0,
+                group_password: "",
+                group_label: "Main",
+                keep: crate::keystore::KeepPhrase::No,
+            })
+            .unwrap();
+        let e = ks.enrolment(&derived.address.to_string(), "first").unwrap();
+        assert_eq!(e.name, "Main");
+        assert!(e.seed.starts_with("g_"), "{}", e.seed);
+        ks.change_password(&derived.address.to_string(), "first", "second").unwrap();
+        assert!(ks.unlock_key(&e.seed, 0, "first").is_err());
+        assert_eq!(ks.unlock_key(&e.seed, 0, "second").unwrap(), e.unlock_key);
+        let groups = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
+        assert!(!groups.contains(&hex::encode(e.unlock_key)), "no unlock key in the clear");
     }
 }

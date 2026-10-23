@@ -22,7 +22,7 @@ use crate::gate;
 use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
 use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
 use crate::{BitcoinImport, WalletStart};
-use logos_signer_interface::jobs::JobTable;
+use logos_signer_interface::jobs::{JobTable, KeyJobs};
 use logos_signer_interface::{json as signer_json, wire};
 
 /// The keystore module's IPC contract. Each non-defaulted method is a callable
@@ -198,6 +198,15 @@ pub trait KeystoreModule: Send + 'static {
     fn sign_result(&mut self, job: String) -> String;
     /// `{ ok, job }`. Tier M.
     fn cancel_sign(&mut self, job: String) -> String;
+    /// A seed's unlock key, for the signer manager to unlock the wallet's data: `{ seed, index,
+    /// secret }`, the secret being the wallet's password → `{ ok, job }`, done at once. Tier M.
+    fn unlock_key(&mut self, request_json: String) -> String;
+    /// `{ ok, job, state, code?, error? }`. Tier M.
+    fn unlock_key_status(&mut self, job: String) -> String;
+    /// `{ ok, job, key }`, once: the job forgets it. Tier M.
+    fn unlock_key_result(&mut self, job: String) -> String;
+    /// `{ ok, job }`. Tier M.
+    fn cancel_unlock_key(&mut self, job: String) -> String;
     /// Hold an account's key in memory until `ttlMs` passes or `count` requests are signed.
     /// `{ account, password, ttlMs?, count? }` → `{ ok, account, expiresInMs, countLeft }`. Tier M:
     /// the manager keeps which apps the unlock covers, so nothing else may reach it.
@@ -268,6 +277,10 @@ pub trait KeystoreModuleEvents {
 // C-ABI dispatch. No `build.rs`, no `OUT_DIR`.
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 
+/// The module behind `logos.wallets/1`: the signer manager, bound at runtime, since it depends on
+/// this keystore and this keystore can't depend on it.
+const WALLETS: &str = "signer_manager_module";
+
 #[derive(Default)]
 struct KeystoreModuleImpl {
     ks: Option<Keystore>,
@@ -277,6 +290,8 @@ struct KeystoreModuleImpl {
     /// Keys held by an unlock, in memory only, and the signer interface's jobs.
     unlocks: Unlocks,
     jobs: JobTable,
+    /// Unlock-key jobs: read once, by the manager only, and announced nowhere.
+    keys: KeyJobs,
 }
 
 impl KeystoreModuleImpl {
@@ -288,7 +303,25 @@ impl KeystoreModuleImpl {
     /// The keystore as a signer, over this module's state for one call.
     fn signer(&mut self) -> std::result::Result<KeystoreSigner<'_>, String> {
         let ks = self.ks.as_ref().ok_or_else(|| "keystore not initialized (context not ready)".to_string())?;
-        Ok(KeystoreSigner { ks, unlocks: &mut self.unlocks, jobs: &mut self.jobs })
+        Ok(KeystoreSigner { ks, unlocks: &mut self.unlocks, jobs: &mut self.jobs, keys: &mut self.keys })
+    }
+
+    /// Tell the signer manager about the wallet an import added, while its password is at hand,
+    /// so the person never unlocks it a second time. Asked without waiting: the manager answers
+    /// in its own time, and without one installed the wallet is added all the same.
+    fn enroll(&mut self, account_or_group: &str, password: &str) {
+        let Ok(ks) = self.ks() else { return };
+        let Ok(e) = ks.enrolment(account_or_group, password) else { return };
+        let body = Zeroizing::new(
+            json!({ "seed": e.seed, "kind": "keystore", "unlockKey": hex::encode(e.unlock_key), "name": e.name,
+                    "origin": e.origin, "birthday": e.birthday })
+            .to_string(),
+        );
+        // Not from this call: the first call to the manager waits for its connection in a nested
+        // event loop, where the next call into this module would wait on this one's lock.
+        std::thread::spawn(move || {
+            wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
+        });
     }
 
     /// Both account events: the keystore's own, and the signer interface's.
@@ -700,6 +733,7 @@ impl KeystoreModule for KeystoreModuleImpl {
                 let kept =
                     ks.get_groups().ok().and_then(|gs| gs.get(&d.group).and_then(|r| r.phrase.clone()));
                 self.announce();
+                self.enroll(&d.address.to_string(), &password);
                 json!({ "ok": true, "address": d.address.to_string(), "path": d.path,
                         "group": d.group, "storage": storage.as_str(), "index": d.index,
                         "origin": "derived", "phrase": kept })
@@ -845,6 +879,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         match res {
             Ok(addr) => {
                 self.announce();
+                self.enroll(&addr.to_string(), &p.password);
                 json!({ "ok": true, "address": addr.to_string(), "origin": "random" }).to_string()
             }
             Err(e) => err(e),
@@ -1036,6 +1071,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         match res {
             Ok(addr) => {
                 self.announce();
+                self.enroll(&addr.to_string(), &password);
                 json!({ "ok": true, "address": addr.to_string() }).to_string()
             }
             Err(e) => err(e),
@@ -1056,6 +1092,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         match res {
             Ok(addr) => {
                 self.announce();
+                self.enroll(&addr.to_string(), &new_password);
                 json!({ "ok": true, "address": addr.to_string() }).to_string()
             }
             Err(e) => err(e),
@@ -1371,6 +1408,47 @@ impl KeystoreModule for KeystoreModuleImpl {
         }
     }
 
+    fn unlock_key(&mut self, request_json: String) -> String {
+        let request_json = Zeroizing::new(request_json);
+        if !self.is_manager("unlock_key") {
+            return not_authorized();
+        }
+        match self.signer() {
+            Ok(mut s) => signer_json::unlock_key(&mut s, &request_json),
+            Err(e) => err(e),
+        }
+    }
+
+    fn unlock_key_status(&mut self, job: String) -> String {
+        if !self.is_manager("unlock_key_status") {
+            return not_authorized();
+        }
+        match self.signer() {
+            Ok(mut s) => signer_json::unlock_key_status(&mut s, &job),
+            Err(e) => err(e),
+        }
+    }
+
+    fn unlock_key_result(&mut self, job: String) -> String {
+        if !self.is_manager("unlock_key_result") {
+            return not_authorized();
+        }
+        match self.signer() {
+            Ok(mut s) => signer_json::unlock_key_result(&mut s, &job),
+            Err(e) => err(e),
+        }
+    }
+
+    fn cancel_unlock_key(&mut self, job: String) -> String {
+        if !self.is_manager("cancel_unlock_key") {
+            return not_authorized();
+        }
+        match self.signer() {
+            Ok(mut s) => signer_json::cancel_unlock_key(&mut s, &job),
+            Err(e) => err(e),
+        }
+    }
+
     fn sign_status(&mut self, job: String) -> String {
         if !self.is_manager("sign_status") {
             return not_authorized();
@@ -1604,6 +1682,7 @@ impl KeystoreModule for KeystoreModuleImpl {
                 let kept = record.as_ref().and_then(|r| r.phrase.clone());
                 let birthday = record.and_then(|r| r.birthday);
                 self.announce();
+                self.enroll(&g.id, &password);
                 json!({ "ok": true, "group": g.id, "family": family.as_str(), "chain": chain.as_str(),
                         "path": format!("m/{}", g.account.origin().to_string().trim_start_matches("m/")),
                         "fingerprint": g.account.fingerprint.to_string(),
