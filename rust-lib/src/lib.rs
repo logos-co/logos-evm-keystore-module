@@ -18,6 +18,10 @@ pub mod layout;
 
 mod keystore;
 
+/// The bookkeeping, one box per seed under this module's key for it from the signer manager, so
+/// a locked wallet's accounts are not listed.
+pub mod index;
+
 /// The acknowledgement a random key is created behind, and the type it produces. Its own
 /// module so the rest of the crate cannot construct that type — only ask for one.
 pub mod ack;
@@ -27,7 +31,12 @@ pub mod ack;
 pub mod hd;
 
 pub use ack::Unrecoverable;
-pub use keystore::{BitcoinGroup, BitcoinImport, KeepPhrase, KeptPhrase, Keystore, KeystoreError, WalletStart};
+pub use keystore::{
+    BitcoinGroup, BitcoinImport, Enrolment, KeepPhrase, KeptPhrase, Keystore, KeystoreError, WalletStart, IMPORTED_SEED,
+};
+
+/// A seed's unlock key: what unlocks the wallet's data in every app, kept behind its password.
+pub mod unlockkey;
 
 // The Logos module contract + glue. Feature-gated so the crypto core above can
 // be exercised with `cargo test --no-default-features`; the builder compiles it

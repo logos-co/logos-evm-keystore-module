@@ -55,10 +55,19 @@ custodians and managers.
 pickers: `{ ok, wallets: { "<address>": { wallet, index? } } }`. Accounts without a
 named derivation group are omitted rather than assigned a guessed wallet.
 
-A wallet is named like an account is: `set_group_label` writes, an empty string clears,
-and `get_group_labels` answers from `group-labels.json` alone — so the name survives the
-record and the key it belonged to, which is the row a UI most needs to name. Duplicates
-are storable on purpose; uniqueness is the reader's problem.
+A wallet is named like an account is: `set_wallet_name` names the wallet — every account
+file of one seed — and `set_group_label` one account file, each empty unless the person gives
+a name; an empty string clears. `get_group_labels` answers from the names alone — so a name
+survives the record and the key it belonged to, which is the row a UI most needs to name.
+Duplicates are storable on purpose; uniqueness is the reader's problem.
+
+**A locked wallet lists nothing.** The records, accounts and names are kept one document per
+seed, sealed under this module's key for that seed from the signer manager (`data_key(seed,
+"index")`), which it gives once the person unlocks the wallet in the Signer app. Until then
+none of the reads above shows that wallet (`list_groups` counts it as `lockedWallets`), and
+vaults are named at random rather than by their address. A seed's unlock root stays readable
+behind its password, in `seeds.json`, so the wallet can still be unlocked. Without a signer
+manager everything stays readable, as before. See *The sealed index* in `docs/specs.md`.
 
 **Setting a name proves custody; clearing one does not.** A label is what a reader shows
 *in place of* an address, so writing one is a claim — naming an account needs that

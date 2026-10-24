@@ -49,8 +49,12 @@ tempfile = "3"
 # plugin's export list keeps its symbols in (see CMakeLists.txt).
 bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64", "rand-std"] }
 
+# A seed's unlock root, sealed under the wallet's password in its group's record.
+scrypt = { version = "0.11", default-features = false }
+chacha20poly1305 = "0.10"
+
 # logos.signer/1: its payload types, signature checks and job bookkeeping.
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02" }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca091a9330d455a5b60b80537e34dc535d1e6503" }
 
 # The Logos runtime SDK is staged by the builder as a sibling crate. It is
 # optional + enabled by the default `logos_module` feature so `cargo test
@@ -66,7 +70,7 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
 
 [dev-dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02", features = ["conformance", "mock"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca091a9330d455a5b60b80537e34dc535d1e6503", features = ["conformance", "mock"] }
 
 [features]
 default = ["logos_module"]

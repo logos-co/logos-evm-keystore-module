@@ -28,6 +28,7 @@ use crate::ack::Unrecoverable;
 use crate::atomic;
 use crate::btc::{self, AccountPublic, AccountSecret, Chain, Family};
 use crate::hd::{self, Bip44Path, Seed};
+use crate::index::{self, KeyRing, SeedDoc};
 use crate::layout::{self, Doc, Root, Scan, Slot, StageKind};
 
 #[derive(Debug, Error)]
@@ -61,8 +62,26 @@ pub enum KeystoreError {
 
 pub(crate) type Result<T> = std::result::Result<T, KeystoreError>;
 
-/// Manages a directory of scrypt vault files. One vault file per account, named
-/// `<lowercase-hex-address>.json`.
+/// The prefix of a seed that is one imported key: `k_` + 16 random bytes in hex.
+pub const IMPORTED_SEED: &str = "k_";
+
+/// What the signer manager is told when a wallet is added here ([`Keystore::enrolment`]).
+pub struct Enrolment {
+    pub seed: String,
+    pub unlock_key: [u8; 33],
+    pub name: String,
+    pub origin: Option<String>,
+    pub birthday: Option<String>,
+}
+
+/// The index keys accounts by lowercase hex with no `0x`.
+fn by_key<'m, V>(m: &'m BTreeMap<String, V>, address: &str) -> Option<&'m V> {
+    let bare = address.trim_start_matches("0x");
+    m.iter().find(|(k, _)| k.trim_start_matches("0x").eq_ignore_ascii_case(bare)).map(|(_, v)| v)
+}
+
+/// Manages a directory of scrypt vault files. One vault file per account, named at random; the
+/// index (see `crate::index`) says which account each is, sealed per seed.
 ///
 /// There is deliberately NO cache of unlocked signers. Signing *is* vault
 /// access: a key is derived from the vault password for one operation and wiped
@@ -70,8 +89,13 @@ pub(crate) type Result<T> = std::result::Result<T, KeystoreError>;
 /// Unlocked>` whose entries carried an *optional* deadline, and the only caller
 /// passed `None` — so an unlock was an unlimited, process-lifetime signer that
 /// any module able to reach this one could spend.
+#[derive(Clone)]
 pub struct Keystore {
     root: Root,
+    /// The index keys this process holds, for the seeds unlocked in the Signer app.
+    keys: KeyRing,
+    /// Older builds' documents were moved into the index, in this process.
+    migrated: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Fields of an unsigned transaction, as JSON from the caller. All numeric
@@ -165,14 +189,52 @@ fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
     atomic::set_mode(path, mode).map_err(|e| KeystoreError::Io(e.to_string()))
 }
 
-fn vault_name(addr: &Address) -> String {
-    // lowercase hex, no 0x — stable filename + easy listing
+/// Before a seed's wallet had a name of its own, an older keys app copied it onto each of the
+/// seed's files and accounts: one text, on every one that has a name, which a reader shows as the
+/// wallet's. When the wallet is first named, that copy comes off them.
+fn adopt_copied_name(d: &mut SeedDoc, seed: &str) {
+    if d.wallet_names.contains_key(seed) {
+        return;
+    }
+    let groups: Vec<String> = d
+        .groups
+        .iter()
+        .filter(|(id, _)| Keystore::seed_of_group(&d.groups, id) == seed)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let names: std::collections::BTreeSet<&String> =
+        groups.iter().filter_map(|id| d.group_labels.get(id)).filter(|n| !n.trim().is_empty()).collect();
+    let [copied] = names.into_iter().collect::<Vec<_>>()[..] else { return };
+    let copied = copied.clone();
+    d.group_labels.retain(|id, n| !(groups.contains(id) && *n == copied));
+    let accounts: Vec<String> =
+        d.accounts.iter().filter(|(_, p)| groups.contains(&p.group)).map(|(a, _)| a.clone()).collect();
+    d.labels.retain(|a, n| !(accounts.contains(a) && *n == copied));
+    d.wallet_names.insert(seed.to_string(), copied);
+}
+
+/// An account's key in the index: lowercase hex, no 0x.
+fn addr_key(addr: &Address) -> String {
     format!("{:x}", addr)
+}
+
+fn new_vault_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    format!("a_{}", hex::encode(b))
+}
+
+fn new_key_seed_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    format!("{IMPORTED_SEED}{}", hex::encode(b))
 }
 
 impl Keystore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { root: Root::new(dir) }
+        Self { root: Root::new(dir), keys: KeyRing::default(), migrated: Default::default() }
     }
 
     /// Derive the signer for `address` from its vault. The returned signer is
@@ -188,13 +250,26 @@ impl Keystore {
         // renamed onto another address's filename signed as that address.
         if signer.address() != addr {
             return Err(KeystoreError::Refused(format!(
-                "the vault at {}.json holds the key for {} — refusing to act as {addr} with \
-                 another account's key",
-                vault_name(&addr),
+                "the vault the index names for {} holds the key for {} — refusing to act as \
+                 {addr} with another account's key",
+                addr_key(&addr),
                 signer.address()
             )));
         }
         Ok(signer)
+    }
+
+    /// The key in one vault, by id, whatever account it is: an imported key's seed unlocks
+    /// while its account is not listed.
+    fn signer_in_vault(&self, id: &str, password: &str) -> Result<PrivateKeySigner> {
+        if !self.scan()?.vaults.iter().any(|v| v == id) {
+            return Err(KeystoreError::NotFound(format!("vault {id}")));
+        }
+        let key = Zeroizing::new(
+            eth_keystore::decrypt_key(self.root.path(&Slot::Vault(id.to_string())), password)
+                .map_err(|e| KeystoreError::Vault(e.to_string()))?,
+        );
+        PrivateKeySigner::from_slice(&key).map_err(|e| KeystoreError::InvalidKey(e.to_string()))
     }
 
     fn ensure_dir(&self) -> Result<()> {
@@ -204,8 +279,9 @@ impl Keystore {
         atomic::tighten_dir(self.root.as_path()).map_err(|e| KeystoreError::Io(e.to_string()))
     }
 
-    fn vault_path(&self, addr: &Address) -> PathBuf {
-        self.root.path(&Slot::Vault(vault_name(addr)))
+    /// The vault id the index names for this address, in a seed this process can read.
+    fn vault_id(&self, addr: &Address) -> Result<Option<String>> {
+        Ok(self.get_provenance()?.remove(&addr_key(addr)).map(|p| p.vault).filter(|v| !v.is_empty()))
     }
 
     /// The vault the AUTHORITY names for this address.
@@ -215,10 +291,12 @@ impl Keystore {
     /// authority will not name is a contradiction, so the scan decides here too, and
     /// anything else sitting at that path is refused by name rather than taken for the vault.
     fn held_vault(&self, addr: &Address) -> Result<PathBuf> {
-        let name = vault_name(addr);
+        let Some(name) = self.vault_id(addr)? else {
+            return Err(KeystoreError::NotFound(addr.to_string()));
+        };
         let scan = self.scan()?;
         if scan.vaults.contains(&name) {
-            return Ok(self.vault_path(addr));
+            return Ok(self.root.path(&Slot::Vault(name)));
         }
         let rel = Slot::Vault(name).rel().to_string_lossy().into_owned();
         if scan.stray().contains(&rel) {
@@ -243,10 +321,16 @@ impl Keystore {
         }
     }
 
-    /// Addresses the authority names a vault for. Taken once, for a caller asking about
-    /// many — a scan per index would be the same answer, read n times.
+    /// Addresses the index names a vault on disk for, in the index's form. Taken once, for a
+    /// caller asking about many — a scan per index would be the same answer, read n times.
     fn held_addresses(&self) -> Result<Vec<String>> {
-        Ok(self.scan()?.vaults)
+        let vaults = self.scan()?.vaults;
+        Ok(self
+            .get_provenance()?
+            .into_iter()
+            .filter(|(_, p)| !p.vault.is_empty() && vaults.contains(&p.vault))
+            .map(|(addr, _)| addr)
+            .collect())
     }
 
     /// Generate a fresh BIP-39 mnemonic of `words` (12/15/18/21/24). Does NOT
@@ -270,9 +354,13 @@ impl Keystore {
     /// that write is the directory it writes into: encrypt into a stage and rename out of
     /// it. The stage sits inside `<ks>/` so the rename never crosses a filesystem, and so
     /// the one scan that finds a live vault finds a half-written one too.
-    fn write_vault(&self, addr: &Address, key: &[u8], password: &str) -> Result<()> {
+    fn write_vault(&self, id: &str, key: &[u8], password: &str) -> Result<()> {
+        #[cfg(test)]
+        if tests::FAIL_VAULT_WRITE.with(|f| f.replace(false)) {
+            return Err(KeystoreError::Io("a test failed this vault's write".into()));
+        }
         self.ensure_dir()?;
-        let kind = StageKind::Vault(vault_name(addr));
+        let kind = StageKind::Vault(id.to_string());
         let stage = atomic::Stage::create(self.root.path(&Slot::Stage(kind.clone())))
             .map_err(|e| KeystoreError::Vault(e.to_string()))?;
         let file = Slot::staged_name(&kind);
@@ -280,30 +368,51 @@ impl Keystore {
         eth_keystore::encrypt_key(stage.path(), &mut rng, key, password, Some(&file))
             .map_err(|e| KeystoreError::Vault(e.to_string()))?;
         stage
-            .promote(&file, &self.vault_path(addr))
+            .promote(&file, &self.root.path(&Slot::Vault(id.to_string())))
             .map_err(|e| KeystoreError::Vault(e.to_string()))
     }
 
-    fn persist_signer(&self, signer: &PrivateKeySigner, password: &str) -> Result<Address> {
-        // The single choke point for a new vault, so this is where an unreadable sidecar is
-        // refused: BEFORE the key lands. A vault whose provenance record could not be
-        // written is a key nothing can later explain.
-        self.get_groups()?;
-        self.get_provenance()?;
+    /// The single choke point for a new vault. Its record goes down first, naming the vault's
+    /// random id: a crash then leaves a record of a vault never written, which lists nothing,
+    /// never a key nothing names. An address already held keeps its vault, written again.
+    fn persist_signer(&self, signer: &PrivateKeySigner, password: &str, mut p: Provenance) -> Result<Address> {
         let addr = signer.address();
         // `to_bytes()` hands back the raw secp256k1 secret. Own it in a
         // Zeroizing so it is wiped when this scope ends, on every path.
         let key = Zeroizing::new(signer.to_bytes().0);
-        self.write_vault(&addr, key.as_slice(), password)?;
+        let unlock = if p.group.is_empty() { Some(crate::unlockkey::of_imported(key.as_slice(), 0)?) } else { None };
+        let state = self.view()?;
+        let k = addr_key(&addr);
+        let held = state.merged().accounts.remove(&k);
+        if held.is_none() {
+            // An imported key here already, in a wallet this process can't read.
+            if let Some(locked) = unlock.as_ref().and_then(|u| state.locked_seed_of(u)) {
+                return Err(KeystoreError::Refused(format!(
+                    "this key is here already, in a locked wallet ({locked}): unlock it in the Signer app first"
+                )));
+            }
+        }
+        p.vault = held.as_ref().map(|h| h.vault.clone()).filter(|v| !v.is_empty()).unwrap_or_else(new_vault_id);
+        if p.group.is_empty() {
+            p.seed = held.as_ref().map(|h| h.seed.clone()).filter(|s| !s.is_empty()).unwrap_or_else(new_key_seed_id);
+            p.check = unlock.as_ref().map(|u| index::check_of(&p.seed, u));
+        }
+        let id = p.vault.clone();
+        let before = held.clone();
+        self.update_accounts(|all| all.insert(k.clone(), p))?;
+        self.write_vault(&id, key.as_slice(), password).inspect_err(|_| {
+            let _ = self.update_accounts(|all| match &before {
+                Some(b) => all.insert(k.clone(), b.clone()),
+                None => all.remove(&k),
+            });
+        })?;
         Ok(addr)
     }
 
     /// Import a raw private key (hex, with or without 0x), persisting a vault.
     pub fn import_private_key(&self, priv_hex: &str, password: &str) -> Result<Address> {
         let signer = signer_from_hex(priv_hex)?;
-        let address = self.persist_signer(&signer, password)?;
-        self.record_provenance(&address, Provenance::of("imported-key"))?;
-        Ok(address)
+        self.persist_signer(&signer, password, Provenance::of("imported-key"))
     }
 
     /// Derive account `index` from a mnemonic (+ optional BIP-39 passphrase) and
@@ -319,6 +428,7 @@ impl Keystore {
             change: 0,
             group_password: "",
             group_label: "",
+            wallet_name: "",
             keep: KeepPhrase::No,
         })
         .map(|d| d.address)
@@ -346,9 +456,7 @@ impl Keystore {
         );
         drop(stage);
         let signer = PrivateKeySigner::from_slice(&key).map_err(|e| KeystoreError::InvalidKey(e.to_string()))?;
-        let address = self.persist_signer(&signer, new_password)?;
-        self.record_provenance(&address, Provenance::of("imported-json"))?;
-        Ok(address)
+        self.persist_signer(&signer, new_password, Provenance::of("imported-json"))
     }
 
     /// Export an account as a fresh scrypt keystore JSON (string), without
@@ -375,18 +483,110 @@ impl Keystore {
         let addr = signer.address();
         let key = Zeroizing::new(signer.to_bytes().0);
         drop(signer);
-        self.write_vault(&addr, key.as_slice(), new)?;
+        let id = self.vault_id(&addr)?.ok_or_else(|| KeystoreError::NotFound(addr.to_string()))?;
+        self.write_vault(&id, key.as_slice(), new)?;
+        // The wallet's unlock root follows its accounts' password, where `old` sealed it.
+        let group = by_key(&self.get_provenance()?, &addr.to_string()).map(|p| p.group.clone()).unwrap_or_default();
+        if !group.is_empty() {
+            self.reseal_unlock(&group, old, new)?;
+        }
         Ok(addr)
     }
 
-    /// Human-readable account names. Kept beside the vaults, never inside them: a label is
-    /// not a secret and must not require a password to read.
-    fn labels_path(&self) -> PathBuf {
-        self.root.path(&Slot::Doc(Doc::Labels))
+    fn reseal_unlock(&self, group: &str, old: &str, new: &str) -> Result<()> {
+        let groups = self.get_groups()?;
+        let Some(sealed) = groups.get(group).and_then(|g| g.unlock.clone()) else { return Ok(()) };
+        let Some(root) = crate::unlockkey::open(&sealed, old, group) else { return Ok(()) };
+        let resealed = crate::unlockkey::seal(&root, new, group)?;
+        self.update_groups(|gs| {
+            if let Some(g) = gs.get_mut(group) {
+                g.unlock = Some(resealed.clone());
+            }
+        })
     }
 
+    /// The seed a group belongs to, as the signer manager knows it: its seed link, else itself.
+    pub fn seed_of_group(groups: &BTreeMap<String, Group>, group: &str) -> String {
+        groups.get(group).and_then(|g| g.seed.as_ref()).map_or_else(|| group.to_string(), |s| s.id.clone())
+    }
+
+    /// The seed an account comes from: its group's, else its own as a key imported on its own.
+    pub fn seed_of_account(groups: &BTreeMap<String, Group>, p: &Provenance) -> String {
+        if p.group.is_empty() {
+            p.seed.clone()
+        } else {
+            Self::seed_of_group(groups, &p.group)
+        }
+    }
+
+    /// A seed's unlock key at `index`, behind the password of one of its groups, or of the
+    /// imported key it is. From the seed's plain files, as it is asked for while it is locked.
+    pub fn unlock_key(&self, seed: &str, index: u32, password: &str) -> Result<[u8; 33]> {
+        let seed = seed.trim();
+        let state = self.view()?;
+        let files = state.seeds.get(seed).ok_or_else(|| KeystoreError::NotFound(format!("seed {seed}")))?;
+        if seed.starts_with(IMPORTED_SEED) {
+            let vault = files.vaults.first().ok_or_else(|| KeystoreError::NotFound(format!("seed {seed}")))?;
+            let signer = self.signer_in_vault(vault, password).map_err(|e| match e {
+                KeystoreError::Vault(_) => KeystoreError::Vault("the password for this wallet is not correct".into()),
+                other => other,
+            })?;
+            let key = Zeroizing::new(signer.to_bytes().0);
+            return crate::unlockkey::of_imported(key.as_slice(), index);
+        }
+        let mut sealed_any = false;
+        for (id, sealed) in &files.groups {
+            let Some(sealed) = sealed else { continue };
+            sealed_any = true;
+            if let Some(root) = crate::unlockkey::open(sealed, password, id) {
+                return crate::unlockkey::key_at(&root, index);
+            }
+        }
+        if !sealed_any {
+            return Err(KeystoreError::Refused(
+                "this wallet was added before it kept an unlock key: add it again from its phrase".into(),
+            ));
+        }
+        Err(KeystoreError::Vault("the password for this wallet is not correct".into()))
+    }
+
+    /// What the signer manager is told when an account or a wallet is added here: its seed, its
+    /// unlock key at index 0, the name it goes by, and where its history starts.
+    pub fn enrolment(&self, account_or_group: &str, password: &str) -> Result<Enrolment> {
+        let id = account_or_group.trim();
+        let groups = self.get_groups()?;
+        let names = self.get_group_labels()?;
+        let wallets = self.wallet_names()?;
+        let (seed, name, origin, birthday) = match groups.get(id) {
+            Some(g) => (
+                Self::seed_of_group(&groups, id),
+                names.get(id).cloned().filter(|n| !n.is_empty()),
+                g.origin.clone(),
+                g.birthday.clone(),
+            ),
+            None => {
+                let addr = parse_address(id)?;
+                let p = by_key(&self.get_provenance()?, &addr.to_string())
+                    .cloned()
+                    .ok_or_else(|| KeystoreError::NotFound(addr.to_string()))?;
+                let label = by_key(&self.get_labels()?, &addr.to_string()).cloned().filter(|l| !l.is_empty());
+                let name = names.get(&p.group).cloned().filter(|n| !n.is_empty()).or(label);
+                (Self::seed_of_account(&groups, &p), name, None, None)
+            }
+        };
+        let unlock_key = self.unlock_key(&seed, 0, password)?;
+        let name = wallets.get(&seed).cloned().filter(|n| !n.is_empty()).or(name);
+        // The name shows while the wallet is locked, so it never comes from an address.
+        let name = name.unwrap_or_else(|| {
+            if seed.starts_with(IMPORTED_SEED) { "Imported key".into() } else { "Keystore wallet".into() }
+        });
+        Ok(Enrolment { seed, unlock_key, name, origin, birthday })
+    }
+
+    /// Human-readable account names, in the index beside the accounts they name: readable while
+    /// their wallet is unlocked, with no account password.
     pub fn get_labels(&self) -> Result<BTreeMap<String, String>> {
-        self.read_json(&self.labels_path())
+        Ok(self.view()?.merged().labels)
     }
 
     /// Open an account's vault to prove the caller holds it. One message for every way that
@@ -434,17 +634,22 @@ impl Keystore {
     /// is the one way to strip a stale name off a vault whose password is lost.
     pub fn set_label(&self, address: &str, label: &str, password: &str) -> Result<()> {
         let addr = parse_address(address)?;
-        if !self.has_address(address) {
-            return Err(KeystoreError::InvalidParams(format!("no such account: {addr}")));
+        // An unreadable index says so, rather than "no such account".
+        match self.held_vault(&addr) {
+            Err(KeystoreError::NotFound(_)) => return Err(KeystoreError::InvalidParams(format!("no such account: {addr}"))),
+            Err(e) => return Err(e),
+            Ok(_) if !self.has_address(address) => {
+                return Err(KeystoreError::InvalidParams(format!("no such account: {addr}")))
+            }
+            Ok(_) => {}
         }
-        let key = vault_name(&addr);
+        let key = addr_key(&addr);
         let label = label.trim().to_string();
         if !label.is_empty() {
             self.prove_custody(address, password)?;
         }
-        // Read and write under one lock, so a torn labels.json cannot silently erase every
-        // name and a concurrent rename cannot lose one.
-        self.update(&self.labels_path(), |labels: &mut BTreeMap<String, String>| {
+        // Read and write under one lock, so a concurrent rename cannot lose a name.
+        self.update_labels(|labels| {
             if label.is_empty() {
                 labels.remove(&key);
             } else {
@@ -469,30 +674,65 @@ impl Keystore {
     /// filename is lowercase.
     pub fn account_report(&self) -> Result<AccountReport> {
         let scan = self.settle()?.left;
-        let addrs = |v: &[String]| v.iter().map(|a| parse_address(a)).collect::<Result<Vec<_>>>();
+        let state = self.view()?;
+        let by_vault: BTreeMap<String, String> = state
+            .merged()
+            .accounts
+            .into_iter()
+            .filter(|(_, p)| !p.vault.is_empty())
+            .map(|(addr, p)| (p.vault, addr))
+            .collect();
+        let hidden = state.hidden();
         let mut report = AccountReport {
             accounts: Vec::new(),
-            staged: addrs(&scan.staged_vaults)?,
+            staged: scan
+                .staged_vaults
+                .iter()
+                .filter_map(|id| by_vault.get(id))
+                .map(|a| parse_address(a))
+                .collect::<Result<Vec<_>>>()?,
             unexplained: scan.stray(),
             mismatched: Vec::new(),
         };
-        for name in &scan.vaults {
-            match self.declared_address(name) {
+        report.unexplained.extend(self.unnamed_vaults(&scan, &state)?);
+        let mut vaults: Vec<(&String, &String)> = scan.vaults.iter().filter_map(|id| by_vault.get(id).map(|a| (a, id))).collect();
+        // By address, as older builds listed their address-named files.
+        vaults.sort();
+        for (_, id) in vaults {
+            let addr = &by_vault[id];
+            if hidden.vaults.contains(id) {
+                continue;
+            }
+            match self.declared_address(id) {
                 // Reported as unexplained too, so the one removal path can reach it.
-                Some(declared) if &declared != name => {
-                    report.mismatched.push(format!("{name}.json holds 0x{declared}"));
-                    report.unexplained.push(format!("{name}.json"));
+                Some(declared) if &declared != addr => {
+                    report.mismatched.push(format!("{id}.json holds 0x{declared}"));
+                    report.unexplained.push(format!("{id}.json"));
                 }
-                _ => report.accounts.push(parse_address(name)?),
+                _ => report.accounts.push(parse_address(addr)?),
             }
         }
         report.unexplained.sort();
         Ok(report)
     }
 
+    /// Vaults no seed's files name: a key this keystore cannot say whose it is without its
+    /// password. Reported as unexplained, so the one removal path reaches them.
+    fn unnamed_vaults(&self, scan: &Scan, state: &index::State) -> Result<Vec<String>> {
+        let named: std::collections::BTreeSet<String> = state.seeds.values().flat_map(|f| f.vaults.iter().cloned()).collect();
+        let indexed: std::collections::BTreeSet<String> =
+            state.merged().accounts.into_values().map(|p| p.vault).filter(|v| !v.is_empty()).collect();
+        Ok(scan
+            .vaults
+            .iter()
+            .filter(|id| !named.contains(*id) && !indexed.contains(*id))
+            .map(|id| Slot::Vault(id.clone()).rel().to_string_lossy().into_owned())
+            .collect())
+    }
+
     /// The address a vault file declares, where it declares one. Vaults this module writes
     /// carry no such field; one that does was placed here by something else, and a
-    /// disagreement with the filename means neither claim can be trusted without a password.
+    /// disagreement with the index means neither claim can be trusted without a password.
     fn declared_address(&self, name: &str) -> Option<String> {
         let raw = std::fs::read_to_string(self.root.path(&Slot::Vault(name.to_string()))).ok()?;
         let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -508,7 +748,9 @@ impl Keystore {
     /// `<ks>/`. `acknowledge` is required because this keystore cannot read the material and
     /// therefore cannot promise it is not a key.
     pub fn remove_unexplained(&self, rel: &str, acknowledge: bool) -> Result<bool> {
-        let reported = self.scan()?.unexplained_all();
+        let scan = self.scan()?;
+        let mut reported = scan.unexplained_all();
+        reported.extend(self.unnamed_vaults(&scan, &self.view()?)?);
         if !reported.iter().any(|p| p == rel) {
             return Err(KeystoreError::NotFound(format!("{rel} is not reported as unexplained")));
         }
@@ -531,18 +773,24 @@ impl Keystore {
     /// a wallet over a `.DS_Store` is the worse failure. Under `groups/` it may be a
     /// whole-wallet key, and there it still refuses.
     pub fn unexplained(&self) -> Result<Vec<String>> {
-        Ok(self.scan()?.stray())
+        let scan = self.scan()?;
+        let mut out = scan.stray();
+        out.extend(self.unnamed_vaults(&scan, &self.view()?)?);
+        out.sort();
+        Ok(out)
     }
 
     /// Whether a vault for this address is here. Through the same declared-address rule
     /// `account_report` uses, so the two cannot disagree about what the wallet holds.
     pub fn has_address(&self, address: &str) -> bool {
         match parse_address(address) {
-            Ok(addr) => {
-                let name = vault_name(&addr);
-                self.held_vault(&addr).is_ok()
-                    && self.declared_address(&name).is_none_or(|d| d == name)
-            }
+            Ok(addr) => match self.held_vault(&addr) {
+                Ok(path) => {
+                    let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.declared_address(&id).is_none_or(|d| d == addr_key(&addr))
+                }
+                Err(_) => false,
+            },
             Err(_) => false,
         }
     }
@@ -868,9 +1116,9 @@ pub struct SeedLink {
     pub check: String,
 }
 
-/// A group's record in `groups.json`. Nothing here is a secret: `usedPassphrase` is a
-/// boolean so a user restoring elsewhere is told a passphrase was involved, never what it was.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A group's record, in its seed's sealed index. `usedPassphrase` is a boolean so a user
+/// restoring elsewhere is told a passphrase was involved, never what it was.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Group {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<SeedLink>,
@@ -909,12 +1157,17 @@ pub struct Group {
     /// The first day the wallet could have received coins, `YYYY-MM-DD` in UTC, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub birthday: Option<String>,
+    /// The seed's unlock root, sealed under this group's password: what unlocks the wallet's data
+    /// in every app. See [`crate::unlockkey`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock: Option<crate::unlockkey::SealedRoot>,
+    /// [`index::check_of`] the seed's unlock key: finds the seed again while it is locked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
 }
 
-/// Where one account came from. Kept beside the vaults for the same reason labels are: a
-/// derivation path is not a secret, and an attacker holding the directory already reads
-/// the addresses off the filenames.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Where one account came from, and which vault is its, in its seed's sealed index.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Provenance {
     /// `derived` | `imported-key` | `imported-json` | `random` | `unknown`.
     pub origin: String,
@@ -924,6 +1177,15 @@ pub struct Provenance {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
+    /// Its vault's random id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub vault: String,
+    /// A key imported on its own is a seed of its own: its id.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub seed: String,
+    /// That seed's [`index::check_of`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
 }
 
 impl Provenance {
@@ -1051,7 +1313,10 @@ pub struct ImportRequest<'a> {
     pub bip44_account: u32,
     pub change: u32,
     pub group_password: &'a str,
+    /// This account file's own name, empty by default.
     pub group_label: &'a str,
+    /// The wallet's name, kept for its seed when the seed has none yet.
+    pub wallet_name: &'a str,
     /// Keep the phrase too, or record one kept earlier. The BIP39 passphrase never is.
     pub keep: KeepPhrase<'a>,
 }
@@ -1260,14 +1525,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 impl Keystore {
-    fn groups_path(&self) -> PathBuf {
-        self.root.path(&Slot::Doc(Doc::Groups))
-    }
-
-    fn accounts_path(&self) -> PathBuf {
-        self.root.path(&Slot::Doc(Doc::Accounts))
-    }
-
     fn group_vault_path(&self, id: &str) -> PathBuf {
         self.root.path(&Slot::GroupKey(id.to_string()))
     }
@@ -1303,29 +1560,163 @@ impl Keystore {
         }
     }
 
+    /// The index as this process reads it: every seed it holds the key for, and every seed still
+    /// waiting for one. Older builds' documents move in first.
+    fn view(&self) -> Result<index::State> {
+        self.migrate()?;
+        index::load(&self.root, &self.keys)
+    }
+
+    /// Read, change and write the index as ONE critical section, as [`Self::update`] does a
+    /// document: each readable seed's part is written back under its own key.
+    fn update_index<R>(&self, f: impl FnOnce(&mut SeedDoc) -> R) -> Result<R> {
+        self.migrate()?;
+        self.ensure_dir()?;
+        let _guard = self.lock()?;
+        let state = index::load(&self.root, &self.keys)?;
+        let mut doc = state.merged();
+        let out = f(&mut doc);
+        index::store(&self.root, &self.keys, &state, &doc)?;
+        Ok(out)
+    }
+
+    fn update_groups<R>(&self, f: impl FnOnce(&mut BTreeMap<String, Group>) -> R) -> Result<R> {
+        self.update_index(|d| f(&mut d.groups))
+    }
+
+    fn update_accounts<R>(&self, f: impl FnOnce(&mut BTreeMap<String, Provenance>) -> R) -> Result<R> {
+        self.update_index(|d| f(&mut d.accounts))
+    }
+
+    fn update_labels<R>(&self, f: impl FnOnce(&mut BTreeMap<String, String>) -> R) -> Result<R> {
+        self.update_index(|d| f(&mut d.labels))
+    }
+
+    fn update_group_labels<R>(&self, f: impl FnOnce(&mut BTreeMap<String, String>) -> R) -> Result<R> {
+        self.update_index(|d| f(&mut d.group_labels))
+    }
+
     pub fn get_groups(&self) -> Result<BTreeMap<String, Group>> {
-        self.read_json(&self.groups_path())
+        Ok(self.view()?.merged().groups)
     }
 
     pub fn get_provenance(&self) -> Result<BTreeMap<String, Provenance>> {
-        self.read_json(&self.accounts_path())
+        Ok(self.view()?.merged().accounts)
     }
 
-    fn group_labels_path(&self) -> PathBuf {
-        self.root.path(&Slot::Doc(Doc::GroupLabels))
-    }
-
-    /// Wallet names, by group id. Their own document rather than a field of `groups.json`,
-    /// because the group a reader most needs to name is the stranded one — and its record
-    /// is exactly what is missing. Readable when that file is not.
+    /// Wallet names, by group id. Their own map rather than a field of the record, because
+    /// the group a reader most needs to name is the stranded one — and its record is exactly
+    /// what is missing.
     pub fn get_group_labels(&self) -> Result<BTreeMap<String, String>> {
-        self.read_json(&self.group_labels_path())
+        Ok(self.view()?.merged().group_labels)
+    }
+
+    /// The keys this process holds for the index, shared with whoever asks the signer manager.
+    pub fn key_ring(&self) -> KeyRing {
+        self.keys.clone()
+    }
+
+    /// Seeds whose bookkeeping this process can't read yet, each with the generation its box
+    /// needs (none: the current one).
+    pub fn closed_seeds(&self) -> Result<Vec<(String, Option<u32>)>> {
+        Ok(self.view()?.closed())
+    }
+
+    /// Open a seed's bookkeeping with this module's keys for it from the signer manager: the key
+    /// of its box's generation, and the current one it is sealed under from then on.
+    pub fn open_seed(
+        &self,
+        seed: &str,
+        box_key: &logos_signer_interface::wallets::DataKey,
+        current: &logos_signer_interface::wallets::DataKey,
+    ) -> Result<bool> {
+        self.migrate()?;
+        self.ensure_dir()?;
+        let _guard = self.lock()?;
+        index::open_seed(&self.root, &self.keys, seed, box_key, current)
+    }
+
+    /// Forget every index key: every sealed seed reads as locked until it opens again.
+    pub fn lock_seeds(&self) {
+        self.keys.clear();
+    }
+
+    /// How many of this keystore's wallets are locked in this process.
+    pub fn locked_wallets(&self) -> Result<usize> {
+        Ok(self.locked_seeds()?.len())
+    }
+
+    /// The locked wallets, by the names the keystore gives the signer manager for them.
+    pub fn locked_seeds(&self) -> Result<Vec<String>> {
+        Ok(self.view()?.locked_seeds())
+    }
+
+    /// Move older builds' documents into the index, and give their address-named vaults random
+    /// names. Once per process; again after a crash part-way, as every step can be repeated.
+    fn migrate(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.migrated.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let legacy_docs: Vec<Doc> = Doc::LEGACY.into_iter().filter(|d| self.root.path(&Slot::Doc(*d)).exists()).collect();
+        let legacy_vaults: Vec<String> = self.raw_scan()?.vaults.into_iter().filter(|v| layout::is_legacy_vault(v)).collect();
+        if legacy_docs.is_empty() && legacy_vaults.is_empty() {
+            self.migrated.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+        self.ensure_dir()?;
+        let _guard = self.lock()?;
+        let old = SeedDoc {
+            groups: self.read_json(&self.root.path(&Slot::Doc(Doc::Groups)))?,
+            accounts: self.read_json(&self.root.path(&Slot::Doc(Doc::Accounts)))?,
+            labels: self.read_json(&self.root.path(&Slot::Doc(Doc::Labels)))?,
+            group_labels: self.read_json(&self.root.path(&Slot::Doc(Doc::GroupLabels)))?,
+            wallet_names: BTreeMap::new(),
+        };
+        let state = index::load(&self.root, &self.keys)?;
+        let mut doc = state.merged();
+        for (k, v) in old.groups {
+            doc.groups.entry(k).or_insert(v);
+        }
+        for (k, v) in old.accounts {
+            doc.accounts.entry(k).or_insert(v);
+        }
+        for (k, v) in old.labels {
+            doc.labels.entry(k).or_insert(v);
+        }
+        for (k, v) in old.group_labels {
+            doc.group_labels.entry(k).or_insert(v);
+        }
+        // Every address-named vault is an account, recorded or not, and gets a random name.
+        for v in &legacy_vaults {
+            let p = doc.accounts.entry(v.clone()).or_insert_with(|| Provenance::of("unknown"));
+            if p.vault.is_empty() {
+                p.vault = new_vault_id();
+            }
+        }
+        // A key imported on its own is a seed of its own.
+        for p in doc.accounts.values_mut().filter(|p| p.group.is_empty() && p.seed.is_empty()) {
+            p.seed = new_key_seed_id();
+        }
+        index::store(&self.root, &self.keys, &state, &doc)?;
+        for (addr, p) in &doc.accounts {
+            let from = self.root.path(&Slot::Vault(addr.clone()));
+            let to = self.root.path(&Slot::Vault(p.vault.clone()));
+            if !p.vault.is_empty() && layout::is_legacy_vault(addr) && from.exists() && !to.exists() {
+                std::fs::rename(&from, &to).map_err(|e| KeystoreError::Io(e.to_string()))?;
+            }
+        }
+        for d in legacy_docs {
+            remove_path(&self.root.path(&Slot::Doc(d)))?;
+        }
+        self.migrated.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// The ONE writer of a wallet name. Empty clears, like an account label.
     fn write_group_label(&self, id: &str, label: &str) -> Result<()> {
         let label = label.trim().to_string();
-        self.update(&self.group_labels_path(), |names: &mut BTreeMap<String, String>| {
+        self.update_group_labels(|names| {
             if label.is_empty() {
                 names.remove(id);
             } else {
@@ -1346,6 +1737,56 @@ impl Keystore {
     /// at is a question for whatever renders them, and refusing the write would only make it
     /// unable to show the truth.
     pub fn set_group_label(&self, req: &GroupLabelRequest) -> Result<()> {
+        let id = req.group;
+        let recorded = self.prove_naming(req)?;
+        // A name an older build wrote into the record moves out first, or clearing one here
+        // would only reveal the older name still sitting underneath it.
+        if recorded.get(id).is_some_and(|g| !g.label.trim().is_empty()) {
+            self.update_groups(|groups| {
+                if let Some(g) = groups.get_mut(id) {
+                    g.label = String::new();
+                }
+            })?;
+        }
+        self.write_group_label(id, req.label)
+    }
+
+    /// Name a wallet — every account file of one seed, as the header over them shows it — or
+    /// clear the name with an empty string. `group` is any file of the seed, and prices the name
+    /// as `set_group_label` does. The account files keep names of their own, empty by default.
+    pub fn set_wallet_name(&self, req: &GroupLabelRequest) -> Result<()> {
+        let recorded = self.prove_naming(req)?;
+        let seed = Self::seed_of_group(&recorded, req.group);
+        let name = req.label.trim().to_string();
+        self.update_index(|d| {
+            adopt_copied_name(d, &seed);
+            if name.is_empty() {
+                d.wallet_names.remove(&seed);
+            } else {
+                d.wallet_names.insert(seed.clone(), name.clone());
+            }
+        })
+    }
+
+    /// Wallet names, by the seed they name.
+    pub fn wallet_names(&self) -> Result<BTreeMap<String, String>> {
+        Ok(self.view()?.merged().wallet_names)
+    }
+
+    /// Name a new seed's wallet, unless it has a name already.
+    fn name_new_wallet(&self, seed: &str, name: &str) -> Result<()> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Ok(());
+        }
+        check_displayable(&name, "wallet name")?;
+        self.update_index(|d| {
+            d.wallet_names.entry(seed.to_string()).or_insert(name);
+        })
+    }
+
+    /// What setting a name on `req.group` costs, checked; the records it read.
+    fn prove_naming(&self, req: &GroupLabelRequest) -> Result<BTreeMap<String, Group>> {
         let id = req.group;
         check_group_id(id)?;
         // Its record, its key, an account that came from it, or a name already standing over
@@ -1372,7 +1813,7 @@ impl Keystore {
                 // wallet's: which of those it is answers a question the caller may not ask.
                 let belongs = parse_address(req.address)
                     .ok()
-                    .and_then(|a| provenance.get(&vault_name(&a)))
+                    .and_then(|a| provenance.get(&addr_key(&a)))
                     .is_some_and(|p| p.group == id);
                 if !belongs {
                     return Err(KeystoreError::Refused(
@@ -1389,16 +1830,7 @@ impl Keystore {
                 self.prove_group_custody(&store, id, req.password)?;
             }
         }
-        // A name an older build wrote into the record moves out first, or clearing one here
-        // would only reveal the older name still sitting underneath it.
-        if recorded.get(id).is_some_and(|g| !g.label.trim().is_empty()) {
-            self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
-                if let Some(g) = groups.get_mut(id) {
-                    g.label = String::new();
-                }
-            })?;
-        }
-        self.write_group_label(id, req.label)
+        Ok(recorded)
     }
 
     /// Everything the key directory holds — live keys, staged ones, and anything the layout
@@ -1412,11 +1844,27 @@ impl Keystore {
         Ok((&self.scan()?).into())
     }
 
+    /// The key directory as a reader sees it: a locked wallet's keys are not stranded, and
+    /// show once it unlocks. An unreadable index hides nothing, so no key turns undeletable.
+    pub fn listed_group_store(&self) -> Result<GroupStore> {
+        let mut store = self.group_store()?;
+        let hidden = self.view().map(|s| s.hidden().groups).unwrap_or_default();
+        store.keys.retain(|id| !hidden.contains(id));
+        store.staged.retain(|id| !hidden.contains(id));
+        Ok(store)
+    }
+
     /// Everything the keystore directory holds, classified. One scan is the authority for
     /// every question asked of it — what may be minted, what is derivable, what is
     /// deletable, and what is here that this keystore did not write — so those answers
     /// cannot drift apart the way "the final path" and "the staging path" did.
     pub fn scan(&self) -> Result<Scan> {
+        // Older builds' layout moves in first, so no answer is about files about to be renamed.
+        self.migrate()?;
+        self.raw_scan()
+    }
+
+    fn raw_scan(&self) -> Result<Scan> {
         layout::scan(&self.root).map_err(|u| KeystoreError::Corrupt(u.what, u.why))
     }
 
@@ -1502,21 +1950,14 @@ impl Keystore {
     /// Derivation key ids on disk, at either path. This is what makes a stranded or
     /// half-written key nameable rather than permanent.
     pub fn list_derivation_keys(&self) -> Result<Vec<String>> {
-        Ok(self.scan()?.key_ids())
-    }
-
-    fn record_provenance(&self, addr: &Address, p: Provenance) -> Result<()> {
-        let key = vault_name(addr);
-        self.update(&self.accounts_path(), |all: &mut BTreeMap<String, Provenance>| {
-            all.insert(key, p);
-        })
+        Ok(self.listed_group_store()?.ids())
     }
 
     /// Record only what is not already recorded, so walking past an existing account never
     /// rewrites how it actually came to be.
     fn record_provenance_if_absent(&self, addr: &Address, p: Provenance) -> Result<()> {
-        let key = vault_name(addr);
-        self.update(&self.accounts_path(), |all: &mut BTreeMap<String, Provenance>| {
+        let key = addr_key(addr);
+        self.update_accounts(|all| {
             all.entry(key).or_insert(p);
         })
     }
@@ -1538,7 +1979,7 @@ impl Keystore {
     }
 
     fn bump_next_index(&self, id: &str, used: u32) -> Result<()> {
-        self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+        self.update_groups(|groups| {
             if let Some(g) = groups.get_mut(id) {
                 g.next_index = g.next_index.max(used.saturating_add(1));
             }
@@ -1681,14 +2122,15 @@ impl Keystore {
         password: &str,
     ) -> Result<Derived> {
         let signer = hd::signer_in_account(account_key, path.change, path.index)?;
-        let address = self.persist_signer(&signer, password)?;
-        self.record_provenance(
-            &address,
+        let address = self.persist_signer(
+            &signer,
+            password,
             Provenance {
                 origin: "derived".into(),
                 group: id.to_string(),
                 path: path.to_string(),
                 index: Some(path.index),
+                ..Default::default()
             },
         )?;
         self.bump_next_index(id, path.index)?;
@@ -1746,7 +2188,16 @@ impl Keystore {
         Ok(())
     }
 
-    fn seed_link(&self, seed: &Seed) -> Result<(SeedLink, BTreeMap<String, Option<SeedLink>>)> {
+    /// The seed link a new group of this seed takes, the older groups that learn it, and the
+    /// seed's check. Refuses a seed that is here already in a wallet that is locked: its
+    /// groups can't be read, so a new one would be a second wallet of the same seed.
+    fn seed_link(&self, seed: &Seed) -> Result<(SeedLink, BTreeMap<String, Option<SeedLink>>, String)> {
+        let unlock = crate::unlockkey::key_at(&*crate::unlockkey::root_of(seed.as_secret())?, 0)?;
+        if let Some(locked) = self.view()?.locked_seed_of(&unlock) {
+            return Err(KeystoreError::Refused(format!(
+                "this wallet is here already, and locked ({locked}): unlock it in the Signer app first"
+            )));
+        }
         let groups = self.get_groups()?;
         let mut matching = Vec::new();
         let mut link = None;
@@ -1772,13 +2223,15 @@ impl Keystore {
                 (id, old)
             })
             .collect();
-        Ok((link, prior))
+        let check = index::check_of(&link.id, &unlock);
+        Ok((link, prior, check))
     }
 
     /// Import a mnemonic, optionally keeping the account key so later accounts can be
     /// derived without the phrase. Creates the group.
     pub fn import_mnemonic_ex(&self, req: &ImportRequest) -> Result<Derived> {
         let path = Bip44Path::new(req.bip44_account, req.change, req.index)?;
+        check_displayable(req.wallet_name, "wallet name")?;
         if req.storage == Storage::Extkey && req.group_password.is_empty() {
             return Err(KeystoreError::InvalidParams(
                 "keeping a derivation key needs a password of its own".into(),
@@ -1786,11 +2239,12 @@ impl Keystore {
         }
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let account_key = seed.account_key(path.account)?;
-        let (seed_link, prior_seeds) = self.seed_link(&seed)?;
+        let (seed_link, prior_seeds, check) = self.seed_link(&seed)?;
         let fingerprint = btc::master_fingerprint(seed.as_secret())?.to_string();
         let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
 
         let id = new_group_id();
+        let unlock = crate::unlockkey::seal(&*crate::unlockkey::root_of(seed.as_secret())?, req.password, &id)?;
         let record = Group {
             seed: Some(seed_link.clone()),
             storage: req.storage,
@@ -1808,8 +2262,10 @@ impl Keystore {
             phrase: phrase.clone(),
             origin: None,
             birthday: None,
+            unlock: Some(unlock),
+            check: Some(check),
         };
-        self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+        self.update_groups(|groups| {
             for old in prior_seeds.keys() {
                 if let Some(group) = groups.get_mut(old) {
                     group.seed = Some(seed_link.clone());
@@ -1832,6 +2288,7 @@ impl Keystore {
             }
             self.persist_derived(&account_key, &id, path, req.password)
         })();
+        let landed = landed.and_then(|d| self.name_new_wallet(&seed_link.id, req.wallet_name).map(|()| d));
 
         landed.inspect_err(|_| {
             // Both paths the key can occupy, not just the final one: rolling back only the
@@ -1839,7 +2296,7 @@ impl Keystore {
             let _ = remove_path(&self.group_vault_path(&id));
             let _ = remove_path(&self.stage_dir(&id));
             let _ = self.write_group_label(&id, "");
-            let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            let _ = self.update_groups(|groups| {
                 for (old, seed) in &prior_seeds {
                     if let Some(group) = groups.get_mut(old) {
                         group.seed = seed.clone();
@@ -1870,7 +2327,7 @@ impl Keystore {
             let index = start.saturating_add(offset);
             let path = Bip44Path::new(account, change, index)?;
             let address = hd::address_in_account(&key, change, index)?;
-            if !held.contains(&vault_name(&address)) {
+            if !held.contains(&addr_key(&address)) {
                 return self.persist_derived(&key, &id, path, password);
             }
             self.record_provenance_if_absent(
@@ -1880,6 +2337,7 @@ impl Keystore {
                     group: id.clone(),
                     path: path.to_string(),
                     index: Some(index),
+                    ..Default::default()
                 },
             )?;
             self.bump_next_index(&id, index)?;
@@ -1912,7 +2370,7 @@ impl Keystore {
         let path = Bip44Path::new(account, change, index)?;
         let key = self.open_group_key(&id, group_password)?;
         let address = hd::address_in_account(&key, change, index)?;
-        if self.held_addresses()?.contains(&vault_name(&address)) {
+        if self.held_addresses()?.contains(&addr_key(&address)) {
             return Err(KeystoreError::Refused(format!("{path} is already held, as {address}")));
         }
         self.persist_derived(&key, &id, path, password)
@@ -1937,7 +2395,7 @@ impl Keystore {
                 let address = hd::address_in_account(&key, 0, index)?;
                 out.push(serde_json::json!({"family": family, "chain": "main", "account": account,
                     "index": index, "path": path.to_string(), "address": address.to_string(),
-                    "present": held.contains(&vault_name(&address))}));
+                    "present": held.contains(&addr_key(&address))}));
             }
         } else {
             let family = Family::parse(family)?;
@@ -1991,7 +2449,7 @@ impl Keystore {
                 index,
                 path: path.to_string(),
                 address,
-                present: held.contains(&vault_name(&address)),
+                present: held.contains(&addr_key(&address)),
             });
         }
         Ok(out)
@@ -2001,9 +2459,7 @@ impl Keystore {
     /// not exist unless someone asked for a key no recovery phrase covers, and it carries
     /// the key it generated. Nothing here can mint one without holding it.
     pub fn create_unrelated_account(&self, password: &str, key: Unrecoverable) -> Result<Address> {
-        let address = self.persist_signer(key.signer(), password)?;
-        self.record_provenance(&address, Provenance::of("random"))?;
-        Ok(address)
+        self.persist_signer(key.signer(), password, Provenance::of("random"))
     }
 
     /// Stop keeping a group's derivation key. Removes every path the id can occupy, and
@@ -2014,6 +2470,9 @@ impl Keystore {
     /// Accounts already derived are untouched; what ends is adding MORE without the phrase.
     pub fn forget_derivation(&self, group: &str) -> Result<Forgotten> {
         check_group_id(group)?;
+        if self.view().is_ok_and(|s| s.hidden().groups.contains(group)) {
+            return Err(KeystoreError::Refused(format!("wallet {group} is locked: unlock it in the Signer app first")));
+        }
         // Readable bookkeeping only: an unreadable groups.json must not stop a key's removal.
         if self.get_groups().is_ok_and(|g| g.get(group).is_some_and(|g| g.family.is_some())) {
             return Err(KeystoreError::Refused(format!(
@@ -2035,7 +2494,7 @@ impl Keystore {
             was_stranded: false,
             staged_removed: removed_staged,
         };
-        let downgraded = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+        let downgraded = self.update_groups(|groups| {
             match groups.get_mut(group) {
                 Some(g) => {
                     g.storage = Storage::Plain;
@@ -2087,7 +2546,7 @@ impl Keystore {
         // The record goes first: a name left over a vanished record is invisible cruft, while
         // a vanished name over a row still on screen is a user-visible surprise.
         if recorded {
-            self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            self.update_groups(|groups| {
                 groups.remove(group)
             })?;
         }
@@ -2101,10 +2560,14 @@ impl Keystore {
     /// that no record names. A stranded key is listed rather than hidden — it is live
     /// material, and hiding it is what made it undeletable.
     pub fn list_groups(&self) -> Result<Vec<GroupView>> {
-        let provenance = self.get_provenance()?;
-        let recorded = self.get_groups()?;
-        let names = self.get_group_labels()?;
+        let state = self.view()?;
+        let doc = state.merged();
+        let provenance = doc.accounts;
+        let recorded = doc.groups;
+        let names = doc.group_labels;
         let store = self.group_store()?;
+        // A locked wallet's keys are not stranded: they are listed once it unlocks.
+        let hidden = state.hidden();
         let mut out: Vec<GroupView> = recorded
             .into_iter()
             .map(|(id, mut group)| {
@@ -2132,6 +2595,9 @@ impl Keystore {
                 v.staged = store.staged.contains(&id);
                 continue;
             }
+            if hidden.groups.contains(&id) {
+                continue;
+            }
             // Not derivable: without the record there is no path prefix to derive against.
             // It is still deletable, which is the affordance that matters here.
             let staged = store.staged.contains(&id);
@@ -2157,9 +2623,11 @@ impl Keystore {
                     chain: None,
                     fingerprint: None,
                     xpub: None,
+                    unlock: None,
                     phrase: None,
                     origin: None,
                     birthday: None,
+                    check: None,
                 },
                 used_indices: Vec::new(),
                 account_count,
@@ -2183,7 +2651,7 @@ impl Keystore {
             .into_iter()
             .map(|address| {
                 let provenance = recorded
-                    .get(&vault_name(&address))
+                    .get(&addr_key(&address))
                     .cloned()
                     .unwrap_or_else(|| Provenance::of("unknown"));
                 let derivable = groups.get(&provenance.group).is_some_and(|g| {
@@ -2248,15 +2716,15 @@ impl Keystore {
     /// Retire an index so it is never handed out again. A reused path may collide with an
     /// account that still holds funds; a gap costs nothing.
     fn retire(&self, address: &Address) -> Result<()> {
-        let key = vault_name(address);
-        let removed = self.update(&self.accounts_path(), |all: &mut BTreeMap<String, Provenance>| {
+        let key = addr_key(address);
+        let removed = self.update_accounts(|all| {
             all.remove(&key)
         })?;
         let (Some(p), ) = (removed, ) else { return Ok(()) };
         let (Some(index), false) = (p.index, p.group.is_empty()) else {
             return Ok(());
         };
-        self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+        self.update_groups(|groups| {
             if let Some(g) = groups.get_mut(&p.group) {
                 if !g.retired.contains(&index) {
                     g.retired.push(index);
@@ -2282,7 +2750,10 @@ pub struct BitcoinImport<'a> {
     pub account: u32,
     /// The vault's password: it guards the account key and the database key.
     pub password: &'a str,
+    /// This account's own name, empty by default.
     pub label: &'a str,
+    /// The wallet's name, kept for its seed when the seed has none yet.
+    pub wallet_name: &'a str,
     pub keep: KeepPhrase<'a>,
     pub start: WalletStart<'a>,
 }
@@ -2340,6 +2811,7 @@ impl Keystore {
             return Err(KeystoreError::InvalidParams("a Bitcoin wallet's vault needs a password".into()));
         }
         check_displayable(req.label, "label")?;
+        check_displayable(req.wallet_name, "wallet name")?;
         match (req.start, req.keep) {
             (WalletStart::Created, KeepPhrase::Kept(_)) => {
                 return Err(KeystoreError::InvalidParams(
@@ -2353,7 +2825,8 @@ impl Keystore {
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let (secret, fingerprint) =
             AccountSecret::from_seed(&secp, seed.as_secret(), req.family, req.chain, req.account)?;
-        let (seed_link, prior_seeds) = self.seed_link(&seed)?;
+        let (seed_link, prior_seeds, check) = self.seed_link(&seed)?;
+        let unlock_root = crate::unlockkey::root_of(seed.as_secret())?;
         drop(seed);
         let account = AccountPublic {
             family: req.family,
@@ -2378,6 +2851,8 @@ impl Keystore {
         let forget_new_phrase = || self.forget_new_phrase(made, &phrase);
 
         let id = new_group_id();
+        let unlock = crate::unlockkey::seal(&unlock_root, req.password, &id)?;
+        drop(unlock_root);
         let created_ms = now_ms();
         let (origin, birthday) = match req.start {
             WalletStart::Created => ("created", Some(utc_day(created_ms))),
@@ -2399,8 +2874,10 @@ impl Keystore {
             phrase: phrase.clone(),
             origin: Some(origin.into()),
             birthday,
+            unlock: Some(unlock),
+            check: Some(check),
         };
-        self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+        self.update_groups(|groups| {
             for old in prior_seeds.keys() {
                 if let Some(group) = groups.get_mut(old) {
                     group.seed = Some(seed_link.clone());
@@ -2413,13 +2890,14 @@ impl Keystore {
         .inspect_err(|_| forget_new_phrase())?;
         let landed = (|| {
             self.write_group_label(&id, req.label)?;
-            self.write_group_vault(&id, &text, req.password)
+            self.write_group_vault(&id, &text, req.password)?;
+            self.name_new_wallet(&seed_link.id, req.wallet_name)
         })();
         landed.inspect_err(|_| {
             let _ = remove_path(&self.group_vault_path(&id));
             let _ = remove_path(&self.stage_dir(&id));
             let _ = self.write_group_label(&id, "");
-            let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            let _ = self.update_groups(|groups| {
                 for (old, seed) in &prior_seeds {
                     if let Some(group) = groups.get_mut(old) {
                         group.seed = seed.clone();
@@ -2437,7 +2915,7 @@ impl Keystore {
         check_group_id(id)?;
         let groups = self.get_groups()?;
         let g = groups.get(id).ok_or_else(|| KeystoreError::NotFound(format!("group {id}")))?;
-        let corrupt = |what: &str| KeystoreError::Corrupt("groups.json".into(), format!("wallet {id}: {what}"));
+        let corrupt = |what: &str| KeystoreError::Corrupt(Doc::Index.file().into(), format!("wallet {id}: {what}"));
         let family = Family::parse(g.family.as_deref().ok_or_else(|| {
             KeystoreError::Refused(format!("wallet {id} is not a Bitcoin wallet"))
         })?)?;
@@ -2645,9 +3123,12 @@ impl Keystore {
     /// password, like `forget_derivation`: removing a secret needs no proof of holding it.
     pub fn forget_phrase(&self, id: &str) -> Result<bool> {
         check_phrase_id(id)?;
+        if self.view().is_ok_and(|s| s.hidden().phrases.contains(id)) {
+            return Err(KeystoreError::Refused("this phrase's wallet is locked: unlock it in the Signer app first".into()));
+        }
         let removed = remove_path(&self.phrase_vault_path(id))?;
         let staged = remove_path(&self.phrase_stage_dir(id))?;
-        self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+        self.update_groups(|groups| {
             for g in groups.values_mut().filter(|g| g.phrase.as_deref() == Some(id)) {
                 g.phrase = None;
             }
@@ -2658,10 +3139,14 @@ impl Keystore {
     /// Every kept phrase on disk, at either path, with the wallets made from it.
     pub fn kept_phrases(&self) -> Result<Vec<KeptPhrase>> {
         let scan = self.scan()?;
-        let groups = self.get_groups().unwrap_or_default();
+        let state = self.view()?;
+        let groups = state.merged().groups;
+        // A locked wallet's phrase is listed once it unlocks.
+        let hidden = state.hidden();
         Ok(scan
             .phrase_ids()
             .into_iter()
+            .filter(|id| !hidden.phrases.contains(id))
             .map(|id| KeptPhrase {
                 groups: groups.iter().filter(|(_, g)| g.phrase.as_deref() == Some(id.as_str())).map(|(g, _)| g.clone()).collect(),
                 staged: !scan.phrases.contains(&id),
@@ -2855,6 +3340,35 @@ mod tests {
     use alloy::consensus::transaction::SignerRecoverable;
     use alloy::eips::eip2718::Decodable2718;
     use alloy::primitives::address;
+
+    thread_local! {
+        /// Fails this thread's next vault write, for the tests of what an import undoes.
+        pub(super) static FAIL_VAULT_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// An account's vault file, by the account the index names it for.
+    fn vault_file(ks: &Keystore, addr: &Address) -> std::path::PathBuf {
+        ks.held_vault(addr).unwrap()
+    }
+
+    /// What a crash or a hand-edit can leave in the plain index.
+    fn corrupt_index(dir: &std::path::Path, body: &str) {
+        std::fs::write(dir.join("index.pending.json"), body).unwrap();
+    }
+
+    /// Lose every wallet record, as an older build's deleted `groups.json` did.
+    fn lose_records(ks: &Keystore) {
+        ks.update_groups(|g| g.clear()).unwrap();
+    }
+
+    /// Every bookkeeping file, as one text: what anyone who can read the directory reads.
+    fn plain_docs(dir: &std::path::Path) -> String {
+        ["seeds.json", "index.pending.json", "index.sealed.json"]
+            .iter()
+            .map(|n| std::fs::read_to_string(dir.join(n)).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     // Foundry's canonical test mnemonic → account 0.
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -3067,7 +3581,7 @@ mod tests {
 
         let dmode = std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777;
         assert_eq!(dmode, 0o700, "vault dir was {dmode:o}");
-        let vault = sub.join(format!("{:x}.json", addr));
+        let vault = vault_file(&ks, &addr);
         let fmode = std::fs::metadata(&vault).unwrap().permissions().mode() & 0o777;
         assert_eq!(fmode, 0o600, "vault file was {fmode:o}");
     }
@@ -3412,7 +3926,7 @@ mod tests {
         assert!(ks.get_labels().unwrap().is_empty(), "a refused rename must write nothing");
 
         ks.set_label(&a, "Treasury", "pw").unwrap();
-        assert_eq!(ks.get_labels().unwrap()[&vault_name(&addr)], "Treasury");
+        assert_eq!(ks.get_labels().unwrap()[&addr_key(&addr)], "Treasury");
 
         // The escape hatch: a stale name comes off a vault whose password is lost.
         ks.set_label(&a, "", "nonsense").unwrap();
@@ -3440,6 +3954,7 @@ mod tests {
             change: 0,
             group_password: "gp",
             group_label: "Main",
+            wallet_name: "",
             keep: KeepPhrase::No,
         }
     }
@@ -3486,6 +4001,7 @@ mod tests {
             account: 0,
             password: "pw",
             label: "Savings",
+            wallet_name: "",
             keep: crate::keystore::KeepPhrase::No,
             start: crate::keystore::WalletStart::Restored(None),
         })
@@ -3504,12 +4020,14 @@ mod tests {
                 let ks = Keystore::new(dir.path());
                 let group = ks.import_bitcoin(&BitcoinImport {
                     phrase, bip39_passphrase: "", family, chain, account: 0,
-                    password: "pw", label: "Savings", keep: KeepPhrase::No,
+                    password: "pw", label: "Savings", wallet_name: "", keep: KeepPhrase::No,
                     start: WalletStart::Restored(None),
                 }).unwrap();
                 // A public-only copy has neither encrypted keys nor a recovery phrase.
                 let public_dir = tempfile::tempdir().unwrap();
-                std::fs::copy(dir.path().join("groups.json"), public_dir.path().join("groups.json")).unwrap();
+                for doc in ["seeds.json", "index.pending.json"] {
+                    std::fs::copy(dir.path().join(doc), public_dir.path().join(doc)).unwrap();
+                }
                 let public = Keystore::new(public_dir.path());
                 let (address, path) = public.bitcoin_address_preview(&group.id).unwrap();
                 assert_eq!(path, format!("m/{}'/{}'/0'/0/0", family.purpose(), chain.coin_type()));
@@ -3537,7 +4055,7 @@ mod tests {
         let secret = ks.open_bitcoin_key(&g.id, "pw", &acct).unwrap();
         assert_eq!(secret.xpub(&bitcoin::secp256k1::Secp256k1::new()), acct.xpub);
         // The account key is in the vault and nowhere in the record.
-        let record = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
+        let record = plain_docs(dir.path());
         assert!(!record.contains("tprv") && !record.contains("databaseKey"), "{record}");
         assert!(record.contains("\"family\": \"bitcoin\""), "{record}");
     }
@@ -3551,6 +4069,7 @@ mod tests {
             account: 0,
             password: "pw",
             label: "",
+            wallet_name: "",
             keep,
             start,
         })
@@ -3586,7 +4105,7 @@ mod tests {
         assert!(bitcoin_import_starting(&ks, WalletStart::Restored(Some("2009-01-03")), KeepPhrase::No).is_ok());
 
         // A record from before birthdays were kept scans the most.
-        ks.update(&ks.groups_path(), |gs: &mut BTreeMap<String, Group>| {
+        ks.update_groups(|gs| {
             let g = gs.get_mut(&dated.id).unwrap();
             (g.origin, g.birthday) = (None, None);
         })
@@ -3687,6 +4206,7 @@ mod tests {
             account: 0,
             password: "pw",
             label: "",
+            wallet_name: "",
             keep,
             start: WalletStart::Restored(None),
         })
@@ -3720,7 +4240,7 @@ mod tests {
         let ks = Keystore::new(dir.path());
         let evm = ks.import_mnemonic_ex(&req(Storage::Plain, 0)).unwrap();
         // Model an older record which predates seed grouping.
-        ks.update(&ks.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+        ks.update_groups(|groups| {
             groups.get_mut(&evm.group).unwrap().seed = None;
         })
         .unwrap();
@@ -3747,7 +4267,7 @@ mod tests {
             .check_seed_source(TEST_MNEMONIC, "different", &btc.id)
             .is_err());
         // Public grouping metadata contains neither recovery words nor BIP39 passphrases.
-        let json = std::fs::read_to_string(ks.groups_path()).unwrap();
+        let json = plain_docs(dir.path());
         assert!(!json.contains(TEST_MNEMONIC) && !json.contains("different"));
     }
 
@@ -3756,11 +4276,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ks = Keystore::new(dir.path());
         let first = bitcoin_import(&ks, Family::Segwit);
-        ks.update(&ks.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+        ks.update_groups(|groups| {
             groups.get_mut(&first.id).unwrap().seed = None;
         })
         .unwrap();
-        std::fs::write(ks.accounts_path(), "not json").unwrap();
+        FAIL_VAULT_WRITE.with(|f| f.set(true));
         assert!(ks.import_mnemonic_ex(&req(Storage::Plain, 0)).is_err());
         let groups = ks.get_groups().unwrap();
         assert_eq!(groups.len(), 1);
@@ -3783,6 +4303,7 @@ mod tests {
                 account: 0,
                 password: "pw",
                 label: "",
+                wallet_name: "",
                 keep: KeepPhrase::Kept(&id),
                 start: WalletStart::Restored(None),
             })
@@ -3811,7 +4332,7 @@ mod tests {
         assert!(record.used_passphrase, "the wallet says a passphrase was used");
         let words = ks.show_phrase(record.phrase.as_deref().unwrap(), "phrase-pw").unwrap();
         assert_eq!(words.as_str(), TEST_MNEMONIC, "the phrase, and nothing of the passphrase");
-        let groups = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
+        let groups = plain_docs(dir.path());
         assert!(!groups.contains("second secret"), "{groups}");
     }
 
@@ -3828,13 +4349,10 @@ mod tests {
         let mut both = vec![d.group.clone(), b.id.clone()];
         both.sort();
         assert_eq!(ks.kept_phrases().unwrap()[0].groups, both);
-        // An import that fails after keeping leaves no new phrase vault behind: an unreadable
-        // accounts.json refuses the account's key once the phrase is already kept.
-        let accounts = dir.path().join("accounts.json");
-        let saved = std::fs::read(&accounts).unwrap();
-        std::fs::write(&accounts, "not json").unwrap();
+        // An import that fails after keeping leaves no new phrase vault behind: the account's
+        // vault fails once the phrase is already kept.
+        FAIL_VAULT_WRITE.with(|f| f.set(true));
         let failed = ks.import_mnemonic_ex(&ImportRequest { index: 1, keep: KeepPhrase::New("other-pw"), ..req(Storage::Extkey, 0) });
-        std::fs::write(&accounts, saved).unwrap();
         assert!(failed.is_err());
         assert_eq!(ks.kept_phrases().unwrap().len(), 1, "{:?}", ks.kept_phrases());
         assert!(ks.scan().unwrap().stray().is_empty());
@@ -3870,7 +4388,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ks = Keystore::new(dir.path());
         ks.import_mnemonic_ex(&req(Storage::Extkey, 0)).unwrap();
-        let record = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
+        let record = serde_json::to_string(&ks.get_groups().unwrap()).unwrap();
         for field in ["family", "chain", "xpub"] {
             assert!(!record.contains(field), "{field} in {record}");
         }
@@ -4051,7 +4569,7 @@ mod tests {
         let next = ks.derive_next_account(Some(&group), "gp", "pw", 0).unwrap();
         assert_eq!(next.index, 3);
         assert_eq!(ks.list_groups().unwrap()[0].group.retired, vec![1]);
-        assert!(!ks.get_provenance().unwrap().contains_key(&vault_name(&a1.address)));
+        assert!(!ks.get_provenance().unwrap().contains_key(&addr_key(&a1.address)));
     }
 
     #[test]
@@ -4062,7 +4580,7 @@ mod tests {
 
         // Corrupt the cache the way a hand-edit would. It is a high-water mark, not the
         // authority: the worst it can do is skip an index, never collide.
-        ks.update(&ks.groups_path(), |g: &mut BTreeMap<String, Group>| {
+        ks.update_groups(|g| {
             g.get_mut(&group).unwrap().next_index = 0;
         })
         .unwrap();
@@ -4174,7 +4692,7 @@ mod tests {
         let (ks, group) = with_group(dir.path());
         let acct = ACCT0.to_string();
         ks.set_group_label(&rename_as(&group, "Cold storage", &acct, "pw")).unwrap();
-        std::fs::write(dir.path().join("groups.json"), "{}").unwrap();
+        lose_records(&ks);
 
         let stranded = ks.list_groups().unwrap();
         assert!(stranded[0].stranded && stranded[0].id == group);
@@ -4193,7 +4711,8 @@ mod tests {
     fn an_unreadable_wallet_names_file_refuses_rather_than_erasing_every_name() {
         let dir = tempfile::tempdir().unwrap();
         let (ks, group) = with_group(dir.path());
-        std::fs::write(dir.path().join("group-labels.json"), "{\"x\": ").unwrap();
+        let saved = std::fs::read_to_string(dir.path().join("index.pending.json")).unwrap();
+        corrupt_index(dir.path(), "{\"x\": ");
 
         assert!(ks.get_group_labels().is_err());
         assert!(ks.account_wallets().is_err(), "the join must not turn a corrupt names file into no wallets");
@@ -4206,6 +4725,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{e}").contains("unreadable"), "got {e}");
         assert!(ks.import_mnemonic_ex(&ImportRequest { bip44_account: 1, ..req(Storage::Extkey, 0) }).is_err());
+        corrupt_index(dir.path(), &saved);
         assert_eq!(ks.get_groups().unwrap().len(), 1, "a refused import left a half-made wallet");
     }
 
@@ -4228,14 +4748,12 @@ mod tests {
 
     #[test]
     fn a_name_an_older_build_left_in_the_record_is_read_and_then_moved_out_of_it() {
-        // groups.json carried the name before it had a document of its own. It is still
-        // shown, but a rename has to leave nothing underneath that can resurface.
+        // The record carried the name before it had a map of its own. It is still shown, but a
+        // rename has to leave nothing underneath that can resurface.
         let dir = tempfile::tempdir().unwrap();
         let (ks, group) = with_group(dir.path());
-        std::fs::remove_file(dir.path().join("group-labels.json")).unwrap();
-        let mut groups = ks.get_groups().unwrap();
-        groups.get_mut(&group).unwrap().label = "Legacy".into();
-        std::fs::write(dir.path().join("groups.json"), serde_json::to_string(&groups).unwrap()).unwrap();
+        ks.update_group_labels(|n| n.clear()).unwrap();
+        ks.update_groups(|g| g.get_mut(&group).unwrap().label = "Legacy".into()).unwrap();
         assert_eq!(ks.list_groups().unwrap()[0].group.label, "Legacy");
 
         ks.set_group_label(&rename(&group, "")).unwrap();
@@ -4295,7 +4813,7 @@ mod tests {
         let d2 = tempfile::tempdir().unwrap();
         let (ks2, g2) = with_group(d2.path());
         assert!(ks2.delete_account(&ACCT0.to_string(), "pw").unwrap());
-        std::fs::write(d2.path().join("groups.json"), "{}").unwrap();
+        lose_records(&ks2);
         assert!(ks2.list_groups().unwrap()[0].stranded);
         let e = ks2.set_group_label(&rename(&g2, "Old phone")).unwrap_err();
         assert!(format!("{e}").contains("keeps a derivation key needs that key's password"), "got {e}");
@@ -4361,7 +4879,7 @@ mod tests {
         // to reach it too — otherwise the one call that can clear it cannot be aimed.
         let dir = tempfile::tempdir().unwrap();
         let (ks, group) = emptied(dir.path());
-        std::fs::write(dir.path().join("groups.json"), "{}").unwrap();
+        lose_records(&ks);
         assert!(ks.list_groups().unwrap().is_empty(), "nothing on disk but the name");
 
         ks.set_group_label(&rename(&group, "Old phone")).unwrap();
@@ -4380,7 +4898,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ks, group) = with_group(dir.path());
         ks.derive_next_account(Some(&group), "gp", "pw", 0).unwrap();
-        std::fs::write(dir.path().join("groups.json"), "{}").unwrap();
+        lose_records(&ks);
 
         let listed = ks.list_groups().unwrap();
         assert!(listed[0].stranded && listed[0].id == group);
@@ -4472,7 +4990,7 @@ mod tests {
 
         // A name left standing over a record that already went: the operation is total, so
         // it takes what is there and says which half it found.
-        std::fs::write(dir.path().join("groups.json"), "{}").unwrap();
+        lose_records(&ks);
         let out = ks.remove_group(&group).unwrap();
         assert!(!out.record_removed && out.name_removed);
         assert!(ks.get_group_labels().unwrap().is_empty());
@@ -4486,16 +5004,21 @@ mod tests {
         for (name, corrupt) in corruptions() {
             let dir = tempfile::tempdir().unwrap();
             let (ks, group) = emptied(dir.path());
+            let saved = std::fs::read_to_string(dir.path().join("index.pending.json")).unwrap();
             corrupt(dir.path());
             assert!(ks.remove_group(&group).is_err(), "{name}");
+            std::fs::remove_file(dir.path().join("index.pending.json")).unwrap();
+            corrupt_index(dir.path(), &saved);
             assert_eq!(ks.get_group_labels().unwrap()[&group], "Main", "{name}: the name went anyway");
         }
 
-        // accounts.json is the one that says whether anything is still under the wallet.
+        // The accounts are what say whether anything is still under the wallet.
         let dir = tempfile::tempdir().unwrap();
         let (ks, group) = emptied(dir.path());
-        std::fs::write(dir.path().join("accounts.json"), "{\"x\": ").unwrap();
+        let saved = std::fs::read_to_string(dir.path().join("index.pending.json")).unwrap();
+        corrupt_index(dir.path(), "{\"x\": ");
         assert!(ks.remove_group(&group).is_err());
+        corrupt_index(dir.path(), &saved);
         assert!(ks.get_groups().unwrap().contains_key(&group));
     }
 
@@ -4537,13 +5060,13 @@ mod tests {
 
         // An account that predates all of this is reported unknown, never guessed: a guess
         // about recoverability is the one lie this must not tell.
+        // An older build named it by its address; the next keystore to open takes it in.
         let ancient = address!("0000000000000000000000000000000000000001");
-        std::fs::copy(
-            dir.path().join(format!("{}.json", vault_name(&from_json))),
-            dir.path().join(format!("{}.json", vault_name(&ancient))),
-        )
-        .unwrap();
-        assert_eq!(origin(ancient), "unknown");
+        std::fs::copy(vault_file(&ks, &from_json), dir.path().join(format!("{}.json", addr_key(&ancient)))).unwrap();
+        let reopened = Keystore::new(dir.path());
+        let found = reopened.provenance_view().unwrap().into_iter().find(|p| p.address == ancient).unwrap();
+        assert_eq!(found.provenance.origin, "unknown");
+        assert!(!dir.path().join(format!("{}.json", addr_key(&ancient))).exists(), "its vault took a random name");
     }
 
     #[test]
@@ -4557,14 +5080,11 @@ mod tests {
         assert_ne!(d.address, ACCT0);
         assert!(ks.list_groups().unwrap()[0].group.used_passphrase);
 
-        // Neither sidecar may carry the phrase or the passphrase: they are read without a
-        // password, by anyone who can read the directory.
-        for name in ["groups.json", "accounts.json"] {
-            let txt = std::fs::read_to_string(dir.path().join(name)).unwrap();
-            assert!(!txt.contains("TREZOR"), "{name} leaked the passphrase");
-            assert!(!txt.contains(TEST_MNEMONIC), "{name} leaked the phrase");
-            assert!(!txt.contains("xprv"), "{name} leaked the derivation key");
-        }
+        // No bookkeeping may carry the phrase or the passphrase, sealed or not.
+        let txt = plain_docs(dir.path());
+        assert!(!txt.contains("TREZOR"), "the bookkeeping leaked the passphrase");
+        assert!(!txt.contains(TEST_MNEMONIC), "the bookkeeping leaked the phrase");
+        assert!(!txt.contains("xprv"), "the bookkeeping leaked the derivation key");
     }
 
     #[cfg(unix)]
@@ -4589,9 +5109,9 @@ mod tests {
     fn a_failed_import_leaves_no_half_made_group() {
         let dir = tempfile::tempdir().unwrap();
         let ks = Keystore::new(dir.path());
-        // Make the account vault unwritable by putting a directory where its file goes, so
-        // the failure lands AFTER the group's derivation key has been written.
-        std::fs::create_dir_all(dir.path().join(format!("{}.json", vault_name(&ACCT0)))).unwrap();
+        // Fail the account vault's write, so the failure lands AFTER the group's derivation key
+        // has been written.
+        FAIL_VAULT_WRITE.with(|f| f.set(true));
 
         assert!(ks.import_mnemonic_ex(&req(Storage::Extkey, 0)).is_err());
         assert!(ks.get_groups().unwrap().is_empty(), "a group whose account never landed must not survive");
@@ -4640,10 +5160,10 @@ mod tests {
     /// whose derivation key is still on disk.
     fn corruptions() -> Vec<Corruption> {
         let write = |name: &'static str, body: &'static str| -> Corruption {
-            (name, Box::new(move |p: &std::path::Path| std::fs::write(p.join("groups.json"), body).unwrap()))
+            (name, Box::new(move |p: &std::path::Path| corrupt_index(p, body)))
         };
         let mut cases = vec![
-            // Exactly the measured state: `> groups.json`, or a crash before any byte lands.
+            // Exactly the measured state: `> file`, or a crash before any byte lands.
             write("truncated", ""),
             // ENOSPC part-way through a non-atomic write.
             write("partial json", "{\"g_0123456789abcdef0123456789abcdef\": {\"storage\": \"extk"),
@@ -4656,7 +5176,7 @@ mod tests {
         #[cfg(unix)]
         cases.push(("unreadable", Box::new(|p: &std::path::Path| {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(p.join("groups.json"), std::fs::Permissions::from_mode(0o000)).unwrap();
+            std::fs::set_permissions(p.join("index.pending.json"), std::fs::Permissions::from_mode(0o000)).unwrap();
         })));
         cases
     }
@@ -4673,12 +5193,12 @@ mod tests {
             let e = ks.create_unrelated_account("pw", acked()).unwrap_err();
             assert!(
                 matches!(e, KeystoreError::Corrupt(..)),
-                "{name}: an unreadable groups.json must refuse, got {e}"
+                "{name}: an unreadable index must refuse, got {e}"
             );
-            assert!(format!("{e}").contains("groups.json"), "{name}: {e}");
+            assert!(format!("{e}").contains("index.pending.json"), "{name}: {e}");
             assert!(ks.import_private_key(ACCT0_PK, "pw").is_err(), "{name}");
 
-            assert_eq!(ks.list_accounts().unwrap(), vec![ACCT0], "{name}: a vault landed anyway");
+            assert_eq!(ks.scan().unwrap().vaults.len(), 1, "{name}: a vault landed anyway");
             assert!(ks.group_vault_path(&group).exists(), "{name}");
 
             // Every other read of that file refuses too, instead of reporting "no wallets".
@@ -4694,18 +5214,18 @@ mod tests {
 
     #[test]
     fn an_unreadable_accounts_file_refuses_before_the_vault_lands() {
-        // accounts.json is read on the way to writing every new vault. Swallowing its
-        // errors would leave a key on disk with no record of where it came from.
+        // The index is read on the way to writing every new vault. Swallowing its errors would
+        // leave a key on disk with no record of where it came from.
         for (name, body) in [("truncated", ""), ("wrong schema", "[]")] {
             let dir = tempfile::tempdir().unwrap();
             let ks = Keystore::new(dir.path());
             ks.create_unrelated_account("pw", acked()).unwrap();
-            let before = ks.list_accounts().unwrap();
-            std::fs::write(dir.path().join("accounts.json"), body).unwrap();
+            let before = ks.scan().unwrap().vaults;
+            corrupt_index(dir.path(), body);
 
             assert!(matches!(ks.create_unrelated_account("pw", acked()), Err(KeystoreError::Corrupt(..))), "{name}");
             assert!(ks.import_private_key(ACCT0_PK, "pw").is_err(), "{name}");
-            assert_eq!(ks.list_accounts().unwrap(), before, "{name}: a vault landed despite the refusal");
+            assert_eq!(ks.scan().unwrap().vaults, before, "{name}: a vault landed despite the refusal");
             assert!(ks.get_provenance().is_err(), "{name}");
         }
     }
@@ -4717,7 +5237,7 @@ mod tests {
         let a = ks.create_unrelated_account("pw", acked()).unwrap();
         ks.set_label(&a.to_string(), "Savings", "pw").unwrap();
 
-        std::fs::write(dir.path().join("labels.json"), "{\"x\": ").unwrap();
+        corrupt_index(dir.path(), "{\"x\": ");
         assert!(ks.get_labels().is_err());
         // Naming a second account would otherwise write a fresh map over the torn one,
         // silently losing every name it held. The password is correct on purpose: a wrong
@@ -4755,8 +5275,8 @@ mod tests {
         // makes it deletable — it just no longer decides anything about creating accounts.
         let dir = tempfile::tempdir().unwrap();
         let (ks, group) = with_group(dir.path());
-        std::fs::remove_file(dir.path().join("groups.json")).unwrap();
-        assert!(ks.get_groups().unwrap().is_empty(), "an absent file is an empty one");
+        lose_records(&ks);
+        assert!(ks.get_groups().unwrap().is_empty(), "no record is an empty one");
 
         assert_eq!(ks.list_derivation_keys().unwrap(), vec![group.clone()]);
         assert!(ks.group_store().unwrap().possible_key_material().iter().any(|m| m.contains(&group)));
@@ -4773,18 +5293,18 @@ mod tests {
         let (ks, group) = with_group(dir.path());
         ks.derive_next_account(Some(&group), "gp", "pw", 0).unwrap();
 
-        let before = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
+        let before = plain_docs(dir.path());
         let listed = |ks: &Keystore| ks.scan().unwrap();
         assert!(listed(&ks).doc_stages.is_empty(), "left staged: {:?}", listed(&ks).doc_stages);
 
         restrict_permissions(dir.path(), 0o500).unwrap();
-        let failed = ks.update(&ks.groups_path(), |g: &mut BTreeMap<String, Group>| {
+        let failed = ks.update_groups(|g| {
             g.get_mut(&group).unwrap().next_index = 99;
         });
         restrict_permissions(dir.path(), 0o700).unwrap();
 
         assert!(failed.is_err(), "a failed staging must not report success");
-        assert_eq!(std::fs::read_to_string(dir.path().join("groups.json")).unwrap(), before);
+        assert_eq!(plain_docs(dir.path()), before);
         assert_eq!(ks.list_accounts().unwrap().len(), 2);
         assert!(ks.get_groups().is_ok());
         assert!(listed(&ks).doc_stages.is_empty(), "a failed write left a staged copy behind");
@@ -4806,7 +5326,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (ks, group) = with_group(dir.path());
         let derived = ks.derive_next_account(Some(&group), "gp", "pw", 0).unwrap();
-        std::fs::write(dir.path().join("groups.json"), "{}").unwrap();
+        lose_records(&ks);
 
         // Nameable: listed as stranded, and reachable without the bookkeeping at all.
         let stranded: Vec<_> = ks.list_groups().unwrap().into_iter().filter(|g| g.stranded).collect();
@@ -4844,7 +5364,8 @@ mod tests {
             let out = ks.forget_derivation(&group).unwrap();
             assert!(!out.record_updated, "{name}: the record cannot have been updated");
             assert!(!ks.group_vault_path(&group).exists(), "{name}");
-            assert!(ks.signer_for(&ACCT0.to_string(), "pw").is_ok(), "{name}: an account was lost");
+            // The account's key stays in its vault: which account it is waits on the index.
+            assert_eq!(ks.scan().unwrap().vaults.len(), 1, "{name}: an account was lost");
         }
     }
 
@@ -5206,10 +5727,10 @@ mod tests {
             let own = tempfile::tempdir().unwrap();
             let dir = tempfile::tempdir_in(own.path()).unwrap();
             let (ks, group) = with_group(dir.path());
-            // groups.json is removed so the directory scan answers alone, with no record to
-            // agree with. It is what the scan REPORTS that is measured here; what makes a
-            // random key safe is the acknowledgement, asserted below in every row alike.
-            std::fs::remove_file(dir.path().join("groups.json")).unwrap();
+            // The records are lost so the directory scan answers alone, with no record to agree
+            // with. It is what the scan REPORTS that is measured here; what makes a random key
+            // safe is the acknowledgement, asserted below in every row alike.
+            lose_records(&ks);
             (state.setup)(dir.path(), &group);
             let name = state.name;
 
@@ -5293,8 +5814,8 @@ mod tests {
         // PREFIX, so four of these five minted an unrecoverable random key beside a live
         // whole-wallet derivation key — each stranded vault proved live by decrypting it.
         //
-        // groups.json is deleted throughout: keystore.rs says the key directory is the
-        // authority and the record only describes it, so the authority is tested ALONE.
+        // The records are lost throughout: keystore.rs says the key directory is the authority
+        // and the record only describes it, so the authority is tested ALONE.
         for (what, parent) in [
             ("the key directory itself", "groups"),
             ("one directory over", "groups.bak"),
@@ -5304,7 +5825,7 @@ mod tests {
         ] {
             let dir = tempfile::tempdir().unwrap();
             let (ks, group) = with_group(dir.path());
-            std::fs::remove_file(dir.path().join("groups.json")).unwrap();
+            lose_records(&ks);
 
             let home = dir.path().join(parent.replace("{id}", &group));
             std::fs::create_dir_all(&home).unwrap();
@@ -5352,8 +5873,9 @@ mod tests {
             // Half one: the account vault's path is a link to a live key elsewhere.
             let donor = Keystore::new(outside.path());
             let acct = donor.import_private_key(ACCT0_PK, "pw").unwrap();
-            let real = outside.path().join(format!("{acct:x}.json"));
-            let linked = dir.path().join(format!("{:x}.json", ACCT0));
+            let real = vault_file(&donor, &acct);
+            let linked = vault_file(&ks, &ACCT0);
+            let link_name = linked.file_name().unwrap().to_string_lossy().into_owned();
             std::fs::remove_file(&linked).unwrap();
             std::os::unix::fs::symlink(&real, &linked).unwrap();
             assert_eq!(opens_to(&linked, "pw"), ACCT0, "the link does not reach a live key");
@@ -5371,8 +5893,8 @@ mod tests {
                 assert!(used.is_some(), "an unlisted vault was used");
             }
             // Named, and removable by name — refusing without that would be a wedge.
-            assert!(ks.scan().unwrap().stray().contains(&format!("{:x}.json", ACCT0)));
-            assert!(ks.remove_unexplained(&format!("{:x}.json", ACCT0), true).unwrap());
+            assert!(ks.scan().unwrap().stray().contains(&link_name));
+            assert!(ks.remove_unexplained(&link_name, true).unwrap());
             assert!(std::fs::read_to_string(&real).is_ok(), "removal followed the link");
 
             // Half two: the derivation key's path is a link to a live key elsewhere.
@@ -5730,7 +6252,7 @@ mod tests {
             let ks = Keystore::new(dir.path());
             let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
             assert_eq!(addr, ACCT0);
-            let a = format!("{:x}", ACCT0);
+            let a = vault_file(&ks, &ACCT0).file_stem().unwrap().to_string_lossy().into_owned();
             (state.setup)(dir.path(), &a);
 
             // Measured, not argued: each `live` path really does sign for ACCT0.
@@ -5829,7 +6351,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ks = Keystore::new(dir.path());
         let addr = ks.import_private_key(ACCT0_PK, "pw").unwrap();
-        let path = dir.path().join(format!("{:x}.json", addr));
+        let path = vault_file(&ks, &addr);
         let before = std::fs::read_to_string(&path).unwrap();
 
         let mut held = std::fs::File::open(&path).unwrap();
@@ -5874,11 +6396,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ks = Keystore::new(dir.path());
         ks.import_private_key(ACCT0_PK, "pw").unwrap();
+        let vault = vault_file(&ks, &ACCT0);
         let wrong = "b".repeat(40);
-        std::fs::rename(
-            dir.path().join(format!("{:x}.json", ACCT0)),
-            dir.path().join(format!("{wrong}.json")),
-        )
+        // The index names ACCT0's vault for another address.
+        ks.update_accounts(|all| {
+            let p = all.remove(&addr_key(&ACCT0)).unwrap();
+            all.insert(wrong.clone(), p);
+        })
         .unwrap();
         let claimed = format!("0x{wrong}");
 
@@ -5896,14 +6420,14 @@ mod tests {
         }
         // Deleting `wrong` must not destroy ACCT0's only key on the way.
         assert!(ks.delete_account(&claimed, "pw").is_err());
-        assert!(dir.path().join(format!("{wrong}.json")).exists());
+        assert!(vault.exists());
 
         // The other half: a vault that DECLARES an address disagreeing with its filename is
         // not listed as an account at all — there the mismatch is knowable without a password.
         let dir = tempfile::tempdir().unwrap();
         let ks = Keystore::new(dir.path());
         ks.import_private_key(ACCT0_PK, "pw").unwrap();
-        let path = dir.path().join(format!("{:x}.json", ACCT0));
+        let path = vault_file(&ks, &ACCT0);
         let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         v["address"] = serde_json::json!(wrong);
         std::fs::write(&path, v.to_string()).unwrap();
@@ -5913,7 +6437,7 @@ mod tests {
         assert_eq!(report.mismatched.len(), 1, "{:?}", report.mismatched);
         assert!(report.mismatched[0].contains(&wrong));
         // Named as unexplained too, so the one removal path reaches it.
-        assert!(report.unexplained.contains(&format!("{:x}.json", ACCT0)));
+        assert!(report.unexplained.contains(&path.file_name().unwrap().to_string_lossy().into_owned()));
         // And the two answers agree: `has_address` used to say yes off the filename alone.
         assert!(!ks.has_address(&ACCT0.to_string()));
     }
@@ -5924,8 +6448,8 @@ mod tests {
         // disappeared when something happened to call `list_accounts` and not otherwise.
         let dir = tempfile::tempdir().unwrap();
         let ks = Keystore::new(dir.path());
-        let a = format!("{:x}", ACCT0);
         ks.import_private_key(ACCT0_PK, "pw").unwrap();
+        let a = vault_file(&ks, &ACCT0).file_stem().unwrap().to_string_lossy().into_owned();
         let stage = dir.path().join(format!(".stage-{a}"));
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::copy(dir.path().join(format!("{a}.json")), stage.join(format!("{a}.json"))).unwrap();
@@ -6169,5 +6693,252 @@ mod tests {
             assert!(ks.sign_message(&ACCT0.to_string(), "pw", "hi").is_ok(), "{name}");
             assert!(ks.create_unrelated_account("pw", acked()).is_ok(), "{name}");
         }
+    }
+
+    // ---- the sealed index: a locked wallet lists nothing -----------------------
+
+    fn data_key(byte: u8, generation: u32) -> logos_signer_interface::wallets::DataKey {
+        logos_signer_interface::wallets::DataKey {
+            key: logos_signer_interface::Secret::new(hex::encode([byte; 32])),
+            generation,
+        }
+    }
+
+    /// Every path under the keystore, as one text.
+    fn every_name(dir: &std::path::Path) -> String {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                out.push(e.file_name().to_string_lossy().into_owned());
+                if e.file_type().unwrap().is_dir() {
+                    todo.push(e.path());
+                }
+            }
+        }
+        out.join("\n")
+    }
+
+    /// A keystore with an EVM wallet, a Bitcoin wallet of the same phrase, a kept phrase and an
+    /// imported key, every seed sealed as the signer manager's keys would seal it.
+    fn sealed_keystore(dir: &std::path::Path) -> (Keystore, Vec<String>) {
+        let ks = Keystore::new(dir);
+        ks.import_mnemonic_ex(&ImportRequest { keep: KeepPhrase::New("phrase-pw"), ..req(Storage::Extkey, 0) }).unwrap();
+        bitcoin_import(&ks, Family::Segwit);
+        ks.import_private_key(&format!("{:064x}", 7), "pw").unwrap();
+        let closed = ks.closed_seeds().unwrap();
+        assert_eq!(closed.len(), 2, "one seed for the phrase, one for the key: {closed:?}");
+        let mut seeds = Vec::new();
+        for (seed, wanted) in closed {
+            assert_eq!(wanted, None, "a new seed waits for its first key");
+            assert!(ks.open_seed(&seed, &data_key(1, 0), &data_key(1, 0)).unwrap());
+            seeds.push(seed);
+        }
+        (ks, seeds)
+    }
+
+    #[test]
+    fn a_sealed_seed_lists_nothing_until_its_key_opens_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, seeds) = sealed_keystore(dir.path());
+        assert_eq!(ks.list_accounts().unwrap().len(), 2);
+        assert_eq!(ks.locked_wallets().unwrap(), 0);
+        assert!(!dir.path().join("index.pending.json").exists() || plain_docs(dir.path()).contains("{}"));
+
+        // Another process, or this one after Basecamp restarts: no key, nothing listed.
+        let fresh = Keystore::new(dir.path());
+        assert!(fresh.list_accounts().unwrap().is_empty());
+        assert!(fresh.list_groups().unwrap().is_empty(), "a locked wallet's keys are not stranded");
+        assert!(fresh.kept_phrases().unwrap().is_empty(), "nor is its phrase listed");
+        assert!(fresh.list_derivation_keys().unwrap().is_empty(), "nor its derivation keys");
+        let key = ks.list_derivation_keys().unwrap();
+        let phrase = ks.kept_phrases().unwrap()[0].id.clone();
+        assert_eq!(key.len(), 2, "the EVM and the Bitcoin wallet's: {key:?}");
+        for k in &key {
+            assert!(format!("{}", fresh.forget_derivation(k).unwrap_err()).contains("locked"), "{k}");
+            assert!(dir.path().join(format!("groups/{k}.json")).exists(), "a refusal deleted nothing");
+        }
+        assert!(format!("{}", fresh.forget_phrase(&phrase).unwrap_err()).contains("locked"));
+        assert!(fresh.account_report().unwrap().unexplained.is_empty(), "nor its vaults unexplained");
+        assert!(fresh.provenance_view().unwrap().is_empty() && fresh.get_labels().unwrap().is_empty());
+        assert!(!fresh.has_address(&ACCT0.to_string()));
+        assert!(fresh.sign_message(&ACCT0.to_string(), "pw", "hi").is_err());
+        assert_eq!(fresh.locked_wallets().unwrap(), 2);
+        let mut locked = fresh.locked_seeds().unwrap();
+        locked.sort();
+        let mut want = seeds.clone();
+        want.sort();
+        assert_eq!(locked, want, "named as the keystore names them to the manager");
+        for v in fresh.scan().unwrap().vaults {
+            assert!(fresh.remove_unexplained(&format!("{v}.json"), true).is_err(), "a locked wallet's vault is removable");
+        }
+
+        // A wrong key opens nothing; the right one, of the box's generation, opens it again.
+        let closed = fresh.closed_seeds().unwrap();
+        assert!(closed.iter().all(|(_, g)| *g == Some(0)), "{closed:?}");
+        assert!(fresh.open_seed(&seeds[0], &data_key(2, 0), &data_key(2, 0)).is_err());
+        for s in &seeds {
+            assert!(fresh.open_seed(s, &data_key(1, 0), &data_key(1, 1)).unwrap(), "sealed again under generation 1");
+        }
+        assert_eq!(fresh.list_accounts().unwrap().len(), 2);
+        assert_eq!(fresh.list_derivation_keys().unwrap(), key);
+        assert!(fresh.sign_message(&ACCT0.to_string(), "pw", "hi").is_ok());
+        assert!(Keystore::new(dir.path()).closed_seeds().unwrap().iter().all(|(_, g)| *g == Some(1)));
+
+        // Locking forgets the keys.
+        fresh.lock_seeds();
+        assert!(fresh.list_accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_file_names_an_account_and_no_plain_document_holds_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let accounts = ks.list_accounts().unwrap();
+        let xpub = ks.get_groups().unwrap().values().find_map(|g| g.xpub.clone()).unwrap();
+        let names = every_name(dir.path());
+        let docs = plain_docs(dir.path());
+        for a in &accounts {
+            let hexed = addr_key(a);
+            assert!(!names.contains(&hexed), "a file is named by {a}: {names}");
+            assert!(!docs.to_ascii_lowercase().contains(&hexed), "a document holds {a}");
+        }
+        assert!(!docs.contains(&xpub) && !docs.contains("tpub") && !docs.contains("Main"), "{docs}");
+    }
+
+    #[test]
+    fn a_locked_seed_still_gives_its_unlock_key_behind_its_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, seeds) = sealed_keystore(dir.path());
+        let wanted: Vec<[u8; 33]> = seeds.iter().map(|s| ks.unlock_key(s, 0, "pw").unwrap()).collect();
+        let fresh = Keystore::new(dir.path());
+        for (s, want) in seeds.iter().zip(&wanted) {
+            assert_eq!(&fresh.unlock_key(s, 0, "pw").unwrap(), want, "{s}");
+            assert!(fresh.unlock_key(s, 0, "wrong").is_err(), "{s}");
+        }
+    }
+
+    #[test]
+    fn a_wallet_here_already_but_locked_is_not_added_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        sealed_keystore(dir.path());
+        let fresh = Keystore::new(dir.path());
+        for e in [
+            fresh.import_mnemonic_ex(&ImportRequest { index: 3, ..req(Storage::Plain, 0) }).unwrap_err(),
+            fresh.import_private_key(&format!("{:064x}", 7), "pw").unwrap_err(),
+        ] {
+            assert!(format!("{e}").contains("unlock it in the Signer app"), "{e}");
+        }
+        assert!(fresh.import_private_key(&format!("{:064x}", 8), "pw").is_ok(), "another key is welcome");
+        assert_eq!(fresh.scan().unwrap().vaults.len(), 3, "a refusal wrote no vault");
+    }
+
+    #[test]
+    fn an_older_builds_documents_and_address_named_vaults_move_into_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let d = ks.import_mnemonic_ex(&req(Storage::Extkey, 0)).unwrap();
+        let key = ks.import_private_key(&format!("{:064x}", 7), "pw").unwrap();
+        ks.set_label(&key.to_string(), "Spare", "pw").unwrap();
+        // What an older build left: four documents, and vaults named by their address.
+        let doc = ks.view().unwrap().merged();
+        for a in [d.address, key] {
+            std::fs::rename(vault_file(&ks, &a), dir.path().join(format!("{}.json", addr_key(&a)))).unwrap();
+        }
+        let strip = |mut p: Provenance| {
+            (p.vault, p.seed, p.check) = (String::new(), String::new(), None);
+            p
+        };
+        let accounts: BTreeMap<String, Provenance> = doc.accounts.into_iter().map(|(k, p)| (k, strip(p))).collect();
+        for (name, body) in [
+            ("groups.json", serde_json::to_string(&doc.groups).unwrap()),
+            ("accounts.json", serde_json::to_string(&accounts).unwrap()),
+            ("labels.json", serde_json::to_string(&doc.labels).unwrap()),
+            ("group-labels.json", serde_json::to_string(&doc.group_labels).unwrap()),
+        ] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        for name in ["seeds.json", "index.pending.json"] {
+            std::fs::remove_file(dir.path().join(name)).unwrap();
+        }
+
+        let moved = Keystore::new(dir.path());
+        let mut want = vec![d.address, key];
+        want.sort_by_key(addr_key);
+        assert_eq!(moved.list_accounts().unwrap(), want);
+        assert_eq!(moved.get_labels().unwrap()[&addr_key(&key)], "Spare");
+        assert_eq!(moved.get_group_labels().unwrap()[&d.group], "Main");
+        assert!(moved.sign_message(&key.to_string(), "pw", "hi").is_ok());
+        assert!(moved.derive_next_account(Some(&d.group), "gp", "pw", 0).is_ok());
+        let names = every_name(dir.path());
+        for gone in ["groups.json", "accounts.json", "labels.json", "group-labels.json"] {
+            assert!(!names.contains(gone), "{gone} is still here");
+        }
+        assert!(!names.contains(&addr_key(&key)) && !names.contains(&addr_key(&d.address)), "{names}");
+        assert!(moved.closed_seeds().unwrap().iter().all(|(s, _)| s.starts_with("g_") || s.starts_with("k_")));
+    }
+
+    // ---- a wallet's name is its seed's; an account file's is its own -----------------
+
+    fn seed_of(ks: &Keystore, group: &str) -> String {
+        Keystore::seed_of_group(&ks.get_groups().unwrap(), group)
+    }
+
+    #[test]
+    fn a_new_wallet_takes_its_name_and_each_account_only_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let first = ks
+            .import_mnemonic_ex(&ImportRequest { group_label: "", wallet_name: "Main wallet", ..req(Storage::Plain, 0) })
+            .unwrap();
+        let seed = seed_of(&ks, &first.group);
+        assert_eq!(ks.wallet_names().unwrap()[&seed], "Main wallet");
+        assert!(ks.get_group_labels().unwrap().is_empty(), "an account file has no name unless given one");
+        assert_eq!(ks.enrolment(&first.address.to_string(), "pw").unwrap().name, "Main wallet");
+
+        // Another account of the same phrase: its own name, and the wallet's is untouched.
+        let savings = ks
+            .import_mnemonic_ex(&ImportRequest { index: 1, group_label: "Savings", wallet_name: "Ignored", ..req(Storage::Plain, 0) })
+            .unwrap();
+        assert_eq!(seed_of(&ks, &savings.group), seed);
+        assert_eq!(ks.wallet_names().unwrap()[&seed], "Main wallet");
+        assert_eq!(ks.get_group_labels().unwrap()[&savings.group], "Savings");
+        assert!(!ks.get_group_labels().unwrap().contains_key(&first.group));
+
+        // Renaming the wallet needs what naming a file needs.
+        let e = ks.set_wallet_name(&rename(&first.group, "Daily")).unwrap_err();
+        assert!(format!("{e}").contains("needs the password of one of them"), "{e}");
+        ks.set_wallet_name(&rename_as(&first.group, "Daily", &first.address.to_string(), "pw")).unwrap();
+        assert_eq!(ks.wallet_names().unwrap()[&seed], "Daily");
+        assert_eq!(ks.get_group_labels().unwrap()[&savings.group], "Savings");
+        ks.set_wallet_name(&rename(&first.group, "")).unwrap();
+        assert!(ks.wallet_names().unwrap().is_empty(), "clearing asks for nothing");
+    }
+
+    #[test]
+    fn the_name_an_older_keys_app_copied_onto_every_file_becomes_the_wallets() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        // What the older keys app wrote: the wallet's name on every file, and on each account.
+        let a = ks.import_mnemonic_ex(&ImportRequest { group_label: "Old", ..req(Storage::Plain, 0) }).unwrap();
+        let b = ks.import_mnemonic_ex(&ImportRequest { index: 1, group_label: "Old", ..req(Storage::Plain, 0) }).unwrap();
+        ks.set_label(&a.address.to_string(), "Old", "pw").unwrap();
+        let seed = seed_of(&ks, &a.group);
+        assert!(ks.wallet_names().unwrap().is_empty(), "adding an account adopts nothing");
+
+        // Naming the wallet takes the copy off its files and accounts.
+        ks.set_wallet_name(&rename_as(&a.group, "New", &a.address.to_string(), "pw")).unwrap();
+        assert_eq!(ks.wallet_names().unwrap()[&seed], "New");
+        let files = ks.get_group_labels().unwrap();
+        assert!(!files.contains_key(&a.group) && !files.contains_key(&b.group), "{files:?}");
+        assert!(ks.get_labels().unwrap().is_empty(), "the copy on the account went too");
+
+        // Two different names are names of their own, and stay.
+        let d2 = tempfile::tempdir().unwrap();
+        let ks2 = Keystore::new(d2.path());
+        let x = ks2.import_mnemonic_ex(&ImportRequest { group_label: "One", ..req(Storage::Plain, 0) }).unwrap();
+        ks2.import_mnemonic_ex(&ImportRequest { index: 1, group_label: "Two", ..req(Storage::Plain, 0) }).unwrap();
+        ks2.set_wallet_name(&rename_as(&x.group, "Both", &x.address.to_string(), "pw")).unwrap();
+        assert_eq!(ks2.get_group_labels().unwrap().len(), 2);
     }
 }

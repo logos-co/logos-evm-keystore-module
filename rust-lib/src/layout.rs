@@ -21,18 +21,23 @@ const IMPORT_FILE: &str = "import.json";
 /// Deepest path the layout explains: `groups/.stage-<id>/<id>.json`.
 const MAX_DEPTH: usize = 3;
 
-/// A bookkeeping document. Not a secret — an attacker holding the directory already reads
-/// the addresses off the vault filenames.
+/// A bookkeeping document. The wallets, accounts and names live in the index, one box per seed
+/// (see `crate::index`); the four documents before it are what older builds wrote, read once to
+/// move them in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Doc {
     Groups,
     Accounts,
     Labels,
-    /// Wallet names. Its own document rather than a field of `groups.json`, so a name is
-    /// still readable for a group that document does not know about.
     GroupLabels,
     /// Which device account each database-key vault belongs to.
     DeviceWallets,
+    /// What a locked seed needs, plain: its unlock roots and its files' ids.
+    Seeds,
+    /// Every seed's bookkeeping, sealed under its key.
+    Index,
+    /// Bookkeeping of seeds whose key hasn't come yet, plain until it does.
+    Pending,
 }
 
 impl Doc {
@@ -43,10 +48,25 @@ impl Doc {
             Doc::Labels => "labels.json",
             Doc::GroupLabels => "group-labels.json",
             Doc::DeviceWallets => "device-wallets.json",
+            Doc::Seeds => "seeds.json",
+            Doc::Index => "index.sealed.json",
+            Doc::Pending => "index.pending.json",
         }
     }
 
-    pub const ALL: [Doc; 5] = [Doc::Groups, Doc::Accounts, Doc::Labels, Doc::GroupLabels, Doc::DeviceWallets];
+    pub const ALL: [Doc; 8] = [
+        Doc::Groups,
+        Doc::Accounts,
+        Doc::Labels,
+        Doc::GroupLabels,
+        Doc::DeviceWallets,
+        Doc::Seeds,
+        Doc::Index,
+        Doc::Pending,
+    ];
+
+    /// The documents older builds kept, before the index.
+    pub const LEGACY: [Doc; 4] = [Doc::Groups, Doc::Accounts, Doc::Labels, Doc::GroupLabels];
 
     fn of_file(name: &str) -> Option<Doc> {
         Doc::ALL.into_iter().find(|d| d.file() == name)
@@ -56,7 +76,7 @@ impl Doc {
 /// What a staging directory holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StageKind {
-    /// `<ks>/.stage-<addr>` — an account vault being written or re-encrypted.
+    /// `<ks>/.stage-<vault id>` — an account vault being written or re-encrypted.
     Vault(String),
     /// `<ks>/groups/.stage-<id>` — a group's derivation key.
     Group(String),
@@ -83,7 +103,8 @@ impl StageKind {
 /// fails to compile until it is given a name the scan can recognise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Slot {
-    /// `<ks>/<addr>.json` — one account's scrypt vault.
+    /// `<ks>/<vault id>.json` — one account's scrypt vault, named at random (older builds named
+    /// it by its address).
     Vault(String),
     /// `<ks>/groups/<id>.json` — one group's derivation key.
     GroupKey(String),
@@ -177,10 +198,10 @@ pub struct Unreadable {
 /// not.
 #[derive(Clone, Debug, Default)]
 pub struct Scan {
-    /// Live account vaults at `<ks>/<addr>.json`, as lowercase hex without `0x`.
+    /// Live account vaults at `<ks>/<vault id>.json`, by id.
     pub vaults: Vec<String>,
-    /// Account vaults an interrupted write left at `<ks>/.stage-<addr>/<addr>.json`. Every
-    /// bit as live: same ciphertext, same password, same account.
+    /// Account vaults an interrupted write left at `<ks>/.stage-<id>/<id>.json`. Every bit as
+    /// live: same ciphertext, same password, same account.
     pub staged_vaults: Vec<String>,
     /// Staging directories for a vault, whether or not a key is still inside.
     pub vault_stages: Vec<String>,
@@ -308,7 +329,7 @@ impl Scan {
         out
     }
 
-    /// Addresses whose key is on disk, at either path.
+    /// Vault ids whose key is on disk, at either path.
     pub fn account_ids(&self) -> Vec<String> {
         let mut out = self.vaults.clone();
         out.extend(self.staged_vaults.iter().cloned());
@@ -394,11 +415,21 @@ pub fn is_device_id(id: &str) -> bool {
     id.len() == 34 && id.starts_with("d_") && is_hex(&id[2..], 32)
 }
 
-/// A vault filename is the address as `vault_name` writes it: 40 lowercase hex, no `0x`.
-/// Anything else is unexplained rather than a vault — a name we could not have written
-/// does not name a file we can open.
+/// An account vault's id: `a_` + 16 random bytes in hex, never derived from the account.
+pub fn is_vault_id(id: &str) -> bool {
+    (id.len() == 34 && id.starts_with("a_") && is_hex(&id[2..], 32)) || is_legacy_vault(id)
+}
+
+/// What older builds named a vault: its address, 40 lowercase hex with no `0x`. Recognised so the
+/// index can take it in and give it a random name.
+pub fn is_legacy_vault(id: &str) -> bool {
+    is_hex(id, 40)
+}
+
+/// Anything not named like a vault id is unexplained rather than a vault — a name we could
+/// not have written does not name a file we can open.
 fn vault_stem(name: &str) -> Option<String> {
-    name.strip_suffix(".json").filter(|s| is_hex(s, 40)).map(str::to_string)
+    name.strip_suffix(".json").filter(|s| is_vault_id(s)).map(str::to_string)
 }
 
 fn group_stem(name: &str) -> Option<String> {
@@ -420,7 +451,7 @@ fn stage_name(name: &str) -> Option<StageKind> {
     if let Some(nonce) = rest.strip_prefix(IMPORT_INFIX) {
         return is_hex(nonce, 32).then(|| StageKind::Import(nonce.into()));
     }
-    if is_hex(rest, 40) {
+    if is_vault_id(rest) {
         return Some(StageKind::Vault(rest.into()));
     }
     if is_phrase_id(rest) {

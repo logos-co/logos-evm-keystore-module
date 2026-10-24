@@ -26,6 +26,7 @@ const ANNOUNCES: &[&str] = &[
     "delete_account",
     "set_label",
     "set_group_label",
+    "set_wallet_name",
     "remove_group",
     "forget_derivation",
     "remove_unexplained",
@@ -68,6 +69,10 @@ const SILENT: &[&str] = &[
     "unlocked",
     "database_key",
     "device_wallets",
+    "unlock_key",
+    "unlock_key_status",
+    "unlock_key_result",
+    "cancel_unlock_key",
 ];
 
 /// The file with comments and string literals blanked, byte offsets preserved: brace and
@@ -214,6 +219,7 @@ fn a_rename_announces_even_though_it_moves_no_count() {
     assert!(ANNOUNCES.contains(&"set_label"));
     assert_eq!(announcements(body_of(&code, "set_label")), (1, 0));
     assert_eq!(announcements(body_of(&code, "set_group_label")), (1, 0));
+    assert_eq!(announcements(body_of(&code, "set_wallet_name")), (1, 0));
 }
 
 // ── the mutants each check above exists to kill ──────────────────────────────────

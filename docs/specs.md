@@ -83,7 +83,7 @@ flowchart TB
         end
         subgraph Core["Crypto core — src/keystore.rs (no network, no Logos)"]
             KS["struct Keystore { dir }<br/>(no signer cache)"]
-            VAULTS["scrypt vault files<br/>&lt;lowercase-hex-addr&gt;.json"]
+            VAULTS["scrypt vault files<br/>a_&lt;random id&gt;.json"]
             MEM["signer: a LOCAL inside approve()<br/>derived per approval, then zeroized"]
         end
     end
@@ -234,6 +234,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `set_label` | `address, label, password: String` | `{ ok }` | no |
 | `get_labels` | — | `{ ok, labels: { <address>: <name> } }` | no |
 | `set_group_label` | `params_json: String` | `{ ok }` | no |
+| `set_wallet_name` | `params_json: String` | `{ ok }` | no |
 | `get_group_labels` | — | `{ ok, labels: { <groupId>: <name> } }` | no |
 | `request_approval` | `intent_json: String` | `{ ok, handle, receipt, state }` | no |
 | `approval_status` | `handle, receipt: String` | `{ ok, state, reason? }` | no |
@@ -251,6 +252,10 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `sign_status` | `job: String` | `{ ok, job, state, code?, error? }` | no |
 | `sign_result` | `job: String` | `{ ok, job, signatures: [..] }` | no |
 | `cancel_sign` | `job: String` | `{ ok, job }` | no |
+| `unlock_key` | `request_json: String` | `{ ok, job }` | no |
+| `unlock_key_status` | `job: String` | `{ ok, job, state, code?, error? }` | no |
+| `unlock_key_result` | `job: String` | `{ ok, job, key }`, once | no |
+| `cancel_unlock_key` | `job: String` | `{ ok, job }` | no |
 | `unlock` | `params_json: String` | `{ ok, account, expiresInMs, countLeft }` | no |
 | `lock` | `params_json: String` | `{ ok, locked }` | no |
 | `unlocked` | — | `{ ok, unlocked: [..] }` | no |
@@ -561,7 +566,15 @@ the machine is showing, and the count in the payload does not move.
 | `set_label` | `address: String, label: String, password: String` | `{ ok: true }` |
 | `get_labels` | — | `{ ok: true, labels: { "<address>": "<name>" } }` |
 | `set_group_label` | `params_json: String` — `{ group, label, address?, password? }` | `{ ok: true }` |
+| `set_wallet_name` | `params_json: String` — `{ group, label, address?, password? }` | `{ ok: true }` |
 | `get_group_labels` | — | `{ ok: true, labels: { "<groupId>": "<name>" } }` |
+
+**A wallet's name is its seed's; an account file's is its own.** `set_wallet_name` names the
+wallet — every account file of one seed, shown as the header over them — with `group` any file of
+it, priced as `set_group_label` prices a name. `list_groups` gives each file's `walletName`, and
+the imports take `walletName`, kept for a seed that has none yet. A file's `label` is its own name,
+empty unless the person gives one. An older keys app copied the wallet's name onto every file and
+account: the first `set_wallet_name` of that seed takes the copy off them.
 
 ```bash
 logosctl call keystore_module set_group_label \
@@ -620,23 +633,23 @@ An empty or whitespace-only `label` **clears** the name; anything else is stored
 trimmed. `set_group_label` refuses a group nothing on disk knows about
 (`{"ok":false,"error":"invalid parameters: no such group: g_…"}`), and an id that is
 not a well-formed group id (`invalid parameters: invalid group id …`) — but it accepts
-a group named by *any* of the four facts the keystore holds: its record in `groups.json`, its key under
+a group named by *any* of the four facts the keystore holds: its record in the index, its key under
 `groups/`, an account whose provenance points at it, or a name already standing over it in
-`group-labels.json`. A wallet a reader can see is one it can name, and a **stranded** key,
+the wallet names. A wallet a reader can see is one it can name, and a **stranded** key,
 a lost record or a leftover name is exactly when it needs to.
 
-`get_group_labels` answers from `group-labels.json` alone, so it stays readable when
-`groups.json` is not — which is what lets a UI name the wallet it is asking the user
+`get_group_labels` answers from the wallet names alone, so it stays readable when the
+record is gone — which is what lets a UI name the wallet it is asking the user
 whether to delete. The same name is also mirrored onto each row of `list_groups` as
 `label`, stranded rows included; a name a build before this one wrote into
-`groups.json` is still shown, and the first rename moves it out of the record so a
+the record is still shown, and the first rename moves it out of the record so a
 cleared name cannot resurface.
 
 **No uniqueness rule.** Two wallets may carry one name. Which of them a reader is
 looking at is a question for whatever renders them — refusing the write would only
 stop it showing what the user actually did.
 
-**Refuses rather than reads as empty.** A present-but-unreadable `group-labels.json`
+**Refuses rather than reads as empty.** A present-but-unreadable index
 fails every one of these calls, and `list_groups` with it — see *Three states, not
 two*. Writing over it would silently erase every name it held.
 
@@ -724,9 +737,9 @@ in `Zeroizing` and live `XPriv` values are kept to a minimum.
 
 ### Index tracking
 
-`nextIndex` lives per group in `groups.json` and is a **cache, not the authority**.
+`nextIndex` lives per group in its record and is a **cache, not the authority**.
 It is recomputed on every use as
-`max(nextIndex, 1 + max index recorded in accounts.json for this group)`, so a
+`max(nextIndex, 1 + max index recorded among the accounts of this group)`, so a
 corrupted or hand-edited sidecar can only *skip* an index — never hand out one
 already in use. A gap costs nothing; a collision is two vaults claiming one address.
 
@@ -866,7 +879,7 @@ The user could neither derive nor stop being derivable. Authorisation is the Tie
 custodian gate, which is where it belongs; a password proves knowledge of the key,
 not intent to destroy it.
 
-Keyed on the key **files**, not on `groups.json`. Routing it through the bookkeeping
+Keyed on the key **files**, not on the records. Routing it through the bookkeeping
 meant a group whose record was lost or unreadable could not be named at all, so its
 whole-wallet key stayed on disk with no way to delete it — and the `extkey → plain`
 downgrade below had no way out. `list_derivation_keys` names such a key.
@@ -878,7 +891,7 @@ downgrade below had no way out. `list_derivation_keys` names such a key.
 **Success:** `{ "ok": true, "group": "g_…", "storage": "plain", "recordUpdated": true,
 "stranded": false, "stagedRemoved": false }`
 
-`recordUpdated` is false when the key was deleted but `groups.json` could not be
+`recordUpdated` is false when the key was deleted but the index could not be
 read or rewritten to downgrade the record. `ok: true` means exactly one thing — the
 key is gone — and `recordUpdated` says whether the bookkeeping followed. Reporting a
 deletion that *did* happen as a failure would invite a retry that finds nothing.
@@ -893,7 +906,7 @@ Remove a wallet's **record** and its **name** — and nothing else. **Tier D.** 
 `accounts_changed`.
 
 This exists because a wallet could be listed and not be removable by anything. A group
-consists of up to four things: a record in `groups.json`, a name in `group-labels.json`,
+consists of up to four things: a record, a name among the wallet names,
 a derivation key at `groups/<id>.json` (and/or a staged copy), and zero or more accounts.
 `forget_derivation` removes the **key** and reports not-found when there is none — so a
 wallet that is not derivable and holds no accounts had only a record, and no method
@@ -920,7 +933,7 @@ a row still on screen is a user-visible surprise.
 | holds ≥1 account | `this wallet still holds N account(s); removing its record would leave them with nothing to name them — delete them first` |
 | has neither a record nor a name | `account not found: no such group: g_…` |
 | id is malformed | `invalid parameters: invalid group id "…"` |
-| `groups.json` / `accounts.json` / the scan is unreadable | the `Corrupt` refusal — never remove on an unread precondition |
+| the index / the scan is unreadable | the `Corrupt` refusal — never remove on an unread precondition |
 
 So a five-account derivable wallet takes six calls to remove, and that is the correct
 cost: five of those are spendable keys, each with its own password. The alternative —
@@ -968,7 +981,7 @@ rather than as a promise.
 `stranded` marks a derivation key on disk that **no record names**. It is listed
 rather than hidden: it cannot derive (there is no recorded path prefix to derive
 against) but it is live whole-wallet material, and hiding it is what made it
-undeletable. Its `pathPrefix` is empty; its `label` is whatever `group-labels.json` holds
+undeletable. Its `pathPrefix` is empty; its `label` is whatever the wallet names hold
 for it, and its `accountCount` is the accounts whose provenance still points at it — a key
 loses its record while the accounts it derived are still here, and both removal and renaming
 read that count as "does this wallet hold anything".
@@ -978,7 +991,7 @@ It is **not** promoted to the live key — a half-written file is not a vault �
 reads as not derivable, but it opens the whole wallet just the same: it refuses a
 random key, and `forget_derivation` removes it.
 
-**Refuses** if `groups.json` or `accounts.json` is present but unreadable — see
+**Refuses** if the index is present but unreadable — see
 *Three states, not two* below.
 
 ---
@@ -1123,7 +1136,7 @@ holds a JSON document inside the same scrypt envelope:
 `{ v: 1, family, accountKey, databaseKey }`. `accountKey` is the account-level xprv or tprv,
 the deepest key the wallet keeps; the root is never stored. `databaseKey` is 32 random bytes,
 generated with the group and derived from nothing, for the wallet core's encrypted database.
-The record in `groups.json` gains `family`, `chain`, `fingerprint` and `xpub`. They are public,
+The record gains `family`, `chain`, `fingerprint` and `xpub`. They are public,
 but the xpub reveals the wallet's whole history, as an EVM vault's filename reveals its address.
 An EVM record gains only `fingerprint`, the master fingerprint of the phrase it was made from,
 recorded while the seed is in memory; a Bitcoin import from the same phrase fills it in on older
@@ -1202,7 +1215,7 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 |---|---|
 | `signer_info` | anyone: it describes the kind of signer, not an account |
 | `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
-| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
+| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock_key`, `unlock_key_status`, `unlock_key_result`, `cancel_unlock_key`, `unlock`, `lock`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
 | `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (Tier D) |
 | `device_wallets` | a configured **manager** or **custodian** |
 | `list_phrases` | anyone: ids and the wallets that name them, never words |
@@ -1215,7 +1228,8 @@ module that could reach `sign` past it would sign inside an unlock it was never 
 ### `signer_info() -> String`
 
 `{ ok, interface: "logos.signer/1", kind: "keystore", model: "scrypt key files", families: ["evm",
-"bitcoin", "bitcoin_taproot"], requestKinds: ["hash"], showsRequest: false, collects: "password" }`.
+"bitcoin", "bitcoin_taproot"], requestKinds: ["hash"], showsRequest: false, collects: "password",
+unlockKey: true }`.
 
 ### `signer_accounts() -> String`
 
@@ -1226,6 +1240,32 @@ the master fingerprint of the phrase it was derived from, when known. A Bitcoin 
 fingerprint, xpub, label?, origin?, available: true }`. `origin` is `{ devices, phrase: { id, name },
 kind, path }`, the signer interface's extension: `phrase.id` is the same for every account of one
 phrase, and `name` is one of their wallet names, the same for each.
+
+Every account names its `seed`: the seed link every group of one phrase shares, else its group's id;
+a key imported on its own (by its key, a JSON vault, or at random) is a seed of its own, `k_` + 16
+random bytes in hex, never its address: the name shows while the wallet is locked. The signer
+manager unlocks that seed's data across every app (see below).
+
+### A seed's unlock key
+
+The signer manager unlocks a wallet's data, in every app, with the public key at
+`m/1280263247'/n'` of its seed, which every holder of the seed gives. The keystore keeps the
+extended key at `m/1280263247'` of each seed it imports, sealed under the password given with it
+(scrypt 2^15, XChaCha20-Poly1305, bound to the group), as the group record's `unlock`, so any index
+derives behind that password and the phrase isn't needed again. Nothing signs under that purpose:
+an item under it is refused. A key imported on its own derives its unlock key from itself.
+`change_password` reseals the root under the new password.
+
+- **`unlock_key`** (`{ seed, index, secret }`, Tier M) answers at once: a job that is `done`, whose
+  `unlock_key_result` gives the 33-byte key, hex, once. No secret is `locked`; a wrong password
+  `wrong_secret`; a seed it doesn't hold `wrong_seed`. A group imported before it kept a root is
+  refused: the person adds it again from its phrase.
+- **Enrolment.** After every import (`import_mnemonic`, `import_seed_wallet`, `import_bitcoin`,
+  `import_private_key`, `import_keystore_json`, `create_unrelated_account`) the keystore tells the
+  manager of the seed, while the password is at hand, so the person never unlocks it twice:
+  `enroll_seed({ seed, kind: "keystore", unlockKey, name, origin?, birthday? })` through
+  `logos.wallets/1` (`wallets.lidl`), bound to `signer_manager_module` at runtime. It is asked
+  without waiting; with no manager installed, the import succeeds all the same.
 
 ### `sign(request_json: String) -> String`
 
@@ -1885,12 +1925,16 @@ Two properties make that total rather than nearly total:
 
 | Path | What it is |
 |------|------------|
-| `<addr>.json` | one account's scrypt vault |
+| `a_<32 hex>.json` | one account's scrypt vault, named at random; older builds named it `<addr>.json` |
 | `groups/<id>.json` | one group's derivation key |
 | `groups/<phrase id>.json` | a kept recovery phrase, when the person chose to keep one |
 | `groups/<device id>.json` | a device wallet's database key, once it was opened for an app |
-| `groups.json`, `accounts.json`, `labels.json`, `group-labels.json`, `device-wallets.json` | bookkeeping sidecars |
-| `.stage-<addr>/` | an account vault mid-write |
+| `index.sealed.json` | every seed's records, accounts and names, one box per seed under its key |
+| `index.pending.json` | the same, plain, for seeds whose key hasn't come yet |
+| `seeds.json` | what a locked seed needs: its unlock roots, its files' ids, its check |
+| `device-wallets.json` | which device account each database-key vault belongs to |
+| `groups.json`, `accounts.json`, `labels.json`, `group-labels.json` | an older build's bookkeeping, moved into the index on first use |
+| `.stage-<vault id>/` | an account vault mid-write |
 | `groups/.stage-<id>/` | a derivation key, a kept phrase, or a device wallet's database key, mid-write |
 | `.stage-import-<nonce>/import.json` | the caller's vault, mid-`import_keystore_json` |
 | `.ks-stage-*` | a document mid-write (random name, so two processes cannot collide) |
@@ -1969,8 +2013,9 @@ can still point at one absolute data directory.
 
 ### On-disk vault files
 
-* **One file per account**, named `<lowercase-hex-address>.json` (no `0x`
-  prefix), e.g. `f39fd6e51aad88f6f4ce6ab8827279cfffb92266.json`.
+* **One file per account**, named at random: `a_` + 16 random bytes in hex, e.g.
+  `a_3f0c1d9e8b7a6f5e4d3c2b1a09f8e7d6.json`. Which account it is, is in the index (below).
+  An older build named it by its address; the first use moves it to a random name.
 * Each file is a **scrypt-encrypted keystore JSON** (Web3 Secure Storage format)
   produced by `eth-keystore::encrypt_key`. The 32-byte secp256k1 private key is
   the encrypted payload; the password is the scrypt secret.
@@ -1980,7 +2025,7 @@ can still point at one absolute data directory.
   is one `File::create` straight to its destination — its whole public surface is
   path-based, there is no encrypt-to-string — so an in-place write leaves a window
   where a crash TRUNCATES the live vault. The only handle on that write is the
-  directory it writes into, so the module encrypts into `.stage-<addr>/` inside the
+  directory it writes into, so the module encrypts into `.stage-<vault id>/` inside the
   keystore directory (one filesystem, so the rename is atomic) and renames out. The
   file is chmod 0600 while still inside the 0700 stage, so it is never briefly
   world-readable at its real path.
@@ -1992,10 +2037,9 @@ can still point at one absolute data directory.
   window at 0644 at the real path. Directory 0700, file 0600. Its KDF parameters
   are checked (`check_kdf_params`) before decryption, because it is still a file on
   disk that a local attacker can swap for a scrypt bomb.
-* **`groups.json`** and **`accounts.json`** — sidecars beside `labels.json`, read
-  through **ungated** methods for the same stated reason: a derivation path is not a
-  secret, and an attacker holding the directory already reads the addresses off the
-  filenames. Neither ever contains a phrase, a passphrase or a key.
+* **The index** — wallet records, account records and both kinds of name, one document per
+  seed; see *The sealed index*. Read through **ungated** methods, for the seeds unlocked in
+  this process. It never contains a phrase, a passphrase or a key.
 * The group id is `g_` + 16 random bytes in hex. Deliberately **not** the extended
   key's fingerprint, which is public-key-derived and would be a stable cross-machine
   correlator for the same phrase. It is validated as an id before it reaches the
@@ -2003,6 +2047,46 @@ can still point at one absolute data directory.
 * One honest admission: the *existence* of `groups/<id>.json` tells an attacker with
   the directory which wallet is worth cracking. That is unavoidable — the file must
   exist for the feature to exist.
+
+### The sealed index
+
+What older builds kept in four plain documents, and in the vault filenames, says which
+accounts and wallets this keystore holds: addresses, xpubs, derivation paths, names. It now
+lives one document per **seed**, each sealed (XChaCha20-Poly1305) under this module's key for
+that seed from the signer manager, `data_key(seed, "index")`. The manager gives that key once
+the person unlocks the wallet in the Signer app, and the module forgets it when the wallet
+locks, so **a locked wallet's accounts are not listed**: not by `list_accounts`, `list_groups`
+(which counts them as `lockedWallets` and names them as `lockedSeeds`, by the keystore's own
+names for them, for an app's `wallets.unlock` with `signer: "keystore_module"`), `get_provenance`,
+`get_labels`, `kept_phrases`,
+`list_derivation_keys`, nor the account the keystore offers the manager. Its vaults and keys are
+not unexplained or stranded either: `remove_unexplained`, `forget_derivation` and `forget_phrase`
+refuse them until it unlocks.
+
+* **`index.sealed.json`** — `{ v: 1, seeds: { <seed>: <box> } }`, 0600, the box format of
+  `logos.wallets/1`, bound to `keystore_module index` and the seed. Opened with the key of its
+  box's generation and sealed again under the current one.
+* **`seeds.json`** — plain, and only what a locked seed needs: each group's sealed unlock root
+  (so `unlock_key` answers behind the wallet's password while it is locked), the random ids of
+  its vaults, keys and kept phrases, and a check of its unlock key, salted by the seed's id. The
+  check finds a seed that is here and locked when the same phrase or key is imported again, which
+  is refused ("unlock it in the Signer app first") rather than made a second wallet. It is over a
+  key that is never public, so it can't be tested against addresses on a chain.
+* **`index.pending.json`** — a seed's document before its first key: just added (the manager
+  enrols and unlocks it, and the module seals it within a second), or kept by a keystore with no
+  signer manager (the CLI, the tests), where it stays plain as before. `""` holds entries no seed
+  claims, such as a stranded key's name.
+
+The module asks for its keys from threads of its own, on the manager's `wallets_changed` and
+`wallets_locked`, never inside a call the manager made, and announces `accounts_changed` when a
+wallet opens or locks. **A trade-off:** a vault's name no longer says whose it is, so an
+unreadable index refuses signing until it is repaired; the keys themselves are untouched in
+their vaults.
+
+**From an older build.** On first use the four documents move into the index (pending until
+each seed's key comes), every address-named vault takes a random name, and the documents go.
+Each step can be repeated, so a crash part-way finishes on the next start. A key imported on its
+own takes a new `k_` seed, which the manager learns when it is next enrolled.
 
 ### Three states, not two
 
@@ -2026,10 +2110,10 @@ Four reads had that shape, and all four now refuse:
 
 | Read | File | What treating it as empty would have said |
 |------|------|-------------------------------------------|
-| `Keystore::get_groups` | `groups.json` | "no wallets here" → a vault lands with no provenance, and `list_groups` hides a live wallet |
-| `Keystore::get_provenance` | `accounts.json` | "this account came from nowhere" |
-| `Keystore::get_labels` | `labels.json` | "no names" → the next `set_label` erases them all |
-| `Keystore::get_group_labels` | `group-labels.json` | "no wallet names" → the next `set_group_label` erases them all, and every wallet frame falls back to an address that moves |
+| `Keystore::get_groups` | the index | "no wallets here" → a vault lands with no provenance, and `list_groups` hides a live wallet |
+| `Keystore::get_provenance` | the index | "this account came from nowhere" |
+| `Keystore::get_labels` | the index | "no names" → the next `set_label` erases them all |
+| `Keystore::get_group_labels` | the index | "no wallet names" → the next `set_group_label` erases them all, and every wallet frame falls back to an address that moves |
 
 A fifth read used to sit in this table: `on_context_ready` read the role names from
 `<persistence>/keystore.json`, and an unreadable one emptied both roles rather than

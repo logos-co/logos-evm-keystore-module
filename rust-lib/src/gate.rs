@@ -176,9 +176,10 @@ pub const TIER_D_METHODS: &[&str] = &[
     "export_keystore_json",
     "change_password",
     "set_label",
-    // Naming a WALLET, like naming an account: it is written by whoever manages the
-    // keystore, and it is what a reader shows in place of an address.
+    // Naming a WALLET or an account file, like naming an account: it is written by whoever
+    // manages the keystore, and it is what a reader shows in place of an address.
     "set_group_label",
+    "set_wallet_name",
     "delete_account",
     // HD derivation. Deriving an account is a mutation, and it opens a vault whose blast
     // radius is a whole wallet rather than one account — so if anything it belongs here
@@ -215,8 +216,20 @@ pub fn tier_d_admits(method: &str, custodians: &[String], caller: &Caller) -> bo
 
 /// The signer interface's signing calls and the keys an unlock holds — Tier M, the manager's.
 /// The manager enforces which apps an unlock covers; a module reaching these past it would not.
-pub const TIER_M_METHODS: &[&str] =
-    &["sign", "sign_status", "sign_result", "cancel_sign", "unlock", "lock", "database_key", "device_database_key"];
+pub const TIER_M_METHODS: &[&str] = &[
+    "sign",
+    "sign_status",
+    "sign_result",
+    "cancel_sign",
+    "unlock",
+    "lock",
+    "database_key",
+    "device_database_key",
+    "unlock_key",
+    "unlock_key_status",
+    "unlock_key_result",
+    "cancel_unlock_key",
+];
 
 /// Tier M: a configured manager, for a method the registry names.
 pub fn tier_m_admits(method: &str, managers: &[String], caller: &Caller) -> bool {
@@ -324,6 +337,7 @@ mod tests {
             "remove_unexplained",
             "set_label",
             "set_group_label",
+            "set_wallet_name",
         ] {
             assert!(TIER_D_METHODS.contains(&method), "{method} is not gated");
         }

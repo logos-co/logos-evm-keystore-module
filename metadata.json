@@ -8,6 +8,9 @@
   "category": "wallet",
   "main": "keystore_module_plugin",
   "dependencies": [],
+  "interface_dependencies": [
+    { "name": "wallets", "input": "logos-signer-interface", "file": "wallets.lidl" }
+  ],
   "include": [],
   "capabilities": [],
   "codegen": {
