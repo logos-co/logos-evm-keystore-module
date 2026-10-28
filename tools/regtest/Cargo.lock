@@ -3107,7 +3107,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 [[package]]
 name = "logos-signer-interface"
 version = "0.1.0"
-source = "git+https://github.com/logos-co/logos-signer-interface?rev=ca091a9330d455a5b60b80537e34dc535d1e6503#ca091a9330d455a5b60b80537e34dc535d1e6503"
+source = "git+https://github.com/logos-co/logos-signer-interface?rev=d8cfff84327c9b2b5cdb9702d1c4217cad567cee#d8cfff84327c9b2b5cdb9702d1c4217cad567cee"
 dependencies = [
  "bip32",
  "chacha20poly1305",

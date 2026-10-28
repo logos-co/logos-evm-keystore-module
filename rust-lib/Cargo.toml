@@ -54,7 +54,7 @@ scrypt = { version = "0.11", default-features = false }
 chacha20poly1305 = "0.10"
 
 # logos.signer/1: its payload types, signature checks and job bookkeeping.
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca091a9330d455a5b60b80537e34dc535d1e6503" }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d8cfff84327c9b2b5cdb9702d1c4217cad567cee" }
 
 # The Logos runtime SDK is staged by the builder as a sibling crate. It is
 # optional + enabled by the default `logos_module` feature so `cargo test
@@ -70,7 +70,7 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
 
 [dev-dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "ca091a9330d455a5b60b80537e34dc535d1e6503", features = ["conformance", "mock"] }
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d8cfff84327c9b2b5cdb9702d1c4217cad567cee", features = ["conformance", "mock"] }
 
 [features]
 default = ["logos_module"]
