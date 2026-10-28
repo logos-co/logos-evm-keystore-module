@@ -138,6 +138,7 @@ fn run(node: &Node, family: Family) -> Res<()> {
         account: 0,
         password: "pw",
         label: "Regtest",
+        wallet_name: "",
         keep: keystore_module::KeepPhrase::No,
         start: keystore_module::WalletStart::Restored(None),
     })?;

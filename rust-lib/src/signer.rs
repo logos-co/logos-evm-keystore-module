@@ -395,10 +395,7 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
     let provenance = ks.get_provenance().map_err(from_keystore)?;
     let names = ks.get_group_labels().map_err(from_keystore)?;
     let groups = ks.get_groups().map_err(from_keystore)?;
-    let seed_of = |address: &str| {
-        let group = by_address(&provenance, address).map(|p| p.group.clone()).unwrap_or_default();
-        Keystore::seed_of(&groups, &group, address)
-    };
+    let seed_of = |address: &str| by_address(&provenance, address).map(|p| Keystore::seed_of_account(&groups, p));
     // The wallet an EVM account comes from: its group's fingerprint, else one another group of the
     // same seed recorded. An imported key belongs to no wallet.
     let wallet_of = |gid: &str| {
@@ -423,7 +420,7 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
             address: Some(addr.to_string()),
             xpub: None,
             key: None,
-            seed: Some(seed_of(&addr.to_string())),
+            seed: seed_of(&addr.to_string()),
             label: by_address(&labels, &key).cloned().filter(|l| !l.is_empty()),
             available: true,
         });
@@ -445,7 +442,7 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
             address: None,
             xpub: Some(acct.xpub.to_string()),
             key: None,
-            seed: Some(Keystore::seed_of(&groups, &id, "")),
+            seed: Some(Keystore::seed_of_group(&groups, &id)),
             label: names.get(&id).cloned().filter(|l| !l.is_empty()),
             available: true,
         });
@@ -546,6 +543,7 @@ mod tests {
                 account: 0,
                 password: "pw",
                 label: "",
+                wallet_name: "",
                 keep: crate::keystore::KeepPhrase::No,
                 start: crate::keystore::WalletStart::Restored(None),
             })
@@ -730,8 +728,11 @@ mod tests {
         assert_eq!(bitcoin.len(), 2);
         let seed = bitcoin[0].seed.clone().unwrap();
         assert_eq!(bitcoin[1].seed.as_deref(), Some(seed.as_str()), "segwit and taproot of one phrase: one seed");
+        // A key imported on its own is a seed of its own, named at random rather than by its address.
         let imported = listed.iter().find(|a| a.family == Family::Evm).unwrap();
-        assert_eq!(imported.seed.as_deref(), Some(format!("key:{}", imported.id.to_ascii_lowercase()).as_str()));
+        let own = imported.seed.as_deref().unwrap();
+        assert!(own.starts_with("k_") && own != seed, "{own}");
+        assert!(!own.contains(&imported.id.to_ascii_lowercase()[2..]), "{own}");
 
         // The interface's mock holds the same phrase, as a card would: the same key at each index.
         let mut card = logos_signer_interface::mock::MockSigner::new(Default::default());
@@ -761,6 +762,7 @@ mod tests {
                 change: 0,
                 group_password: "",
                 group_label: "Main",
+                wallet_name: "",
                 keep: crate::keystore::KeepPhrase::No,
             })
             .unwrap();
@@ -770,7 +772,10 @@ mod tests {
         ks.change_password(&derived.address.to_string(), "first", "second").unwrap();
         assert!(ks.unlock_key(&e.seed, 0, "first").is_err());
         assert_eq!(ks.unlock_key(&e.seed, 0, "second").unwrap(), e.unlock_key);
-        let groups = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
-        assert!(!groups.contains(&hex::encode(e.unlock_key)), "no unlock key in the clear");
+        let docs: String = ["seeds.json", "index.pending.json"]
+            .iter()
+            .map(|n| std::fs::read_to_string(dir.path().join(n)).unwrap_or_default())
+            .collect();
+        assert!(!docs.is_empty() && !docs.contains(&hex::encode(e.unlock_key)), "no unlock key in the clear");
     }
 }

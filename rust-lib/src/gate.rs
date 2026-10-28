@@ -176,9 +176,10 @@ pub const TIER_D_METHODS: &[&str] = &[
     "export_keystore_json",
     "change_password",
     "set_label",
-    // Naming a WALLET, like naming an account: it is written by whoever manages the
-    // keystore, and it is what a reader shows in place of an address.
+    // Naming a WALLET or an account file, like naming an account: it is written by whoever
+    // manages the keystore, and it is what a reader shows in place of an address.
     "set_group_label",
+    "set_wallet_name",
     "delete_account",
     // HD derivation. Deriving an account is a mutation, and it opens a vault whose blast
     // radius is a whole wallet rather than one account — so if anything it belongs here
@@ -336,6 +337,7 @@ mod tests {
             "remove_unexplained",
             "set_label",
             "set_group_label",
+            "set_wallet_name",
         ] {
             assert!(TIER_D_METHODS.contains(&method), "{method} is not gated");
         }

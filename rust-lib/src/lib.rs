@@ -18,6 +18,10 @@ pub mod layout;
 
 mod keystore;
 
+/// The bookkeeping, one box per seed under this module's key for it from the signer manager, so
+/// a locked wallet's accounts are not listed.
+pub mod index;
+
 /// The acknowledgement a random key is created behind, and the type it produces. Its own
 /// module so the rest of the crate cannot construct that type — only ask for one.
 pub mod ack;

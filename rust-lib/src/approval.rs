@@ -1312,6 +1312,7 @@ mod tests {
                 account: 0,
                 password: "pw",
                 label: "Savings",
+                wallet_name: "",
                 keep: crate::keystore::KeepPhrase::No,
                 start: crate::keystore::WalletStart::Restored(None),
             })
@@ -1387,6 +1388,7 @@ mod tests {
                 account: 0,
                 password: "pw",
                 label: "",
+                wallet_name: "",
                 keep: crate::keystore::KeepPhrase::No,
                 start: crate::keystore::WalletStart::Restored(None),
             })
