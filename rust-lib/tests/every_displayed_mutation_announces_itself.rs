@@ -68,6 +68,10 @@ const SILENT: &[&str] = &[
     "unlocked",
     "database_key",
     "device_wallets",
+    "unlock_key",
+    "unlock_key_status",
+    "unlock_key_result",
+    "cancel_unlock_key",
 ];
 
 /// The file with comments and string literals blanked, byte offsets preserved: brace and

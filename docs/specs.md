@@ -251,6 +251,10 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `sign_status` | `job: String` | `{ ok, job, state, code?, error? }` | no |
 | `sign_result` | `job: String` | `{ ok, job, signatures: [..] }` | no |
 | `cancel_sign` | `job: String` | `{ ok, job }` | no |
+| `unlock_key` | `request_json: String` | `{ ok, job }` | no |
+| `unlock_key_status` | `job: String` | `{ ok, job, state, code?, error? }` | no |
+| `unlock_key_result` | `job: String` | `{ ok, job, key }`, once | no |
+| `cancel_unlock_key` | `job: String` | `{ ok, job }` | no |
 | `unlock` | `params_json: String` | `{ ok, account, expiresInMs, countLeft }` | no |
 | `lock` | `params_json: String` | `{ ok, locked }` | no |
 | `unlocked` | — | `{ ok, unlocked: [..] }` | no |
@@ -1202,7 +1206,7 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 |---|---|
 | `signer_info` | anyone: it describes the kind of signer, not an account |
 | `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
-| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
+| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock_key`, `unlock_key_status`, `unlock_key_result`, `cancel_unlock_key`, `unlock`, `lock`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
 | `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (Tier D) |
 | `device_wallets` | a configured **manager** or **custodian** |
 | `list_phrases` | anyone: ids and the wallets that name them, never words |
@@ -1215,7 +1219,8 @@ module that could reach `sign` past it would sign inside an unlock it was never 
 ### `signer_info() -> String`
 
 `{ ok, interface: "logos.signer/1", kind: "keystore", model: "scrypt key files", families: ["evm",
-"bitcoin", "bitcoin_taproot"], requestKinds: ["hash"], showsRequest: false, collects: "password" }`.
+"bitcoin", "bitcoin_taproot"], requestKinds: ["hash"], showsRequest: false, collects: "password",
+unlockKey: true }`.
 
 ### `signer_accounts() -> String`
 
@@ -1226,6 +1231,31 @@ the master fingerprint of the phrase it was derived from, when known. A Bitcoin 
 fingerprint, xpub, label?, origin?, available: true }`. `origin` is `{ devices, phrase: { id, name },
 kind, path }`, the signer interface's extension: `phrase.id` is the same for every account of one
 phrase, and `name` is one of their wallet names, the same for each.
+
+Every account names its `seed`: the seed link every group of one phrase shares, else its group's id;
+a key imported on its own (by its key, a JSON vault, or at random) is a seed of its own,
+`key:<address>`. The signer manager unlocks that seed's data across every app (see below).
+
+### A seed's unlock key
+
+The signer manager unlocks a wallet's data, in every app, with the public key at
+`m/1280263247'/n'` of its seed, which every holder of the seed gives. The keystore keeps the
+extended key at `m/1280263247'` of each seed it imports, sealed under the password given with it
+(scrypt 2^15, XChaCha20-Poly1305, bound to the group), as the group record's `unlock`, so any index
+derives behind that password and the phrase isn't needed again. Nothing signs under that purpose:
+an item under it is refused. A key imported on its own derives its unlock key from itself.
+`change_password` reseals the root under the new password.
+
+- **`unlock_key`** (`{ seed, index, secret }`, Tier M) answers at once: a job that is `done`, whose
+  `unlock_key_result` gives the 33-byte key, hex, once. No secret is `locked`; a wrong password
+  `wrong_secret`; a seed it doesn't hold `wrong_seed`. A group imported before it kept a root is
+  refused: the person adds it again from its phrase.
+- **Enrolment.** After every import (`import_mnemonic`, `import_seed_wallet`, `import_bitcoin`,
+  `import_private_key`, `import_keystore_json`, `create_unrelated_account`) the keystore tells the
+  manager of the seed, while the password is at hand, so the person never unlocks it twice:
+  `enroll_seed({ seed, kind: "keystore", unlockKey, name, origin?, birthday? })` through
+  `logos.wallets/1` (`wallets.lidl`), bound to `signer_manager_module` at runtime. It is asked
+  without waiting; with no manager installed, the import succeeds all the same.
 
 ### `sign(request_json: String) -> String`
 

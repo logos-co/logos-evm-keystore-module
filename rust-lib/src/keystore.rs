@@ -61,6 +61,24 @@ pub enum KeystoreError {
 
 pub(crate) type Result<T> = std::result::Result<T, KeystoreError>;
 
+/// The prefix of a seed that is one imported key: `key:<address>`.
+pub const IMPORTED_SEED: &str = "key:";
+
+/// What the signer manager is told when a wallet is added here ([`Keystore::enrolment`]).
+pub struct Enrolment {
+    pub seed: String,
+    pub unlock_key: [u8; 33],
+    pub name: String,
+    pub origin: Option<String>,
+    pub birthday: Option<String>,
+}
+
+/// The keystore's documents key accounts by lowercase hex with no `0x`.
+fn by_key<'m, V>(m: &'m BTreeMap<String, V>, address: &str) -> Option<&'m V> {
+    let bare = address.trim_start_matches("0x");
+    m.iter().find(|(k, _)| k.trim_start_matches("0x").eq_ignore_ascii_case(bare)).map(|(_, v)| v)
+}
+
 /// Manages a directory of scrypt vault files. One vault file per account, named
 /// `<lowercase-hex-address>.json`.
 ///
@@ -376,7 +394,95 @@ impl Keystore {
         let key = Zeroizing::new(signer.to_bytes().0);
         drop(signer);
         self.write_vault(&addr, key.as_slice(), new)?;
+        // The wallet's unlock root follows its accounts' password, where `old` sealed it.
+        let group = by_key(&self.get_provenance()?, &addr.to_string()).map(|p| p.group.clone()).unwrap_or_default();
+        if !group.is_empty() {
+            self.reseal_unlock(&group, old, new)?;
+        }
         Ok(addr)
+    }
+
+    fn reseal_unlock(&self, group: &str, old: &str, new: &str) -> Result<()> {
+        let groups = self.get_groups()?;
+        let Some(sealed) = groups.get(group).and_then(|g| g.unlock.clone()) else { return Ok(()) };
+        let Some(root) = crate::unlockkey::open(&sealed, old, group) else { return Ok(()) };
+        let resealed = crate::unlockkey::seal(&root, new, group)?;
+        self.update(&self.groups_path(), |gs: &mut BTreeMap<String, Group>| {
+            if let Some(g) = gs.get_mut(group) {
+                g.unlock = Some(resealed.clone());
+            }
+        })
+    }
+
+    /// The seed an account comes from, as the signer manager knows it: its group's seed link,
+    /// else the group itself; a key imported on its own is a seed of its own.
+    pub fn seed_of(groups: &BTreeMap<String, Group>, group: &str, address: &str) -> String {
+        match groups.get(group) {
+            Some(g) => g.seed.as_ref().map_or_else(|| group.to_string(), |s| s.id.clone()),
+            None => format!("{IMPORTED_SEED}{}", address.trim().to_ascii_lowercase()),
+        }
+    }
+
+    /// A seed's unlock key at `index`, behind the password of one of its groups, or of the
+    /// imported key it is.
+    pub fn unlock_key(&self, seed: &str, index: u32, password: &str) -> Result<[u8; 33]> {
+        let seed = seed.trim();
+        if let Some(address) = seed.strip_prefix(IMPORTED_SEED) {
+            if !self.has_address(address) {
+                return Err(KeystoreError::NotFound(format!("seed {seed}")));
+            }
+            let signer = self.signer_for(address, password)?;
+            let key = Zeroizing::new(signer.to_bytes().0);
+            return crate::unlockkey::of_imported(key.as_slice(), index);
+        }
+        let groups = self.get_groups()?;
+        let of_seed: Vec<(&String, &Group)> = groups
+            .iter()
+            .filter(|(id, g)| g.seed.as_ref().map_or(id.as_str() == seed, |s| s.id == seed))
+            .collect();
+        if of_seed.is_empty() {
+            return Err(KeystoreError::NotFound(format!("seed {seed}")));
+        }
+        let mut sealed_any = false;
+        for (id, g) in of_seed {
+            let Some(sealed) = &g.unlock else { continue };
+            sealed_any = true;
+            if let Some(root) = crate::unlockkey::open(sealed, password, id) {
+                return crate::unlockkey::key_at(&root, index);
+            }
+        }
+        if !sealed_any {
+            return Err(KeystoreError::Refused(
+                "this wallet was added before it kept an unlock key: add it again from its phrase".into(),
+            ));
+        }
+        Err(KeystoreError::Vault("the password for this wallet is not correct".into()))
+    }
+
+    /// What the signer manager is told when an account or a wallet is added here: its seed, its
+    /// unlock key at index 0, the name it goes by, and where its history starts.
+    pub fn enrolment(&self, account_or_group: &str, password: &str) -> Result<Enrolment> {
+        let id = account_or_group.trim();
+        let groups = self.get_groups()?;
+        let names = self.get_group_labels()?;
+        let (seed, name, origin, birthday) = match groups.get(id) {
+            Some(g) => (
+                Self::seed_of(&groups, id, ""),
+                names.get(id).cloned().filter(|n| !n.is_empty()),
+                g.origin.clone(),
+                g.birthday.clone(),
+            ),
+            None => {
+                let addr = parse_address(id)?;
+                let group = by_key(&self.get_provenance()?, &addr.to_string()).map(|p| p.group.clone()).unwrap_or_default();
+                let label = by_key(&self.get_labels()?, &addr.to_string()).cloned().filter(|l| !l.is_empty());
+                let name = names.get(&group).cloned().filter(|n| !n.is_empty()).or(label);
+                (Self::seed_of(&groups, &group, &addr.to_string()), name, None, None)
+            }
+        };
+        let unlock_key = self.unlock_key(&seed, 0, password)?;
+        let name = name.unwrap_or_else(|| format!("Keystore wallet {}", &seed.trim_start_matches(IMPORTED_SEED)[..10.min(seed.len())]));
+        Ok(Enrolment { seed, unlock_key, name, origin, birthday })
     }
 
     /// Human-readable account names. Kept beside the vaults, never inside them: a label is
@@ -909,6 +1015,10 @@ pub struct Group {
     /// The first day the wallet could have received coins, `YYYY-MM-DD` in UTC, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub birthday: Option<String>,
+    /// The seed's unlock root, sealed under this group's password: what unlocks the wallet's data
+    /// in every app. See [`crate::unlockkey`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock: Option<crate::unlockkey::SealedRoot>,
 }
 
 /// Where one account came from. Kept beside the vaults for the same reason labels are: a
@@ -1791,6 +1901,7 @@ impl Keystore {
         let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
 
         let id = new_group_id();
+        let unlock = crate::unlockkey::seal(&*crate::unlockkey::root_of(seed.as_secret())?, req.password, &id)?;
         let record = Group {
             seed: Some(seed_link.clone()),
             storage: req.storage,
@@ -1808,6 +1919,7 @@ impl Keystore {
             phrase: phrase.clone(),
             origin: None,
             birthday: None,
+            unlock: Some(unlock),
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             for old in prior_seeds.keys() {
@@ -2157,6 +2269,7 @@ impl Keystore {
                     chain: None,
                     fingerprint: None,
                     xpub: None,
+                    unlock: None,
                     phrase: None,
                     origin: None,
                     birthday: None,
@@ -2354,6 +2467,7 @@ impl Keystore {
         let (secret, fingerprint) =
             AccountSecret::from_seed(&secp, seed.as_secret(), req.family, req.chain, req.account)?;
         let (seed_link, prior_seeds) = self.seed_link(&seed)?;
+        let unlock_root = crate::unlockkey::root_of(seed.as_secret())?;
         drop(seed);
         let account = AccountPublic {
             family: req.family,
@@ -2378,6 +2492,8 @@ impl Keystore {
         let forget_new_phrase = || self.forget_new_phrase(made, &phrase);
 
         let id = new_group_id();
+        let unlock = crate::unlockkey::seal(&unlock_root, req.password, &id)?;
+        drop(unlock_root);
         let created_ms = now_ms();
         let (origin, birthday) = match req.start {
             WalletStart::Created => ("created", Some(utc_day(created_ms))),
@@ -2399,6 +2515,7 @@ impl Keystore {
             phrase: phrase.clone(),
             origin: Some(origin.into()),
             birthday,
+            unlock: Some(unlock),
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             for old in prior_seeds.keys() {

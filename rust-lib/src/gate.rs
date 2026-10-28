@@ -215,8 +215,20 @@ pub fn tier_d_admits(method: &str, custodians: &[String], caller: &Caller) -> bo
 
 /// The signer interface's signing calls and the keys an unlock holds — Tier M, the manager's.
 /// The manager enforces which apps an unlock covers; a module reaching these past it would not.
-pub const TIER_M_METHODS: &[&str] =
-    &["sign", "sign_status", "sign_result", "cancel_sign", "unlock", "lock", "database_key", "device_database_key"];
+pub const TIER_M_METHODS: &[&str] = &[
+    "sign",
+    "sign_status",
+    "sign_result",
+    "cancel_sign",
+    "unlock",
+    "lock",
+    "database_key",
+    "device_database_key",
+    "unlock_key",
+    "unlock_key_status",
+    "unlock_key_result",
+    "cancel_unlock_key",
+];
 
 /// Tier M: a configured manager, for a method the registry names.
 pub fn tier_m_admits(method: &str, managers: &[String], caller: &Caller) -> bool {
