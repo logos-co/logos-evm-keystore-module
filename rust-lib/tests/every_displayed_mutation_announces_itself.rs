@@ -27,6 +27,7 @@ const ANNOUNCES: &[&str] = &[
     "set_label",
     "set_group_label",
     "set_wallet_name",
+    "restore_unlock_root",
     "remove_group",
     "forget_derivation",
     "remove_unexplained",

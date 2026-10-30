@@ -21,6 +21,7 @@ use logos_signer_interface::wire::{
 use logos_signer_interface::{Signer, INTERFACE};
 
 use crate::btc::{self, AccountPublic, AccountSecret};
+use crate::index::AddAgain;
 use crate::keystore::{Keystore, KeystoreError};
 use crate::locked::LockedBytes;
 
@@ -58,6 +59,16 @@ enum Target {
 impl Target {
     fn resolve(ks: &Keystore, id: &str) -> Result<Target> {
         let unknown = || SignerError::new(ErrorCode::UnknownAccount, format!("no account {id}"));
+        // Not offered to the manager, so not signed for it either: the keys app adds it again.
+        match ks.add_again_of(id).map_err(from_keystore)? {
+            Some(AddAgain::Phrase) => return Err(SignerError::new(ErrorCode::UnknownAccount, format!(
+                "{id} is in a wallet added before wallets could be locked: add its recovery phrase again in the Keys app"
+            ))),
+            Some(AddAgain::Password) => return Err(SignerError::new(ErrorCode::UnknownAccount, format!(
+                "{id} was added before wallets could be locked: add it to the Signer app from the Keys app"
+            ))),
+            None => {}
+        }
         if let Ok(addr) = Address::from_str(id.trim()) {
             return if ks.has_address(&addr.to_string()) { Ok(Target::Evm(addr)) } else { Err(unknown()) };
         }
@@ -408,9 +419,14 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
                 .find_map(|o| o.fingerprint.clone())
         })
     };
+    // An older build's wallet the manager can't be asked for is left out until it is added again.
+    let waiting = ks.add_again().map_err(from_keystore)?;
     let mut out = Vec::new();
     for addr in ks.list_accounts().map_err(from_keystore)? {
         let key = addr.to_string().to_ascii_lowercase();
+        if seed_of(&key).is_some_and(|s| waiting.contains_key(&s)) {
+            continue;
+        }
         out.push(Account {
             id: addr.to_string(),
             family: Family::Evm,
@@ -426,6 +442,9 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
         });
     }
     for id in ks.bitcoin_groups().map_err(from_keystore)? {
+        if waiting.contains_key(&Keystore::seed_of_group(&groups, &id)) {
+            continue;
+        }
         let Ok((acct, _)) = ks.bitcoin_account(&id) else { continue };
         out.push(Account {
             id: id.clone(),

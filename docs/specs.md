@@ -219,7 +219,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `create_unrelated_account` | `params_json: String` | `{ ok, address, origin }`, or a refusal without the acknowledgement | yes → event |
 | `forget_derivation` | `params_json: String` | `{ ok, group, storage, recordUpdated, stranded, stagedRemoved }` | no |
 | `remove_group` | `params_json: String` | `{ ok, group, recordRemoved, nameRemoved }` | no — refuses while the wallet holds a key or an account |
-| `list_groups` | — | `{ ok, groups: [..] }` | no |
+| `list_groups` | — | `{ ok, groups: [..], lockedWallets, lockedSeeds, addAgain: [..] }` | no |
 | `list_derivation_keys` | — | `{ ok, groups: [id, ..], staged: [id, ..], unexplained: [path, ..], links: [..] }` | no |
 | `get_provenance` | — | `{ ok, accounts: {..} }` | no |
 | `get_account_wallets` | — | `{ ok, wallets: { <address>: { wallet, index? } } }` | no |
@@ -235,6 +235,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `get_labels` | — | `{ ok, labels: { <address>: <name> } }` | no |
 | `set_group_label` | `params_json: String` | `{ ok }` | no |
 | `set_wallet_name` | `params_json: String` | `{ ok }` | no |
+| `restore_unlock_root` | `params_json: String` | `{ ok, seed }`: an older build's wallet, added again so the signer manager can unlock it. Tier D | no — the wallet is offered to the manager again → event |
 | `get_group_labels` | — | `{ ok, labels: { <groupId>: <name> } }` | no |
 | `request_approval` | `intent_json: String` | `{ ok, handle, receipt, state }` | no |
 | `approval_status` | `handle, receipt: String` | `{ ok, state, reason? }` | no |
@@ -978,6 +979,11 @@ and `chain`, and any wallet made from a kept phrase carries its id as `phrase`
 *file*, not just the recorded choice, so a deleted key reads as "not derivable"
 rather than as a promise.
 
+`needsPhrase` marks a file of an older build's wallet that keeps no unlock root, and the reply's
+`addAgain` names each such wallet: `{ seed, needs: "phrase" | "password", groups, accounts }` (see
+*An older build's wallet the manager was never told of*). `lockedWallets` and `lockedSeeds` count
+and name the wallets locked in the Signer app, which are not listed.
+
 `stranded` marks a derivation key on disk that **no record names**. It is listed
 rather than hidden: it cannot derive (there is no recorded path prefix to derive
 against) but it is live whole-wallet material, and hiding it is what made it
@@ -1241,6 +1247,10 @@ fingerprint, xpub, label?, origin?, available: true }`. `origin` is `{ devices, 
 kind, path }`, the signer interface's extension: `phrase.id` is the same for every account of one
 phrase, and `name` is one of their wallet names, the same for each.
 
+An older build's wallet the signer manager was never told of is left out until it is added again
+(`restore_unlock_root`), and `sign` and `unlock` refuse it as `unknown_account`, saying so: the manager
+could not unlock it, so an app offering its accounts could only fail at the send.
+
 Every account names its `seed`: the seed link every group of one phrase shares, else its group's id;
 a key imported on its own (by its key, a JSON vault, or at random) is a seed of its own, `k_` + 16
 random bytes in hex, never its address: the name shows while the wallet is locked. The signer
@@ -1260,6 +1270,9 @@ an item under it is refused. A key imported on its own derives its unlock key fr
   `unlock_key_result` gives the 33-byte key, hex, once. No secret is `locked`; a wrong password
   `wrong_secret`; a seed it doesn't hold `wrong_seed`. A group imported before it kept a root is
   refused: the person adds it again from its phrase.
+- **Older builds' wallets.** A wallet added before the keystore kept a root has no unlock key
+  until its phrase comes again, and a key imported before #35 took a new `k_` seed the manager
+  never heard of; see *An older build's wallet the manager was never told of*.
 - **Enrolment.** After every import (`import_mnemonic`, `import_seed_wallet`, `import_bitcoin`,
   `import_private_key`, `import_keystore_json`, `create_unrelated_account`) the keystore tells the
   manager of the seed, while the password is at hand, so the person never unlocks it twice:
@@ -1407,7 +1420,7 @@ Every request is classified by the **caller identity** the platform reports
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
 | **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity`, `list_phrases` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (default `evm_keystore_ui`) |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `restore_unlock_root`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (default `evm_keystore_ui`) |
 | **M** | the signer interface's signing calls and the keys an unlock holds — see [the keystore as a signer](#the-keystore-as-a-signer-logossigner1) | a configured **manager** (default `signer_manager_module`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
@@ -2087,6 +2100,34 @@ their vaults.
 each seed's key comes), every address-named vault takes a random name, and the documents go.
 Each step can be repeated, so a crash part-way finishes on the next start. A key imported on its
 own takes a new `k_` seed, which the manager learns when it is next enrolled.
+
+#### An older build's wallet the manager was never told of
+
+Some of those seeds' keys can never come. A wallet whose files keep **no unlock root** (added
+before the keystore kept one) can't give its unlock key, and a key imported on its own took a new
+`k_` seed in the move, with **no check** of its unlock key: the manager was never told of either,
+and the keystore can't tell it without what the person brings. Such a seed is plain in
+`index.pending.json` with no `check`, and:
+
+* its accounts are **listed** by this module's own reads, as they always were, and `list_groups`
+  names it in `addAgain` (`needs: "phrase"` for a wallet, `"password"` for a key) and marks its
+  files `needsPhrase`, so the keys app says what it needs;
+* it is **not offered** to the manager: `signer_accounts` leaves it out, so no app lists an account
+  whose send could only end at "unlock it in the Signer app", where it isn't; `sign` and `unlock`
+  refuse it as `unknown_account`, and its key is never asked for;
+* **`restore_unlock_root`** adds it again (Tier D). `{ group | account, phrase | keptPhrase +
+  phrasePassword, passphrase?, password }` for a wallet: the phrase is checked against the accounts
+  the file already holds, the password must open one of them (a file with no account: its key),
+  and the root is sealed under it, as an import seals it, with the seed's check and the link the
+  phrase's other files share. The seed keeps its id unless another file of the phrase already
+  names one. `{ account, password }` for a key: the password opens it, and its check is recorded.
+  No account is added, no vault is written, and a name stays. It is enrolled as an import is, the
+  manager unlocks it at once, and the module seals its document within a second. `{ ok, seed }`;
+  a seed that needs nothing is refused.
+
+Adding another account from the phrase also adds the wallet again: the new file keeps a root, and
+the older ones join its seed. Importing the account it already holds would move the account into
+a new file instead, which is why the keys app refuses it and offers `restore_unlock_root`.
 
 ### Three states, not two
 

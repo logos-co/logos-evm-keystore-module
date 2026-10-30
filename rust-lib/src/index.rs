@@ -144,6 +144,24 @@ pub fn check_of(seed: &str, unlock_key: &[u8; 33]) -> String {
     hex::encode(h.finalize())
 }
 
+/// What an older build's wallet needs before the signer manager can be asked for its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddAgain {
+    /// None of its files keeps an unlock root: its phrase, typed again.
+    Phrase,
+    /// A key it never told the manager of: its password, which opens the key.
+    Password,
+}
+
+impl AddAgain {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Phrase => "phrase",
+            Self::Password => "password",
+        }
+    }
+}
+
 /// The files of seeds that are locked here: listed by nothing until they unlock.
 #[derive(Clone, Debug, Default)]
 pub struct Hidden {
@@ -281,7 +299,8 @@ impl State {
     }
 
     /// Seeds still waiting for a key, and sealed seeds this process can't open with the
-    /// generation their box needs.
+    /// generation their box needs. An older build's wallet the manager was never told of waits
+    /// for nothing until it is added again.
     pub fn closed(&self) -> Vec<(String, Option<u32>)> {
         let mut out: Vec<(String, Option<u32>)> = self
             .sealed
@@ -289,12 +308,37 @@ impl State {
             .filter(|(s, _)| !self.open.contains_key(*s))
             .map(|(s, b)| (s.clone(), wallets::generation(b).ok()))
             .collect();
+        let waiting = self.add_again();
         out.extend(
             self.pending
                 .keys()
-                .filter(|s| s.as_str() != UNCLAIMED && !self.sealed.contains_key(*s))
+                .filter(|s| s.as_str() != UNCLAIMED && !self.sealed.contains_key(*s) && !waiting.contains_key(*s))
                 .map(|s| (s.clone(), None)),
         );
+        out
+    }
+
+    /// Plain seeds an older build added that the signer manager was never told of, and can't be
+    /// from what is here: no check of an unlock key, and either no file that keeps an unlock root
+    /// or a key on its own, which gives its unlock key behind its password.
+    pub fn add_again(&self) -> BTreeMap<String, AddAgain> {
+        let mut out = BTreeMap::new();
+        for (seed, doc) in &self.pending {
+            if seed == UNCLAIMED || self.sealed.contains_key(seed) {
+                continue;
+            }
+            let files = SeedFiles::of(doc);
+            if files.check.is_some() {
+                continue;
+            }
+            if seed.starts_with(crate::keystore::IMPORTED_SEED) {
+                if !files.vaults.is_empty() {
+                    out.insert(seed.clone(), AddAgain::Password);
+                }
+            } else if !files.groups.is_empty() && files.groups.values().all(Option::is_none) {
+                out.insert(seed.clone(), AddAgain::Phrase);
+            }
+        }
         out
     }
 }

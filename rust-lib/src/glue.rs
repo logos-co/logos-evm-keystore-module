@@ -19,6 +19,7 @@ use crate::ack::Unrecoverable;
 use crate::approval::Approvals;
 use crate::btc::{Chain as BtcChain, Family as BtcFamily};
 use crate::gate;
+use crate::index::AddAgain;
 use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
 use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
 use crate::{BitcoinImport, WalletStart};
@@ -88,11 +89,17 @@ pub trait KeystoreModule: Send + 'static {
     /// writers that do, each keeping its own acknowledgement. Because "holds nothing" is the
     /// precondition, nothing signable is at stake and no password is asked for.
     fn remove_group(&mut self, params_json: String) -> String;
-    /// Derivation groups, `{ ok, groups: [...], lockedWallets, lockedSeeds }`. UNGATED, like `get_labels`: a
-    /// wallet showing an account picker needs it. Includes STRANDED groups — a derivation key on
-    /// disk that no record names. A wallet locked in the Signer app is not listed, only counted.
-    /// Each group's `label` is its own name; `walletName` is its seed's.
+    /// Derivation groups, `{ ok, groups: [...], lockedWallets, lockedSeeds, addAgain }`. UNGATED, like
+    /// `get_labels`: a wallet showing an account picker needs it. Includes STRANDED groups — a
+    /// derivation key on disk that no record names. A wallet locked in the Signer app is not
+    /// listed, only counted. Each group's `label` is its own name; `walletName` is its seed's.
+    /// `addAgain` names older builds' wallets the signer manager can't be asked for, `{ seed,
+    /// needs: "phrase" | "password", groups, accounts }`, and their files carry `needsPhrase`.
     fn list_groups(&mut self) -> String;
+    /// Add an older build's wallet again, so the signer manager can unlock it: `{ group, phrase |
+    /// keptPhrase + phrasePassword, passphrase?, password }` records its unlock root, `{ account,
+    /// password }` an imported key's check; then it is enrolled. → `{ ok, seed }`.
+    fn restore_unlock_root(&mut self, params_json: String) -> String;
     /// Name a wallet — every account file of one seed — `{ group, label, address?, password? }`
     /// → `{ ok }`, `group` being any file of it, priced as `set_group_label` prices a name.
     fn set_wallet_name(&mut self, params_json: String) -> String;
@@ -743,6 +750,65 @@ impl KeystoreModule for KeystoreModuleImpl {
         }
     }
 
+    fn restore_unlock_root(&mut self, params_json: String) -> String {
+        if !self.may_mutate("restore_unlock_root") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        #[derive(Deserialize)]
+        struct Params {
+            #[serde(default)]
+            group: String,
+            #[serde(default)]
+            account: String,
+            #[serde(default)]
+            phrase: String,
+            #[serde(default, rename = "keptPhrase")]
+            kept_phrase: Option<String>,
+            #[serde(default, rename = "phrasePassword")]
+            phrase_password: String,
+            #[serde(default)]
+            passphrase: String,
+            password: String,
+        }
+        let p: Params = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let (typed, passphrase, password, phrase_password) = (
+            Zeroizing::new(p.phrase),
+            Zeroizing::new(p.passphrase),
+            Zeroizing::new(p.password),
+            Zeroizing::new(p.phrase_password),
+        );
+        let target = match (p.group.trim(), p.account.trim()) {
+            (g, "") if !g.is_empty() => g.to_string(),
+            ("", a) if !a.is_empty() => a.to_string(),
+            _ => return err("name the wallet's group, or the account"),
+        };
+        let ks = match self.ks() {
+            Ok(ks) => ks,
+            Err(e) => return err(e),
+        };
+        // A key needs no phrase; a wallet's comes typed or from where it is kept.
+        let phrase = if p.kept_phrase.is_none() && typed.trim().is_empty() {
+            typed
+        } else {
+            match words_and_keep(ks, typed, p.kept_phrase.as_deref(), None, &phrase_password) {
+                Ok((words, _)) => words,
+                Err(e) => return err(e),
+            }
+        };
+        match ks.restore_unlock_root(&target, &phrase, &passphrase, &password) {
+            Ok(seed) => {
+                self.announce();
+                self.enroll(&target, &password);
+                json!({ "ok": true, "seed": seed }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
     fn import_seed_wallet(&mut self, params_json: String) -> String {
         let mut params = Zeroizing::new(params_json);
         if !self.may_mutate("import_seed_wallet") {
@@ -1032,11 +1098,11 @@ impl KeystoreModule for KeystoreModuleImpl {
 
     fn list_groups(&mut self) -> String {
         let res = match self.ks() {
-            Ok(ks) => ks.list_groups().and_then(|rows| Ok((rows, ks.wallet_names()?))),
+            Ok(ks) => ks.list_groups().and_then(|rows| Ok((rows, ks.wallet_names()?, ks.add_again_list()?))),
             Err(e) => return err(e),
         };
         match res {
-            Ok((rows, wallet_names)) => {
+            Ok((rows, wallet_names, again)) => {
                 let groups: Vec<_> = rows
                     .into_iter()
                     .map(|g| {
@@ -1058,11 +1124,19 @@ impl KeystoreModule for KeystoreModuleImpl {
                             "stranded": g.stranded, "staged": g.staged,
                             "family": g.group.family, "chain": g.group.chain,
                             "phrase": g.group.phrase, "preview": preview,
+                            "needsPhrase": again.iter().any(|a| a.needs == AddAgain::Phrase && a.groups.contains(&g.id)),
                         })
                     })
                     .collect();
                 let locked = self.ks().ok().and_then(|ks| ks.locked_seeds().ok()).unwrap_or_default();
-                json!({ "ok": true, "groups": groups, "lockedWallets": locked.len(), "lockedSeeds": locked }).to_string()
+                let add_again: Vec<_> = again
+                    .iter()
+                    .map(|a| json!({ "seed": a.seed, "needs": a.needs.as_str(), "groups": a.groups,
+                                     "accounts": a.accounts.iter().map(|x| x.to_string()).collect::<Vec<_>>() }))
+                    .collect();
+                json!({ "ok": true, "groups": groups, "lockedWallets": locked.len(), "lockedSeeds": locked,
+                        "addAgain": add_again })
+                .to_string()
             }
             Err(e) => err(e),
         }
