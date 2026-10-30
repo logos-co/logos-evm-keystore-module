@@ -7552,6 +7552,15 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_install_has_no_older_keystore_to_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("keystore");
+        let ks = Keystore::new(older.join(layout::CURRENT));
+        assert_eq!(ks.older(&older).unwrap(), Older::default());
+        assert_eq!(ks.move_older(&older).unwrap(), Older::default());
+    }
+
+    #[test]
     fn an_older_scan_skips_this_builds_directory_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let v2 = dir.path().join(layout::CURRENT);
