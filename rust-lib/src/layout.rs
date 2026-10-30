@@ -328,7 +328,6 @@ impl Scan {
     pub fn unexplained_all(&self) -> Vec<String> {
         let mut out = self.stray();
         out.extend(self.doc_stages.iter().cloned());
-        out.extend(self.os_files.iter().cloned());
         out.sort();
         out.dedup();
         out
@@ -1126,8 +1125,7 @@ mod tests {
         let s = scan(&root).unwrap();
         assert_eq!(s.os_files, want, "{s:?}");
         assert!(s.stray().is_empty() && s.possible_key_material().is_empty(), "{s:?}");
-        // Still removable by name: named by the scan, like everything it found.
-        assert!(want.iter().all(|w| s.unexplained_all().contains(w)), "{s:?}");
+        assert!(s.unexplained_all().is_empty(), "{s:?}");
     }
 
     #[test]

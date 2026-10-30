@@ -878,6 +878,8 @@ impl Keystore {
         let scan = self.scan()?;
         let mut reported = scan.unexplained_all();
         reported.extend(self.unnamed_vaults(&scan, &self.view()?)?);
+        // Never reported, but a file browser's own file is as removable as anything named.
+        reported.extend(scan.os_files.iter().cloned());
         if !reported.iter().any(|p| p == rel) {
             return Err(KeystoreError::NotFound(format!("{rel} is not reported as unexplained")));
         }
@@ -6796,6 +6798,7 @@ mod tests {
         std::fs::write(dir.path().join("groups").join(".DS_Store"), ds).unwrap();
 
         assert!(ks.unexplained().unwrap().is_empty());
+        assert!(ks.settle().unwrap().left.unexplained_all().is_empty());
         assert!(ks.listed_group_store().unwrap().possible_keys.is_empty());
         assert!(ks.create_unrelated_account("pw", acked()).is_ok());
         assert!(ks.remove_unexplained("groups/.DS_Store", true).unwrap());
