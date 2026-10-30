@@ -491,8 +491,9 @@ Two fields beyond the addresses, both of which used to be dropped in silence:
   path (it is the ONLY copy of that key) or reaping it when the real vault is
   already there. It is non-empty only when the repair itself could not run.
 * **`unexplained`** — paths under the keystore directory that this module did not
-  write: a hand-placed `backup.json`, a `.DS_Store`, a leftover from an older
-  version. **Reported, not refused** — listing and signing keep working whatever
+  write: a hand-placed `backup.json`, a leftover from an older version. A file
+  browser's own files (`.DS_Store` and the like, see *possible key material*) are not
+  listed. **Reported, not refused** — listing and signing keep working whatever
   is here, and a wallet must not be bricked by a stray file. Both severities appear
   (see *possible key material* below): a bucket is a severity, never a filter on
   what a reader is shown.
@@ -1976,9 +1977,18 @@ evidence is:
 * its **name** — `g_<32 hex>.json`, a bare `g_<32 hex>`, or `.stage-g_<32 hex>`: a
   name this module could only have written for a derivation key;
 * its **bytes** — a Web3 Secure Storage vault, which is the shape of an account key
-  and a derivation key alike, and telling the two apart needs the password;
+  and a derivation key alike, and telling the two apart needs the password. A vault is
+  JSON text (UTF-8, or UTF-16 behind its byte-order mark), so a file read in full that
+  is no text at all is not one;
 * whether it could be **looked inside at all** — a directory that cannot be
-  enumerated, or one deeper than the layout explains, is not an empty one.
+  enumerated, a file that cannot be opened, or a directory deeper than the layout
+  explains is not an empty one.
+
+What a file browser writes into any folder it shows — Finder's `.DS_Store` and `._*`,
+Explorer's `Thumbs.db` and `desktop.ini`, Dolphin's `.directory` — is filed as
+`os_files` when it is a file, was read in full, and holds no vault, wherever it sits,
+`groups/` included. It is not reported, and it stays removable by name. A vault under
+one of those names, or one that cannot be opened, is judged like any other file.
 
 Sitting under `groups/` adds to that and never subtracts. Keying the split on that
 prefix alone was a defect: the same 594-byte vault one directory over
@@ -2414,8 +2424,14 @@ BITCOIND_EXE=$(nix build nixpkgs#bitcoind --no-link --print-out-paths)/bin/bitco
   which is the wedge this round removed.
 * `a_stray_path_is_reported_and_wedges_nothing` — an unreadable `groups/`, an unreadable
   directory at the root, a vault-shaped file under a name that says nothing, and a plain
-  `.DS_Store`: each is reported by name, each leaves listing, signing, `settle` and an
+  `notes.txt`: each is reported by name, each leaves listing, signing, `settle` and an
   acknowledged account working, and each is removable by name.
+* `finders_ds_store_is_not_reported_as_a_possible_key` — a real, binary `.DS_Store` at
+  the root and in `groups/` is not reported, and is removable by name. Read as text it
+  failed to read, and "could not look" made it possible key material. With it, in
+  `layout`: `a_binary_file_is_read_and_is_not_a_vault`,
+  `a_file_browsers_own_files_are_no_key_and_are_not_reported`, and
+  `a_vault_wearing_a_file_browsers_name_is_still_possible_key_material`.
 * `there_is_no_unlocked_state_to_reuse` — the structural guarantee: nothing
   survives a signing call that a later caller could reuse.
 * `sign_message_recovers_signer` — EIP-191 signature recovers to the signer.
