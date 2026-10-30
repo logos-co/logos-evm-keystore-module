@@ -28,7 +28,7 @@ use crate::ack::Unrecoverable;
 use crate::atomic;
 use crate::btc::{self, AccountPublic, AccountSecret, Chain, Family};
 use crate::hd::{self, Bip44Path, Seed};
-use crate::index::{self, KeyRing, SeedDoc};
+use crate::index::{self, AddAgain, KeyRing, SeedDoc};
 use crate::layout::{self, Doc, Root, Scan, Slot, StageKind};
 
 #[derive(Debug, Error)]
@@ -581,6 +581,133 @@ impl Keystore {
             if seed.starts_with(IMPORTED_SEED) { "Imported key".into() } else { "Keystore wallet".into() }
         });
         Ok(Enrolment { seed, unlock_key, name, origin, birthday })
+    }
+
+    /// Older builds' wallets the signer manager can't be asked for until the person adds them
+    /// again, by seed.
+    pub fn add_again(&self) -> Result<BTreeMap<String, AddAgain>> {
+        Ok(self.view()?.add_again())
+    }
+
+    /// Each of them with its files and accounts, as the keys app shows them.
+    pub fn add_again_list(&self) -> Result<Vec<AddAgainView>> {
+        let state = self.view()?;
+        let doc = state.merged();
+        Ok(state
+            .add_again()
+            .into_iter()
+            .map(|(seed, needs)| AddAgainView {
+                groups: doc.groups.keys().filter(|g| index::group_seed(&doc, &state, g) == seed).cloned().collect(),
+                accounts: doc
+                    .accounts
+                    .iter()
+                    .filter(|(_, p)| index::account_seed(&doc, &state, p) == seed)
+                    .filter_map(|(a, _)| parse_address(a).ok())
+                    .collect(),
+                seed,
+                needs,
+            })
+            .collect())
+    }
+
+    /// What an account (by address) or a file (by id) still needs, if its seed is one of those.
+    pub fn add_again_of(&self, account_or_group: &str) -> Result<Option<AddAgain>> {
+        let state = self.view()?;
+        let waiting = state.add_again();
+        if waiting.is_empty() {
+            return Ok(None);
+        }
+        let doc = state.merged();
+        let id = account_or_group.trim();
+        let seed = if doc.groups.contains_key(id) {
+            index::group_seed(&doc, &state, id)
+        } else {
+            match parse_address(id).ok().and_then(|a| doc.accounts.get(&addr_key(&a))) {
+                Some(p) => index::account_seed(&doc, &state, p),
+                None => return Ok(None),
+            }
+        };
+        Ok(waiting.get(&seed).copied())
+    }
+
+    /// Add an older build's wallet again, so the signer manager can be told of it: a file's
+    /// phrase, checked against the accounts it holds, gives its unlock root, sealed under the
+    /// password of one of them; an imported key gives its own, behind its password. Nothing
+    /// else changes: no account is added and no vault written. Answers the seed.
+    pub fn restore_unlock_root(&self, account_or_group: &str, phrase: &str, passphrase: &str, password: &str) -> Result<String> {
+        let id = account_or_group.trim();
+        let state = self.view()?;
+        let doc = state.merged();
+        let (group, seed_id) = if doc.groups.contains_key(id) {
+            (id.to_string(), index::group_seed(&doc, &state, id))
+        } else {
+            let addr = parse_address(id).map_err(|_| KeystoreError::NotFound(id.to_string()))?;
+            let p = doc.accounts.get(&addr_key(&addr)).ok_or_else(|| KeystoreError::NotFound(addr.to_string()))?;
+            (p.group.clone(), index::account_seed(&doc, &state, p))
+        };
+        match state.add_again().get(&seed_id) {
+            None => Err(KeystoreError::Refused("this wallet keeps its unlock key already".into())),
+            Some(AddAgain::Password) => self.restore_key_check(&parse_address(id)?, password),
+            Some(AddAgain::Phrase) => self.restore_group_root(&group, &seed_id, &doc, phrase, passphrase, password),
+        }
+    }
+
+    fn restore_group_root(&self, group: &str, seed_id: &str, doc: &SeedDoc, phrase: &str, passphrase: &str, password: &str) -> Result<String> {
+        if phrase.trim().is_empty() {
+            return Err(KeystoreError::InvalidParams("this wallet is added again from its recovery phrase".into()));
+        }
+        let seed = Seed::from_mnemonic(phrase, passphrase)?;
+        if !self.seed_matches_group(&seed, group, &doc.groups[group])? {
+            return Err(KeystoreError::Refused(
+                "this recovery phrase and passphrase are not this wallet's".into(),
+            ));
+        }
+        // Under the password of its accounts, as an import seals it and `change_password`
+        // reseals it; a file with no account has only its key's.
+        match doc.accounts.iter().find(|(_, p)| p.group == group) {
+            Some((addr, _)) => self.prove_custody(addr, password)?,
+            None => self.prove_group_custody(&self.group_store()?, group, password)?,
+        }
+        let (link, prior, check) = self.seed_link(&seed, Some(seed_id))?;
+        let root = crate::unlockkey::root_of(seed.as_secret())?;
+        let unlock = crate::unlockkey::seal(&root, password, group)?;
+        let fingerprint = btc::master_fingerprint(seed.as_secret())?.to_string();
+        self.update_index(|d| {
+            for old in prior.keys() {
+                if let Some(g) = d.groups.get_mut(old) {
+                    g.seed = Some(link.clone());
+                    g.fingerprint.get_or_insert_with(|| fingerprint.clone());
+                }
+            }
+            if let Some(g) = d.groups.get_mut(group) {
+                g.unlock = Some(unlock);
+                g.check = Some(check);
+            }
+            // Joined to another file's seed: its name goes with it, unless that one has one.
+            if link.id != seed_id {
+                if let Some(name) = d.wallet_names.remove(seed_id) {
+                    d.wallet_names.entry(link.id.clone()).or_insert(name);
+                }
+            }
+        })?;
+        Ok(link.id)
+    }
+
+    fn restore_key_check(&self, addr: &Address, password: &str) -> Result<String> {
+        let signer = self.signer_for(&addr.to_string(), password).map_err(|e| match e {
+            KeystoreError::Vault(_) => KeystoreError::Vault("the password for this account is not correct".into()),
+            other => other,
+        })?;
+        let key = Zeroizing::new(signer.to_bytes().0);
+        let unlock = crate::unlockkey::of_imported(key.as_slice(), 0)?;
+        let k = addr_key(addr);
+        self.update_accounts(|all| {
+            all.get_mut(&k).map(|p| {
+                p.check = Some(index::check_of(&p.seed, &unlock));
+                p.seed.clone()
+            })
+        })?
+        .ok_or_else(|| KeystoreError::NotFound(addr.to_string()))
     }
 
     /// Human-readable account names, in the index beside the accounts they name: readable while
@@ -1210,6 +1337,15 @@ pub struct PreviewEntry {
     pub path: String,
     pub address: Address,
     pub present: bool,
+}
+
+/// An older build's wallet to add again: its seed, what it needs, and its files and accounts.
+#[derive(Clone, Debug)]
+pub struct AddAgainView {
+    pub seed: String,
+    pub needs: AddAgain,
+    pub groups: Vec<String>,
+    pub accounts: Vec<Address>,
 }
 
 /// A group as a reader sees it — no secrets, so this is served ungated.
@@ -2190,8 +2326,9 @@ impl Keystore {
 
     /// The seed link a new group of this seed takes, the older groups that learn it, and the
     /// seed's check. Refuses a seed that is here already in a wallet that is locked: its
-    /// groups can't be read, so a new one would be a second wallet of the same seed.
-    fn seed_link(&self, seed: &Seed) -> Result<(SeedLink, BTreeMap<String, Option<SeedLink>>, String)> {
+    /// groups can't be read, so a new one would be a second wallet of the same seed. With no
+    /// link yet, `keep` names the seed, else a new id does.
+    fn seed_link(&self, seed: &Seed, keep: Option<&str>) -> Result<(SeedLink, BTreeMap<String, Option<SeedLink>>, String)> {
         let unlock = crate::unlockkey::key_at(&*crate::unlockkey::root_of(seed.as_secret())?, 0)?;
         if let Some(locked) = self.view()?.locked_seed_of(&unlock) {
             return Err(KeystoreError::Refused(format!(
@@ -2212,7 +2349,7 @@ impl Keystore {
         let link = match link {
             Some(link) => link,
             None => {
-                let id = new_group_id();
+                let id = keep.map_or_else(new_group_id, str::to_string);
                 SeedLink { check: Self::seed_check(seed, &id)?, id }
             }
         };
@@ -2239,7 +2376,7 @@ impl Keystore {
         }
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let account_key = seed.account_key(path.account)?;
-        let (seed_link, prior_seeds, check) = self.seed_link(&seed)?;
+        let (seed_link, prior_seeds, check) = self.seed_link(&seed, None)?;
         let fingerprint = btc::master_fingerprint(seed.as_secret())?.to_string();
         let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
 
@@ -2825,7 +2962,7 @@ impl Keystore {
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let (secret, fingerprint) =
             AccountSecret::from_seed(&secp, seed.as_secret(), req.family, req.chain, req.account)?;
-        let (seed_link, prior_seeds, check) = self.seed_link(&seed)?;
+        let (seed_link, prior_seeds, check) = self.seed_link(&seed, None)?;
         let unlock_root = crate::unlockkey::root_of(seed.as_secret())?;
         drop(seed);
         let account = AccountPublic {
@@ -6940,5 +7077,176 @@ mod tests {
         ks2.import_mnemonic_ex(&ImportRequest { index: 1, group_label: "Two", ..req(Storage::Plain, 0) }).unwrap();
         ks2.set_wallet_name(&rename_as(&x.group, "Both", &x.address.to_string(), "pw")).unwrap();
         assert_eq!(ks2.get_group_labels().unwrap().len(), 2);
+    }
+
+    // ---- an older build's wallet the signer manager can't be asked for --------------
+
+    const OLD_GROUP: &str = "g_0ddba11000000000000000000000000a";
+
+    /// An older build's four documents and its address-named vault, as it left them. With
+    /// `group`, the account was derived from TEST_MNEMONIC by a file that keeps no unlock root;
+    /// without, it is a key imported on its own.
+    fn older_build(dir: &std::path::Path, group: bool) {
+        let other = tempfile::tempdir().unwrap();
+        let tmp = Keystore::new(other.path());
+        tmp.import_private_key(ACCT0_PK, "pw").unwrap();
+        std::fs::copy(vault_file(&tmp, &ACCT0), dir.join(format!("{}.json", addr_key(&ACCT0)))).unwrap();
+        let g = OLD_GROUP;
+        let (groups, account, names) = if group {
+            (
+                format!(r#"{{"{g}":{{"storage":"plain","pathPrefix":"m/44'/60'/0'","nextIndex":1,"retired":[],"usedPassphrase":false,"label":"","createdMs":1700000000000}}}}"#),
+                format!(r#"{{"origin":"derived","group":"{g}","path":"m/44'/60'/0'/0/0","index":0}}"#),
+                format!(r#"{{"{g}":"asd"}}"#),
+            )
+        } else {
+            ("{}".to_string(), r#"{"origin":"imported-key"}"#.to_string(), "{}".to_string())
+        };
+        for (name, body) in [
+            ("groups.json", groups),
+            ("accounts.json", format!(r#"{{"{}":{account}}}"#, addr_key(&ACCT0))),
+            ("labels.json", "{}".to_string()),
+            ("group-labels.json", names),
+        ] {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+    }
+
+    fn offered(ks: &Keystore) -> Vec<String> {
+        crate::signer::accounts(ks).unwrap().into_iter().map(|a| a.id.to_ascii_lowercase()).collect()
+    }
+
+    /// The signer interface's `sign`, as the manager calls it.
+    fn sign_for_manager(ks: &Keystore) -> std::result::Result<String, logos_signer_interface::wire::SignerError> {
+        use logos_signer_interface::wire::{HashItem, Payload, Scheme, Secret, SignRequest};
+        use logos_signer_interface::Signer;
+        let (mut unlocks, mut jobs) = (crate::signer::Unlocks::default(), logos_signer_interface::jobs::JobTable::new());
+        let mut keys = logos_signer_interface::jobs::KeyJobs::new();
+        let mut s = crate::signer::KeystoreSigner { ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
+        s.sign(SignRequest {
+            account: ACCT0.to_string(),
+            payload: Payload::Hash { items: vec![HashItem { path: None, scheme: Scheme::Evm, digest: hex::encode([7u8; 32]) }] },
+            secret: Some(Secret::new("pw")),
+            xpub: None,
+        })
+    }
+
+    #[test]
+    fn an_older_builds_wallet_with_no_unlock_root_waits_for_its_phrase_and_is_not_offered() {
+        let dir = tempfile::tempdir().unwrap();
+        older_build(dir.path(), true);
+        let ks = Keystore::new(dir.path());
+
+        // Listed here, plain as it always was, and named as what it needs.
+        assert_eq!(ks.list_accounts().unwrap(), vec![ACCT0]);
+        assert_eq!(ks.get_group_labels().unwrap()[OLD_GROUP], "asd");
+        let again = ks.add_again_list().unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!((again[0].seed.as_str(), again[0].needs), (OLD_GROUP, AddAgain::Phrase));
+        assert_eq!((again[0].groups.clone(), again[0].accounts.clone()), (vec![OLD_GROUP.to_string()], vec![ACCT0]));
+        assert_eq!(ks.add_again_of(&ACCT0.to_string()).unwrap(), Some(AddAgain::Phrase));
+
+        // Not offered to the signer manager, not signed for it, and its key not asked of it.
+        assert!(offered(&ks).is_empty(), "{:?}", offered(&ks));
+        let e = sign_for_manager(&ks).unwrap_err();
+        assert!(e.message.contains("add its recovery phrase again"), "{}", e.message);
+        assert!(ks.closed_seeds().unwrap().is_empty(), "nothing to ask the manager for");
+        assert!(format!("{}", ks.unlock_key(OLD_GROUP, 0, "pw").unwrap_err()).contains("add it again from its phrase"));
+    }
+
+    #[test]
+    fn adding_an_older_wallets_phrase_again_seals_it_without_touching_its_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        older_build(dir.path(), true);
+        let ks = Keystore::new(dir.path());
+        ks.list_accounts().unwrap();
+        let vault = std::fs::read(vault_file(&ks, &ACCT0)).unwrap();
+        let before = ks.view().unwrap().merged();
+        let other = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        // Another phrase, a passphrase it never had, a wrong password, or no phrase: nothing moves.
+        for (phrase, passphrase, pw, why) in [
+            (other, "", "pw", "not this wallet's"),
+            (TEST_MNEMONIC, "x", "pw", "not this wallet's"),
+            (TEST_MNEMONIC, "", "wrong", "password for this account is not correct"),
+            ("", "", "pw", "from its recovery phrase"),
+        ] {
+            let e = ks.restore_unlock_root(OLD_GROUP, phrase, passphrase, pw).unwrap_err();
+            assert!(format!("{e}").contains(why), "{e}");
+        }
+        assert_eq!(ks.view().unwrap().merged(), before, "a refusal wrote nothing");
+
+        // Its phrase, by the file or by the account: the root, under the accounts' password.
+        assert_eq!(ks.restore_unlock_root(&ACCT0.to_string(), TEST_MNEMONIC, "", "pw").unwrap(), OLD_GROUP);
+        assert!(ks.add_again().unwrap().is_empty());
+        let after = ks.view().unwrap().merged();
+        assert_eq!(after.accounts, before.accounts, "no account added, none moved");
+        assert_eq!(after.groups.keys().collect::<Vec<_>>(), vec![OLD_GROUP], "no file added");
+        assert_eq!(std::fs::read(vault_file(&ks, &ACCT0)).unwrap(), vault, "the vault is not written again");
+        assert_eq!(seed_of(&ks, OLD_GROUP), OLD_GROUP, "the seed keeps its id");
+        let seed = Seed::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let want = crate::unlockkey::key_at(&*crate::unlockkey::root_of(seed.as_secret()).unwrap(), 0).unwrap();
+        assert_eq!(ks.unlock_key(OLD_GROUP, 0, "pw").unwrap(), want);
+        let enrolled = ks.enrolment(OLD_GROUP, "pw").unwrap();
+        assert_eq!((enrolled.seed.as_str(), enrolled.name.as_str()), (OLD_GROUP, "asd"));
+        assert!(format!("{}", ks.restore_unlock_root(OLD_GROUP, TEST_MNEMONIC, "", "pw").unwrap_err()).contains("already"));
+
+        // Offered again, and asked for: the manager's key seals it, and then it locks.
+        assert_eq!(offered(&ks), vec![ACCT0.to_string().to_ascii_lowercase()]);
+        assert_eq!(ks.closed_seeds().unwrap(), vec![(OLD_GROUP.to_string(), None)]);
+        assert!(ks.open_seed(OLD_GROUP, &data_key(1, 0), &data_key(1, 0)).unwrap());
+        assert!(!plain_docs(dir.path()).contains(&addr_key(&ACCT0)), "{}", plain_docs(dir.path()));
+        assert!(sign_for_manager(&ks).is_ok());
+        let fresh = Keystore::new(dir.path());
+        assert!(fresh.list_accounts().unwrap().is_empty());
+        assert_eq!(fresh.locked_seeds().unwrap(), vec![OLD_GROUP.to_string()]);
+    }
+
+    #[test]
+    fn an_older_wallet_is_also_added_again_by_a_new_account_of_its_phrase() {
+        let dir = tempfile::tempdir().unwrap();
+        older_build(dir.path(), true);
+        let ks = Keystore::new(dir.path());
+        let d = ks.import_mnemonic_ex(&req(Storage::Plain, 1)).unwrap();
+        assert!(ks.add_again().unwrap().is_empty(), "not refused, and the new file keeps a root");
+        let seed = seed_of(&ks, &d.group);
+        assert_eq!(seed_of(&ks, OLD_GROUP), seed, "the older file joins its seed");
+        assert_eq!(ks.closed_seeds().unwrap(), vec![(seed, None)]);
+        assert_eq!(offered(&ks).len(), 2);
+    }
+
+    #[test]
+    fn an_older_builds_imported_key_is_added_again_with_its_password() {
+        let dir = tempfile::tempdir().unwrap();
+        older_build(dir.path(), false);
+        let ks = Keystore::new(dir.path());
+        let again = ks.add_again_list().unwrap();
+        assert_eq!((again.len(), again[0].needs, again[0].accounts.clone()), (1, AddAgain::Password, vec![ACCT0]));
+        let seed = again[0].seed.clone();
+        assert!(seed.starts_with(IMPORTED_SEED), "{seed}");
+        assert!(offered(&ks).is_empty());
+        assert!(sign_for_manager(&ks).unwrap_err().message.contains("add it to the Signer app"));
+        assert!(ks.closed_seeds().unwrap().is_empty());
+
+        let e = ks.restore_unlock_root(&ACCT0.to_string(), "", "", "wrong").unwrap_err();
+        assert!(format!("{e}").contains("not correct"), "{e}");
+        assert_eq!(ks.add_again().unwrap().len(), 1);
+        assert_eq!(ks.restore_unlock_root(&ACCT0.to_string(), "", "", "pw").unwrap(), seed);
+        assert!(ks.add_again().unwrap().is_empty());
+        assert_eq!(ks.enrolment(&ACCT0.to_string(), "pw").unwrap().seed, seed);
+        assert_eq!(ks.closed_seeds().unwrap(), vec![(seed.clone(), None)]);
+        assert!(ks.open_seed(&seed, &data_key(1, 0), &data_key(1, 0)).unwrap());
+        assert!(!plain_docs(dir.path()).contains(&addr_key(&ACCT0)));
+    }
+
+    #[test]
+    fn a_wallet_this_build_added_is_never_one_to_add_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        ks.import_mnemonic_ex(&req(Storage::Plain, 0)).unwrap();
+        ks.import_private_key(&format!("{:064x}", 7), "pw").unwrap();
+        // Pending, as with no signer manager here, and still offered and asked for.
+        assert!(ks.add_again().unwrap().is_empty());
+        assert_eq!(ks.closed_seeds().unwrap().len(), 2);
+        assert_eq!(offered(&ks).len(), 2);
     }
 }

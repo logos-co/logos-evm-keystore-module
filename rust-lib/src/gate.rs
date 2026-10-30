@@ -180,6 +180,8 @@ pub const TIER_D_METHODS: &[&str] = &[
     // manages the keystore, and it is what a reader shows in place of an address.
     "set_group_label",
     "set_wallet_name",
+    // Adding an older build's wallet again: it records an unlock root, from its phrase.
+    "restore_unlock_root",
     "delete_account",
     // HD derivation. Deriving an account is a mutation, and it opens a vault whose blast
     // radius is a whole wallet rather than one account — so if anything it belongs here
@@ -338,6 +340,7 @@ mod tests {
             "set_label",
             "set_group_label",
             "set_wallet_name",
+            "restore_unlock_root",
         ] {
             assert!(TIER_D_METHODS.contains(&method), "{method} is not gated");
         }

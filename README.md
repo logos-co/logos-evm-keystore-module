@@ -31,7 +31,7 @@ temporary exposure rather than an oversight; see
 **Accounts (Tier D — the custodian only):** `create_mnemonic`, `import_mnemonic`,
 `create_unrelated_account`, `import_private_key`, `import_keystore_json`,
 `export_keystore_json`, `change_password`, `set_label`, `set_group_label`,
-`delete_account`.
+`delete_account`, `restore_unlock_root`.
 
 `create_unrelated_account` is the only way this crate **generates** a key from randomness,
 and it requires an explicit `acknowledgeUnrecoverable`. It is not the only way to end up
@@ -68,6 +68,12 @@ none of the reads above shows that wallet (`list_groups` counts it as `lockedWal
 vaults are named at random rather than by their address. A seed's unlock root stays readable
 behind its password, in `seeds.json`, so the wallet can still be unlocked. Without a signer
 manager everything stays readable, as before. See *The sealed index* in `docs/specs.md`.
+
+**An older build's wallet is added again, not offered.** A wallet added before the keystore kept
+an unlock root, or a key imported before seeds were sealed, was never enrolled with the signer
+manager and can't be from what is here. It stays listed (`list_groups` names it in `addAgain`),
+but `signer_accounts` leaves it out until `restore_unlock_root` records its root from the phrase,
+or its check from the key's password, and enrols it.
 
 **Setting a name proves custody; clearing one does not.** A label is what a reader shows
 *in place of* an address, so writing one is a claim — naming an account needs that
