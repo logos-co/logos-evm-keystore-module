@@ -109,6 +109,12 @@ pub trait KeystoreModule: Send + 'static {
     /// import left a copy of; `unexplained` are paths the layout does not account for. That
     /// last list REPORTS; it no longer refuses anything.
     fn list_derivation_keys(&mut self) -> String;
+    /// What an older build left in the module's `keystore/` directory, which this build no longer
+    /// reads (its own is `keystore/v2/`): `{ ok, accounts, keys, phrases, devices, documents, left }`.
+    /// UNGATED: counts and file names. Nothing moves until `move_older_keystore`.
+    fn older_keystore(&mut self) -> String;
+    /// Move it in (Tier D). The same shape, of what moved; `left` is what stays there.
+    fn move_older_keystore(&mut self) -> String;
     /// Where each account came from, `{ ok, accounts: { <address>: {...} } }`. UNGATED.
     fn get_provenance(&mut self) -> String;
     /// Wallet ownership for account pickers,
@@ -384,6 +390,8 @@ struct KeystoreModuleImpl {
     jobs: JobTable,
     /// Unlock-key jobs: read once, by the manager only, and announced nowhere.
     keys: KeyJobs,
+    /// The module's `keystore/`, where older builds kept what `ks` keeps in `keystore/v2/`.
+    older: Option<std::path::PathBuf>,
 }
 
 impl KeystoreModuleImpl {
@@ -432,6 +440,12 @@ impl KeystoreModuleImpl {
             _ => -1,
         }
     }
+}
+
+fn older_reply(o: &crate::keystore::Older) -> String {
+    let mut v = serde_json::to_value(o).unwrap_or_default();
+    v["ok"] = true.into();
+    v.to_string()
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -726,9 +740,11 @@ fn parse_secret_params<T: serde::de::DeserializeOwned>(
 impl KeystoreModule for KeystoreModuleImpl {
     fn on_context_ready(&mut self, ctx: &RustModuleContext) {
         let base = std::path::Path::new(&ctx.instance_persistence_path);
-        let ks = Keystore::new(base.join("keystore"));
+        let older = base.join("keystore");
+        let ks = Keystore::new(older.join(crate::layout::CURRENT));
         watch_wallets(ks.clone());
         self.ks = Some(ks);
+        self.older = Some(older);
     }
 
     fn configure(&mut self, config_json: String) -> String {
@@ -1151,6 +1167,38 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(store) => json!({ "ok": true, "groups": store.ids(), "staged": store.staged,
                                  "unexplained": store.possible_keys, "links": store.links })
             .to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn older_keystore(&mut self) -> String {
+        let Some(older) = self.older.clone() else { return err("keystore not initialized (context not ready)") };
+        let res = match self.ks() {
+            Ok(ks) => ks.older(&older),
+            Err(e) => return err(e),
+        };
+        match res {
+            Ok(o) => older_reply(&o),
+            Err(e) => err(e),
+        }
+    }
+
+    fn move_older_keystore(&mut self) -> String {
+        if !self.may_mutate("move_older_keystore") {
+            return not_authorized();
+        }
+        let Some(older) = self.older.clone() else { return err("keystore not initialized (context not ready)") };
+        let res = match self.ks() {
+            Ok(ks) => ks.move_older(&older).map(|o| (o, ks.clone())),
+            Err(e) => return err(e),
+        };
+        match res {
+            Ok((o, ks)) => {
+                self.announce();
+                // Its wallets arrive closed: their keys are the signer manager's to give.
+                std::thread::spawn(move || open_wallets(&ks));
+                older_reply(&o)
+            }
             Err(e) => err(e),
         }
     }

@@ -31,7 +31,7 @@ temporary exposure rather than an oversight; see
 **Accounts (Tier D — the custodian only):** `create_mnemonic`, `import_mnemonic`,
 `create_unrelated_account`, `import_private_key`, `import_keystore_json`,
 `export_keystore_json`, `change_password`, `set_label`, `set_group_label`,
-`delete_account`, `restore_unlock_root`.
+`delete_account`, `restore_unlock_root`, `move_older_keystore`.
 
 `create_unrelated_account` is the only way this crate **generates** a key from randomness,
 and it requires an explicit `acknowledgeUnrecoverable`. It is not the only way to end up
@@ -74,6 +74,12 @@ an unlock root, or a key imported before seeds were sealed, was never enrolled w
 manager and can't be from what is here. It stays listed (`list_groups` names it in `addAgain`),
 but `signer_accounts` leaves it out until `restore_unlock_root` records its root from the phrase,
 or its check from the key's password, and enrols it.
+
+**This build keeps its keystore in `keystore/v2/`.** Older builds wrote the module's `keystore/`
+itself. What they left there is not read: `older_keystore` counts it (accounts, wallet keys, kept
+phrases, device wallets, documents), and `move_older_keystore` moves it in when the keys app asks —
+files renamed into `v2/`, the index joined to this one's by seed, so both keep their wallets.
+Files no build of this keystore wrote stay where they are, and are listed as `left`.
 
 **Setting a name proves custody; clearing one does not.** A label is what a reader shows
 *in place of* an address, so writing one is a claim — naming an account needs that

@@ -10,6 +10,10 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// This build's keystore, inside the module's `keystore/`. Older builds wrote `keystore/` itself;
+/// what they left there is reported, and moved in only when asked.
+pub const CURRENT: &str = "v2";
+
 /// Staging directories are named after what they hold, so a copy a SIGKILL leaves behind is
 /// nameable — and therefore classifiable and deletable.
 pub const STAGE_PREFIX: &str = ".stage-";
@@ -637,6 +641,15 @@ pub fn classify(rel: &[String], kind: Kind) -> Entry {
 /// is reported when it cannot be read — refusing there wedged the whole store, listing and
 /// signing and repair included, over one bad directory.
 pub fn scan(root: &Root) -> Result<Scan, Unreadable> {
+    scan_skipping(root, None)
+}
+
+/// Walk an older build's keystore: the directory [`CURRENT`] sits in, without it.
+pub fn scan_older(root: &Root) -> Result<Scan, Unreadable> {
+    scan_skipping(root, Some(CURRENT))
+}
+
+fn scan_skipping(root: &Root, skip: Option<&str>) -> Result<Scan, Unreadable> {
     let mut out = Scan::default();
     let refused = |why: String| Unreadable { what: "the keystore directory".into(), why };
     let entries = match std::fs::read_dir(root.as_path()) {
@@ -645,7 +658,7 @@ pub fn scan(root: &Root) -> Result<Scan, Unreadable> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(refused(e.to_string())),
     };
-    if !walk(entries, &mut Vec::new(), &mut out) {
+    if !walk(entries, &mut Vec::new(), &mut out, skip) {
         return Err(refused("it could not be read to the end".into()));
     }
     out.sort();
@@ -659,14 +672,18 @@ fn rel_str(rel: &[String]) -> String {
 /// Open a subdirectory and walk it. `false` means this scan could not see inside — which is
 /// reported by the caller, never refused.
 fn descend(dir: &Path, rel: &mut Vec<String>, out: &mut Scan) -> bool {
-    std::fs::read_dir(dir).map(|e| walk(e, rel, out)).unwrap_or(false)
+    std::fs::read_dir(dir).map(|e| walk(e, rel, out, None)).unwrap_or(false)
 }
 
 /// Classify every entry of one already-opened directory. `false` means it could not be read
 /// to the end, so what this scan says about its contents is incomplete.
-fn walk(entries: std::fs::ReadDir, rel: &mut Vec<String>, out: &mut Scan) -> bool {
+fn walk(entries: std::fs::ReadDir, rel: &mut Vec<String>, out: &mut Scan, skip: Option<&str>) -> bool {
     for entry in entries {
         let Ok(entry) = entry else { return false };
+        // The newer keystore inside an older one: a directory, never a link to one.
+        if skip.is_some_and(|s| entry.file_name() == s) && entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
         rel.push(entry.file_name().to_string_lossy().into_owned());
         // EVERY entry is classified, whatever its type — that is the totality this scan
         // rests on. A kind we cannot even read is `Other`, which is unexplained, not absent.
