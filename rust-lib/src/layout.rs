@@ -230,6 +230,9 @@ pub struct Scan {
     /// Unexplained material that could not be one. At worst one account, so this reports
     /// rather than refusing — a keystore must not be bricked by a `.DS_Store`.
     pub unexplained: Vec<String>,
+    /// What a file browser leaves in any folder it shows (`.DS_Store`, `._*`, `Thumbs.db`,
+    /// `desktop.ini`, `.directory`), named so and holding no vault. Removable, never reported.
+    pub os_files: Vec<String>,
     /// Every symlink found, as `<rel> -> <target>`. A link is unexplained material like any
     /// other; this says WHERE it points, because what it aims at is outside this scan.
     pub links: Vec<String>,
@@ -251,6 +254,7 @@ impl Scan {
             &mut self.doc_stages,
             &mut self.possible_keys,
             &mut self.unexplained,
+            &mut self.os_files,
             &mut self.links,
         ] {
             v.sort();
@@ -364,6 +368,9 @@ pub enum Entry {
     ImportScratch(String),
     /// Not from any `Slot`. Treated as material until someone proves otherwise.
     Unexplained,
+    /// A file browser's own file, by its name and by a look inside. Never from `classify`,
+    /// which sees names only.
+    OsFile,
 }
 
 /// What the filesystem says one entry is. Every one of these reaches `classify`, so a name
@@ -490,13 +497,40 @@ const VAULT_PROBE_LIMIT: u64 = 64 * 1024;
 /// Whether these bytes are a Web3 Secure Storage vault — the shape this keystore writes for
 /// an account key AND for a whole-wallet derivation key. Which of the two it holds cannot be
 /// told apart without the password, so an unexplained one is taken for the worse case.
-fn looks_like_a_vault(raw: &str) -> bool {
-    let v: serde_json::Value = match serde_json::from_str(raw) {
+fn looks_like_a_vault(raw: &[u8]) -> bool {
+    let Some(text) = as_text(raw) else { return false };
+    let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(_) => return false,
     };
     let Some(c) = v.get("crypto").or_else(|| v.get("Crypto")) else { return false };
     c.get("ciphertext").is_some() && c.get("kdf").is_some()
+}
+
+/// A vault is JSON text. A byte-order mark names its encoding, so a vault an editor saved as
+/// UTF-16 still reads as one; bytes that are no text at all are not one.
+fn as_text(raw: &[u8]) -> Option<String> {
+    let utf16 = |rest: &[u8], unit: fn([u8; 2]) -> u16| {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| unit([c[0], c[1]])).collect();
+        String::from_utf16(&units).ok()
+    };
+    match raw {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => std::str::from_utf8(rest).ok().map(str::to_string),
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, u16::from_le_bytes),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, u16::from_be_bytes),
+        _ => std::str::from_utf8(raw).ok().map(str::to_string),
+    }
+}
+
+/// What a file browser writes into any folder it shows: Finder's `.DS_Store` and `._*`
+/// (AppleDouble, on volumes without extended attributes), Explorer's `Thumbs.db` and
+/// `desktop.ini`, Dolphin's `.directory`.
+fn is_os_file(name: &str) -> bool {
+    name == ".DS_Store"
+        || name == ".directory"
+        || (name.len() > 2 && name.starts_with("._"))
+        || name.eq_ignore_ascii_case("Thumbs.db")
+        || name.eq_ignore_ascii_case("desktop.ini")
 }
 
 /// Look inside one unexplained FILE, without a password. Directories are answered by the
@@ -505,7 +539,8 @@ fn look(path: &Path, kind: Kind) -> Seen {
     match kind {
         Kind::File => match std::fs::metadata(path).map(|m| m.len()) {
             Ok(n) if n > VAULT_PROBE_LIMIT => Seen::Nothing,
-            Ok(_) => match std::fs::read_to_string(path) {
+            // Bytes, not text: a vault is JSON, so a binary file is read fine and is not one.
+            Ok(_) => match std::fs::read(path) {
                 Ok(raw) if looks_like_a_vault(&raw) => Seen::Maybe,
                 Ok(_) => Seen::Nothing,
                 Err(_) => Seen::Maybe,
@@ -662,7 +697,12 @@ fn walk(entries: std::fs::ReadDir, rel: &mut Vec<String>, out: &mut Scan) -> boo
             }
             _ => Seen::Nothing,
         };
-        file(out, rel, what, seen);
+        // By name AND contents: a vault named `.DS_Store` is still a vault.
+        let os_file = what == Entry::Unexplained
+            && kind == Kind::File
+            && seen == Seen::Nothing
+            && rel.last().is_some_and(|n| is_os_file(n));
+        file(out, rel, if os_file { Entry::OsFile } else { what }, seen);
         rel.pop();
     }
     true
@@ -683,6 +723,7 @@ fn file(out: &mut Scan, rel: &[String], what: Entry, seen: Seen) {
         Entry::DeviceVault(id) => out.devices.push(id),
         Entry::StagedDeviceVault(id) => out.staged_devices.push(id),
         Entry::DocStage => out.doc_stages.push(rel_str(rel)),
+        Entry::OsFile => out.os_files.push(rel_str(rel)),
         // Explained and holding nothing of its own: the material inside is what gets filed.
         Entry::Doc(_)
         | Entry::Lock
@@ -1031,6 +1072,85 @@ mod tests {
         }
         assert_eq!(s.possible_keys, vec!["shut".to_string()]);
         assert_eq!(s.unexplained, vec!["notes.txt".to_string()]);
+    }
+
+    const VAULT: &str = r#"{"crypto":{"cipher":"aes-128-ctr","ciphertext":"ab","kdf":"scrypt"},"id":"x","version":3}"#;
+
+    /// The first bytes of a real one of each: Finder's `.DS_Store` ("Bud1"), an AppleDouble
+    /// `._*`, Explorer's `Thumbs.db` (OLE), and `desktop.ini` in UTF-16 with its mark.
+    fn os_files() -> Vec<(&'static str, Vec<u8>)> {
+        let mut ini = vec![0xFF, 0xFE];
+        ini.extend("[.ShellClassInfo]\r\n".encode_utf16().flat_map(u16::to_le_bytes));
+        vec![
+            (".DS_Store", b"\0\0\0\x01Bud1\0\0\x10\0\0\0\x08\0\xa8\xff\x80\x0b".to_vec()),
+            ("._notes.txt", b"\0\x05\x16\x07\0\x02\0\0Mac OS X        \0\x02\xfe".to_vec()),
+            ("Thumbs.db", vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0xFE, 0xFF]),
+            ("desktop.ini", ini),
+        ]
+    }
+
+    #[test]
+    fn a_binary_file_is_read_and_is_not_a_vault() {
+        // Read as text, a binary file failed to read, and "could not look" made it a possible
+        // whole-wallet key wherever it sat: a real `.DS_Store` wedged account creation.
+        let dir = tempfile::tempdir().unwrap();
+        let root = Root::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(root.as_path().join("groups")).unwrap();
+        let blob = [0x00, 0x00, 0x00, 0x01, b'B', b'u', b'd', b'1', 0x80, 0xFF, 0x10];
+        std::fs::write(root.as_path().join("blob.bin"), blob).unwrap();
+        std::fs::write(root.as_path().join("groups").join("blob.bin"), blob).unwrap();
+
+        let s = scan(&root).unwrap();
+        assert_eq!(s.unexplained, vec!["blob.bin".to_string()], "{s:?}");
+        // In the key directory the place still speaks for it, whatever the bytes say.
+        assert_eq!(s.possible_keys, vec!["groups/blob.bin".to_string()], "{s:?}");
+    }
+
+    #[test]
+    fn a_file_browsers_own_files_are_no_key_and_are_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Root::new(dir.path().to_path_buf());
+        let groups = root.as_path().join("groups");
+        std::fs::create_dir_all(groups.join(format!(".stage-{G}"))).unwrap();
+        let mut want = Vec::new();
+        for (name, bytes) in os_files() {
+            for at in [root.as_path().to_path_buf(), groups.clone(), groups.join(format!(".stage-{G}"))] {
+                std::fs::write(at.join(name), &bytes).unwrap();
+                let rel = at.strip_prefix(root.as_path()).unwrap().join(name);
+                want.push(rel.to_string_lossy().into_owned());
+            }
+        }
+        want.sort();
+
+        let s = scan(&root).unwrap();
+        assert_eq!(s.os_files, want, "{s:?}");
+        assert!(s.stray().is_empty() && s.possible_key_material().is_empty(), "{s:?}");
+        assert!(s.unexplained_all().is_empty(), "{s:?}");
+    }
+
+    #[test]
+    fn a_vault_wearing_a_file_browsers_name_is_still_possible_key_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Root::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(root.as_path()).unwrap();
+        std::fs::write(root.as_path().join(".DS_Store"), VAULT).unwrap();
+        // Saved as UTF-16 by an editor: still the same vault, and still read as one.
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(VAULT.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(root.as_path().join("desktop.ini"), &utf16).unwrap();
+        std::fs::write(root.as_path().join("k.json"), &utf16).unwrap();
+        // One this scan cannot open is not known to be a browser's.
+        let shut = root.as_path().join("Thumbs.db");
+        std::fs::write(&shut, b"x").unwrap();
+        crate::atomic::set_mode(&shut, 0o000).unwrap();
+
+        let s = scan(&root).unwrap();
+        crate::atomic::set_mode(&shut, 0o600).unwrap();
+        for want in [".DS_Store", "desktop.ini", "k.json"] {
+            assert!(s.possible_keys.contains(&want.to_string()), "{want}: {s:?}");
+        }
+        #[cfg(unix)]
+        assert!(s.os_files.is_empty() && s.possible_keys.contains(&"Thumbs.db".to_string()), "{s:?}");
     }
 
     #[test]

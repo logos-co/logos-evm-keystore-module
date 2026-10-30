@@ -878,6 +878,8 @@ impl Keystore {
         let scan = self.scan()?;
         let mut reported = scan.unexplained_all();
         reported.extend(self.unnamed_vaults(&scan, &self.view()?)?);
+        // Never reported, but a file browser's own file is as removable as anything named.
+        reported.extend(scan.os_files.iter().cloned());
         if !reported.iter().any(|p| p == rel) {
             return Err(KeystoreError::NotFound(format!("{rel} is not reported as unexplained")));
         }
@@ -6756,8 +6758,8 @@ mod tests {
                 std::fs::write(d.join("k.json"), vault).unwrap();
             }), "k.json"),
             ("a plain stray file", Box::new(|d: &Path| {
-                std::fs::write(d.join(".DS_Store"), "x").unwrap()
-            }), ".DS_Store"),
+                std::fs::write(d.join("notes.txt"), "x").unwrap()
+            }), "notes.txt"),
         ];
         for (name, plant, rel) in plant {
             let dir = tempfile::tempdir().unwrap();
@@ -6781,6 +6783,25 @@ mod tests {
             assert!(ks.remove_unexplained(rel, true).unwrap(), "{name}");
             assert!(ks.scan().unwrap().unexplained_all().is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn finders_ds_store_is_not_reported_as_a_possible_key() {
+        // A real one is binary. Read as text it failed, and "could not look" put it in the
+        // key directory's report, where the keys app said no account could be made.
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        ks.import_private_key(ACCT0_PK, "pw").unwrap();
+        let ds = b"\0\0\0\x01Bud1\0\0\x10\0\0\0\x08\0\xa8\xff\x80\x0b";
+        std::fs::create_dir_all(dir.path().join("groups")).unwrap();
+        std::fs::write(dir.path().join(".DS_Store"), ds).unwrap();
+        std::fs::write(dir.path().join("groups").join(".DS_Store"), ds).unwrap();
+
+        assert!(ks.unexplained().unwrap().is_empty());
+        assert!(ks.settle().unwrap().left.unexplained_all().is_empty());
+        assert!(ks.listed_group_store().unwrap().possible_keys.is_empty());
+        assert!(ks.create_unrelated_account("pw", acked()).is_ok());
+        assert!(ks.remove_unexplained("groups/.DS_Store", true).unwrap());
     }
 
     #[test]
