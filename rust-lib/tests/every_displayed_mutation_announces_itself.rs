@@ -28,6 +28,7 @@ const ANNOUNCES: &[&str] = &[
     "set_group_label",
     "set_wallet_name",
     "restore_unlock_root",
+    "move_older_keystore",
     "remove_group",
     "forget_derivation",
     "remove_unexplained",
@@ -53,6 +54,7 @@ const SILENT: &[&str] = &[
     "get_group_labels",
     "list_groups",
     "list_derivation_keys",
+    "older_keystore",
     "caller_identity",
     // Showing a kept phrase moves nothing; the list of them is a read.
     "show_phrase",

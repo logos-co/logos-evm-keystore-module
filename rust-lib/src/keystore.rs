@@ -1402,6 +1402,157 @@ pub struct Settled {
     pub left: Scan,
 }
 
+/// What an older build's keystore holds: the directory this one sits in, which it no longer reads.
+/// Moved in only when asked, by [`Keystore::move_older`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Older {
+    pub accounts: usize,
+    /// Wallet keys, which make a whole wallet's accounts.
+    pub keys: usize,
+    pub phrases: usize,
+    /// Device wallets' database keys.
+    pub devices: usize,
+    /// Its bookkeeping, by file name.
+    pub documents: Vec<String>,
+    /// What stays there: what no build of this keystore wrote, and what this one holds otherwise.
+    pub left: Vec<String>,
+}
+
+impl Older {
+    pub fn holds_nothing(&self) -> bool {
+        self.accounts + self.keys + self.phrases + self.devices == 0 && self.documents.is_empty()
+    }
+}
+
+/// Every file and staging directory an older build's scan explains, where it moves to unchanged.
+fn movable(scan: &Scan) -> Vec<Slot> {
+    let stage = |k: StageKind| Slot::Stage(k);
+    let mut out: Vec<Slot> = scan.vaults.iter().map(|id| Slot::Vault(id.clone())).collect();
+    out.extend(scan.vault_stages.iter().map(|id| stage(StageKind::Vault(id.clone()))));
+    out.extend(scan.import_stages.iter().map(|n| stage(StageKind::Import(n.clone()))));
+    out.extend(scan.keys.iter().map(|id| Slot::GroupKey(id.clone())));
+    out.extend(scan.staged.iter().map(|id| stage(StageKind::Group(id.clone()))));
+    out.extend(scan.phrases.iter().map(|id| Slot::PhraseVault(id.clone())));
+    out.extend(scan.staged_phrases.iter().map(|id| stage(StageKind::Phrase(id.clone()))));
+    out.extend(scan.devices.iter().map(|id| Slot::DeviceVault(id.clone())));
+    out.extend(scan.staged_devices.iter().map(|id| stage(StageKind::Device(id.clone()))));
+    out
+}
+
+fn is_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
+impl Keystore {
+    /// What an older build left in `older`, the directory this keystore sits in, as a move would
+    /// find it now: what it would bring in, and what would stay there.
+    pub fn older(&self, older: &Path) -> Result<Older> {
+        let from = Root::new(older);
+        let scan = layout::scan_older(&from).map_err(|u| KeystoreError::Corrupt(u.what, u.why))?;
+        let mut left = scan.stray();
+        left.extend(scan.doc_stages.iter().cloned());
+        // What this keystore holds at the same name stays, so a move asked for again is not offered again.
+        let (go, held): (Vec<Slot>, Vec<Slot>) =
+            movable(&scan).into_iter().partition(|s| std::fs::symlink_metadata(self.root.path(s)).is_err());
+        left.extend(held.iter().map(|s| s.rel().to_string_lossy().into_owned()));
+        let ids: std::collections::BTreeSet<(usize, &str)> = go.iter().filter_map(counted).collect();
+        let n = |k: usize| ids.iter().filter(|(c, _)| *c == k).count();
+        let index_goes = index::would_differ(&from, &self.root)?.is_empty();
+        let devices_go = !self.older_devices(&from)?.1;
+        let mut documents = Vec::new();
+        for d in Doc::ALL.into_iter().filter(|d| is_file(&from.path(&Slot::Doc(*d)))) {
+            let goes = match d {
+                Doc::Seeds | Doc::Index | Doc::Pending => index_goes,
+                Doc::DeviceWallets => devices_go,
+                _ => std::fs::symlink_metadata(self.root.path(&Slot::Doc(d))).is_err(),
+            };
+            if goes { &mut documents } else { &mut left }.push(d.file().to_string());
+        }
+        left.sort();
+        left.dedup();
+        Ok(Older { accounts: n(0), keys: n(1), phrases: n(2), devices: n(3), documents, left })
+    }
+
+    /// An older build's device wallets, and whether one of them is recorded here otherwise.
+    fn older_devices(&self, from: &Root) -> Result<(BTreeMap<String, DeviceWallet>, bool)> {
+        let theirs: BTreeMap<String, DeviceWallet> = self.read_json(&from.path(&Slot::Doc(Doc::DeviceWallets)))?;
+        let ours = self.device_records()?;
+        let clash = theirs.iter().any(|(id, w)| ours.get(id).is_some_and(|o| o != w));
+        Ok((theirs, clash))
+    }
+
+    /// Move what an older build left in `older` in: its files where this keystore keeps them, its
+    /// bookkeeping joined to this one's. Files go first, so a move cut short leaves a file no
+    /// record names yet rather than a record whose file is missing, and it finishes when asked
+    /// again. What no build of this keystore wrote stays, and so does what this one holds otherwise.
+    pub fn move_older(&self, older: &Path) -> Result<Older> {
+        let before = self.older(older)?;
+        let from = Root::new(older);
+        let scan = layout::scan_older(&from).map_err(|u| KeystoreError::Corrupt(u.what, u.why))?;
+        let io = |e: std::io::Error| KeystoreError::Io(e.to_string());
+        {
+            let _guard = self.lock()?;
+            for slot in movable(&scan) {
+                let (src, dst) = (from.path(&slot), self.root.path(&slot));
+                if std::fs::symlink_metadata(&dst).is_ok() {
+                    continue;
+                }
+                if dst.parent() != Some(self.root.as_path()) {
+                    self.ensure_group_dir()?;
+                }
+                std::fs::rename(&src, &dst).map_err(io)?;
+            }
+            // Older builds' own documents: this keystore takes them in on its next read.
+            for d in Doc::LEGACY {
+                let (src, dst) = (from.path(&Slot::Doc(d)), self.root.path(&Slot::Doc(d)));
+                if is_file(&src) && std::fs::symlink_metadata(&dst).is_err() {
+                    std::fs::rename(&src, &dst).map_err(io)?;
+                }
+            }
+            if index::adopt(&from, &self.root)?.is_empty() {
+                for d in [Doc::Seeds, Doc::Index, Doc::Pending] {
+                    remove_path(&from.path(&Slot::Doc(d)))?;
+                }
+            }
+            let (theirs, clash) = self.older_devices(&from)?;
+            if !clash {
+                let mut ours = self.device_records()?;
+                let n = ours.len();
+                ours.extend(theirs);
+                if ours.len() != n {
+                    self.write_json(&self.device_wallets_path(), &ours)?;
+                }
+                remove_path(&from.path(&Slot::Doc(Doc::DeviceWallets)))?;
+            }
+        }
+        self.migrated.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.settle()?;
+        // Empty now, unless something no build wrote is in it.
+        let _ = std::fs::remove_dir(from.path(&Slot::GroupDir));
+        let after = self.older(older)?;
+        let stayed = |d: &String| after.documents.contains(d) || after.left.contains(d);
+        Ok(Older {
+            accounts: before.accounts.saturating_sub(after.accounts),
+            keys: before.keys.saturating_sub(after.keys),
+            phrases: before.phrases.saturating_sub(after.phrases),
+            devices: before.devices.saturating_sub(after.devices),
+            documents: before.documents.into_iter().filter(|d| !stayed(d)).collect(),
+            left: after.left,
+        })
+    }
+}
+
+/// Which of `Older`'s counts a movable slot falls in (accounts, keys, phrases, devices), by its id.
+fn counted(slot: &Slot) -> Option<(usize, &str)> {
+    match slot {
+        Slot::Vault(id) | Slot::Stage(StageKind::Vault(id)) => Some((0, id)),
+        Slot::GroupKey(id) | Slot::Stage(StageKind::Group(id)) => Some((1, id)),
+        Slot::PhraseVault(id) | Slot::Stage(StageKind::Phrase(id)) => Some((2, id)),
+        Slot::DeviceVault(id) | Slot::Stage(StageKind::Device(id)) => Some((3, id)),
+        _ => None,
+    }
+}
+
 /// The last component of a path this module built from a `Slot`, for reporting.
 fn rel_of(path: &Path) -> String {
     path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())
@@ -7269,5 +7420,156 @@ mod tests {
         assert!(ks.add_again().unwrap().is_empty());
         assert_eq!(ks.closed_seeds().unwrap().len(), 2);
         assert_eq!(offered(&ks).len(), 2);
+    }
+
+    // ---- an older build's keystore, beside this one's ----------------------------------------
+
+    /// An older build's keystore in `dir`, with a kept wallet named "asd", a file nobody wrote and
+    /// Finder's; and this build's, in `dir/v2`.
+    fn older_beside(dir: &Path) -> (Derived, Keystore) {
+        let old = Keystore::new(dir);
+        let d = old
+            .import_mnemonic_ex(&ImportRequest { wallet_name: "asd", keep: KeepPhrase::New("phrase-pw"), ..req(Storage::Extkey, 0) })
+            .unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        std::fs::write(dir.join(".DS_Store"), b"\0\0\0\x01Bud1\xff").unwrap();
+        (d, Keystore::new(dir.join(layout::CURRENT)))
+    }
+
+    #[test]
+    fn an_older_keystore_is_reported_and_not_read_until_it_is_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, ks) = older_beside(dir.path());
+
+        assert!(ks.list_accounts().unwrap().is_empty());
+        let o = ks.older(dir.path()).unwrap();
+        assert_eq!((o.accounts, o.keys, o.phrases, o.devices), (1, 1, 1, 0), "{o:?}");
+        assert!(o.documents.contains(&Doc::Seeds.file().to_string()), "{o:?}");
+        assert_eq!(o.left, vec!["notes.txt".to_string()]);
+        // This build's own directory is no part of it.
+        ks.create_unrelated_account("pw2", acked()).unwrap();
+        assert_eq!(ks.older(dir.path()).unwrap(), o);
+    }
+
+    #[test]
+    fn moving_an_older_keystore_brings_its_wallets_names_and_keys_beside_this_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (d, ks) = older_beside(dir.path());
+        let mine = ks.create_unrelated_account("pw2", acked()).unwrap();
+
+        let moved = ks.move_older(dir.path()).unwrap();
+        assert_eq!((moved.accounts, moved.keys, moved.phrases), (1, 1, 1), "{moved:?}");
+        assert_eq!(moved.left, vec!["notes.txt".to_string()]);
+
+        let mut want = vec![ACCT0, mine];
+        want.sort();
+        let mut got = ks.list_accounts().unwrap();
+        got.sort();
+        assert_eq!(got, want);
+        assert!(ks.wallet_names().unwrap().values().any(|n| n == "asd"));
+        assert!(ks.sign_message(&ACCT0.to_string(), "pw", "hi").is_ok());
+        let phrase = ks.get_groups().unwrap()[&d.group].phrase.clone().unwrap();
+        assert_eq!(ks.show_phrase(&phrase, "phrase-pw").unwrap().as_str(), TEST_MNEMONIC);
+        assert_eq!(ks.derive_next_account(Some(&d.group), "gp", "pw", 0).unwrap().address, ACCT1);
+        // Left there: what no build wrote, and Finder's.
+        assert!(ks.older(dir.path()).unwrap().holds_nothing());
+        assert!(dir.path().join("notes.txt").exists() && dir.path().join(".DS_Store").exists());
+    }
+
+    #[test]
+    fn a_move_cut_short_finishes_when_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, ks) = older_beside(dir.path());
+        // The first run moved every file and wrote the documents here, then died.
+        let from = Root::new(dir.path());
+        std::fs::create_dir_all(ks.root.path(&Slot::GroupDir)).unwrap();
+        for slot in movable(&layout::scan_older(&from).unwrap()) {
+            std::fs::rename(from.path(&slot), ks.root.path(&slot)).unwrap();
+        }
+        index::adopt(&from, &ks.root).unwrap();
+
+        let moved = ks.move_older(dir.path()).unwrap();
+        assert_eq!((moved.accounts, moved.keys), (0, 0), "{moved:?}");
+        assert!(ks.older(dir.path()).unwrap().holds_nothing());
+        assert_eq!(ks.list_accounts().unwrap(), vec![ACCT0]);
+    }
+
+    #[test]
+    fn an_older_builds_documents_move_in_and_its_wallet_still_waits_for_its_phrase() {
+        let dir = tempfile::tempdir().unwrap();
+        older_build(dir.path(), true);
+        let ks = Keystore::new(dir.path().join(layout::CURRENT));
+        assert_eq!(ks.older(dir.path()).unwrap().accounts, 1);
+
+        ks.move_older(dir.path()).unwrap();
+        assert_eq!(ks.list_accounts().unwrap(), vec![ACCT0]);
+        assert_eq!(ks.get_group_labels().unwrap()[OLD_GROUP], "asd");
+        assert_eq!(ks.add_again_of(&ACCT0.to_string()).unwrap(), Some(AddAgain::Phrase));
+        assert!(ks.older(dir.path()).unwrap().holds_nothing());
+        // Its address-named vault took a random name here, as it would have in place.
+        assert!(ks.scan().unwrap().vaults.iter().all(|v| !layout::is_legacy_vault(v)));
+    }
+
+    #[test]
+    fn a_seed_this_keystore_holds_otherwise_stays_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, ks) = older_beside(dir.path());
+        std::fs::create_dir_all(ks.root.as_path()).unwrap();
+        // The same seed here already, its name changed since.
+        let pending: String = std::fs::read_to_string(dir.path().join(Doc::Pending.file())).unwrap();
+        std::fs::write(ks.root.path(&Slot::Doc(Doc::Pending)), pending.replace("asd", "renamed")).unwrap();
+
+        // Said before the move, so the offer is not the first a person hears of it.
+        assert!(ks.older(dir.path()).unwrap().left.contains(&Doc::Pending.file().to_string()));
+        let moved = ks.move_older(dir.path()).unwrap();
+        assert!(moved.left.contains(&Doc::Pending.file().to_string()), "{moved:?}");
+        assert!(ks.wallet_names().unwrap().values().any(|n| n == "renamed"));
+        assert!(std::fs::read_to_string(dir.path().join(Doc::Pending.file())).unwrap().contains("asd"));
+        // What stays is not offered again.
+        assert!(ks.older(dir.path()).unwrap().holds_nothing());
+    }
+
+    #[test]
+    fn a_file_this_keystore_holds_at_the_same_name_is_left_and_not_offered_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, ks) = older_beside(dir.path());
+        let from = Root::new(dir.path());
+        let vault = movable(&layout::scan_older(&from).unwrap())
+            .into_iter()
+            .find(|s| matches!(s, Slot::Vault(_)))
+            .unwrap();
+        std::fs::create_dir_all(ks.root.as_path()).unwrap();
+        std::fs::copy(from.path(&vault), ks.root.path(&vault)).unwrap();
+        let name = vault.rel().to_string_lossy().into_owned();
+
+        let o = ks.older(dir.path()).unwrap();
+        assert_eq!((o.accounts, o.keys), (0, 1), "{o:?}");
+        assert!(o.left.contains(&name), "{o:?}");
+        let moved = ks.move_older(dir.path()).unwrap();
+        assert!(moved.left.contains(&name), "{moved:?}");
+        assert!(from.path(&vault).exists());
+        assert!(ks.older(dir.path()).unwrap().holds_nothing());
+    }
+
+    #[test]
+    fn a_fresh_install_has_no_older_keystore_to_offer() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("keystore");
+        let ks = Keystore::new(older.join(layout::CURRENT));
+        assert_eq!(ks.older(&older).unwrap(), Older::default());
+        assert_eq!(ks.move_older(&older).unwrap(), Older::default());
+    }
+
+    #[test]
+    fn an_older_scan_skips_this_builds_directory_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = dir.path().join(layout::CURRENT);
+        std::fs::create_dir_all(v2.join("groups")).unwrap();
+        std::fs::write(v2.join("notes.txt"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("groups").join(layout::CURRENT)).unwrap();
+        let s = layout::scan_older(&Root::new(dir.path())).unwrap();
+        assert_eq!(s.stray(), vec![format!("groups/{}", layout::CURRENT)], "{s:?}");
+        // Read as a keystore of its own, the older directory still sees it.
+        assert!(layout::scan(&Root::new(dir.path())).unwrap().stray().contains(&layout::CURRENT.to_string()));
     }
 }

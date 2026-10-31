@@ -443,6 +443,69 @@ pub fn store(root: &Root, keys: &KeyRing, state: &State, doc: &SeedDoc) -> Resul
     Ok(())
 }
 
+type Docs = (BTreeMap<String, SeedFiles>, BTreeMap<String, String>, BTreeMap<String, SeedDoc>);
+
+/// Another directory's index joined to this one's, an older build's: each of its seeds as it is,
+/// box and all. A seed this index holds otherwise is left out and named; one held the same is not,
+/// so a move cut short can run again. `(before, after, differ)`; nothing is written.
+fn joined(from: &Root, into: &Root) -> Result<(Docs, Docs, Vec<String>)> {
+    let their_seeds: BTreeMap<String, SeedFiles> = read(from, Doc::Seeds)?;
+    let their_file: SealedFile = read(from, Doc::Index)?;
+    if !their_file.seeds.is_empty() && their_file.v != VERSION {
+        return Err(corrupt(Doc::Index, format!("version {}", their_file.v)));
+    }
+    let mut their_pending: BTreeMap<String, SeedDoc> = read(from, Doc::Pending)?;
+    let before: Docs = (read(into, Doc::Seeds)?, read::<SealedFile>(into, Doc::Index)?.seeds, read(into, Doc::Pending)?);
+    let (mut seeds, mut sealed, mut pending) = before.clone();
+    if let Some(theirs) = their_pending.remove(UNCLAIMED) {
+        pending.entry(UNCLAIMED.to_string()).or_default().absorb(&theirs);
+    }
+    let named: BTreeSet<String> =
+        their_seeds.keys().chain(their_file.seeds.keys()).chain(their_pending.keys()).cloned().collect();
+    let mut differ = Vec::new();
+    for seed in named {
+        let theirs = (their_seeds.get(&seed), their_file.seeds.get(&seed), their_pending.get(&seed));
+        let ours = (seeds.get(&seed), sealed.get(&seed), pending.get(&seed));
+        if ours != (None, None, None) {
+            if ours != theirs {
+                differ.push(seed);
+            }
+            continue;
+        }
+        if let Some(f) = theirs.0 {
+            seeds.insert(seed.clone(), f.clone());
+        }
+        if let Some(b) = theirs.1 {
+            sealed.insert(seed.clone(), b.clone());
+        }
+        if let Some(d) = theirs.2 {
+            pending.insert(seed.clone(), d.clone());
+        }
+    }
+    Ok((before, (seeds, sealed, pending), differ))
+}
+
+/// The seeds `adopt` would leave out, because this index holds them otherwise.
+pub fn would_differ(from: &Root, into: &Root) -> Result<Vec<String>> {
+    Ok(joined(from, into)?.2)
+}
+
+/// Take another directory's index in, as [`joined`] describes, and return the seeds left out.
+pub fn adopt(from: &Root, into: &Root) -> Result<Vec<String>> {
+    let (before, (seeds, sealed, pending), differ) = joined(from, into)?;
+    // The plain files first, as `store` writes them.
+    if seeds != before.0 {
+        write(into, Doc::Seeds, &seeds)?;
+    }
+    if sealed != before.1 {
+        write(into, Doc::Index, &SealedFile { v: VERSION, seeds: sealed })?;
+    }
+    if pending != before.2 {
+        write(into, Doc::Pending, &pending)?;
+    }
+    Ok(differ)
+}
+
 /// Open a seed's document with `box_key`, the key of its box's generation, and seal it again under
 /// `current`, which this process keeps. A pending document is sealed for the first time. `false`
 /// when this keystore keeps nothing for the seed.

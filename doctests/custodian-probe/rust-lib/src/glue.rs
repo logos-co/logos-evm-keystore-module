@@ -42,6 +42,8 @@ pub trait KeystoreCustodianModule: Send + 'static {
     fn settle(&mut self) -> String;
     /// Remove one path the scan reported as unexplained. Tier D.
     fn remove(&mut self, path: String) -> String;
+    /// Move an older build's keystore into this one's. Tier D.
+    fn move_older(&mut self) -> String;
     /// Name a wallet. Tier D — the CLI is refused, and the name it would have written is
     /// the one a UI shows in place of an address that moves when an account is deleted.
     /// `address`/`password` are one of the wallet's own accounts, and are what a rename has
@@ -146,6 +148,10 @@ impl KeystoreCustodianModule for KeystoreCustodianModuleImpl {
     fn remove(&mut self, path: String) -> String {
         let p = json!({ "path": path, "acknowledgeMayBeKeyMaterial": true });
         pass(modules().keystore_module.remove_unexplained(&p.to_string()))
+    }
+
+    fn move_older(&mut self) -> String {
+        pass(modules().keystore_module.move_older_keystore())
     }
 
     fn name_wallet(&mut self, group: String, label: String, address: String, password: String) -> String {

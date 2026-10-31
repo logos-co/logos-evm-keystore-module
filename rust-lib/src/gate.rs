@@ -201,6 +201,8 @@ pub const TIER_D_METHODS: &[&str] = &[
     // rather than to whoever reads it.
     "settle",
     "remove_unexplained",
+    // Moving an older build's keystore in: its files move, and its wallets list again.
+    "move_older_keystore",
     // A Bitcoin wallet from a phrase: a mutation like any import.
     "import_bitcoin",
     // A kept phrase: showing its words is for the keys app alone, and forgetting it removes
@@ -341,6 +343,7 @@ mod tests {
             "set_group_label",
             "set_wallet_name",
             "restore_unlock_root",
+            "move_older_keystore",
         ] {
             assert!(TIER_D_METHODS.contains(&method), "{method} is not gated");
         }

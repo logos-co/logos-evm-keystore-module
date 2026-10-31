@@ -79,7 +79,7 @@ flowchart TB
             IMPL["KeystoreModuleImpl<br/>{ ks, approvals, roles }"]
             GATE["Tier gate<br/>current_caller() → A / B / C"]
             EV["KeystoreModuleEvents::accounts_changed<br/>→ emit_accounts_changed(count)"]
-            CTX["on_context_ready(ctx)<br/>ks = Keystore::new(ctx.instance_persistence_path/keystore)"]
+            CTX["on_context_ready(ctx)<br/>ks = Keystore::new(ctx.instance_persistence_path/keystore/v2)"]
         end
         subgraph Core["Crypto core — src/keystore.rs (no network, no Logos)"]
             KS["struct Keystore { dir }<br/>(no signer cache)"]
@@ -225,6 +225,8 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `get_account_wallets` | — | `{ ok, wallets: { <address>: { wallet, index? } } }` | no |
 | `settle` | — | `{ ok, swept, promoted, unexplained, links, staged, importStages }` | removes leftovers |
 | `remove_unexplained` | `params_json: String` | `{ ok, removed }` | removes one reported path |
+| `older_keystore` | — | `{ ok, accounts, keys, phrases, devices, documents: [file, ..], left: [path, ..] }`: what an older build left in `keystore/` | no |
+| `move_older_keystore` | — | the same shape, of what moved; `left` is what stays. Tier D | moves it into `keystore/v2/` → event |
 | `import_private_key` | `priv_hex: String, password: String` | `{ ok, address }` | yes → event |
 | `import_keystore_json` | `key_json, password, new_password: String` | `{ ok, address }` | yes → event |
 | `export_keystore_json` | `address, password: String` | `{ ok, keystore }` | no |
@@ -1092,6 +1094,22 @@ named after it has been swept was never nameable.
 
 ---
 
+### `older_keystore() -> String`, `move_older_keystore() -> String`
+
+What an older build left in the module's `keystore/` directory, and moving it into this one's,
+`keystore/v2/`. See [An older build's keystore](#an-older-builds-keystore). `older_keystore` is
+ungated; `move_older_keystore` is **Tier D** and emits `accounts_changed`.
+
+**Success:** `{ "ok": true, "accounts": 2, "keys": 1, "phrases": 1, "devices": 0,
+"documents": ["index.pending.json", "seeds.json"], "left": ["notes.txt"] }`
+
+```bash
+logosctl call keystore_module older_keystore
+logosctl call keystore_custodian move_older_keystore   # the custodian: Tier D
+```
+
+---
+
 ### `remove_unexplained(params_json: String) -> String`
 
 Remove one path the scan reported as unexplained. **Tier D.** Emits `accounts_changed`.
@@ -1421,7 +1439,7 @@ Every request is classified by the **caller identity** the platform reports
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
 | **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity`, `list_phrases` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `restore_unlock_root`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (default `evm_keystore_ui`) |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `restore_unlock_root`, `move_older_keystore`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (default `evm_keystore_ui`) |
 | **M** | the signer interface's signing calls and the keys an unlock holds — see [the keystore as a signer](#the-keystore-as-a-signer-logossigner1) | a configured **manager** (default `signer_manager_module`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
@@ -1901,7 +1919,8 @@ with `eth_rpc_module` / `uniswap_module`, which set `concurrency: "multi"`.) See
 ### Persistence location & on-context-ready
 
 On `on_context_ready(ctx)` the glue computes the keystore directory as
-`ctx.instance_persistence_path / "keystore"` and constructs `Keystore::new(dir)`.
+`ctx.instance_persistence_path / "keystore" / "v2"` and constructs `Keystore::new(dir)`.
+`keystore/` itself is where older builds kept theirs (see *An older build's keystore* below).
 Until that hook runs, `self.ks` is `None` and `String`-returning methods report
 `keystore not initialized (context not ready)` while bool methods return `false`.
 The `instance_persistence_path` is supplied by the Logos runtime
@@ -2018,6 +2037,40 @@ it cannot explain is removable by name too, with `remove_unexplained()` — incl
 `groups/` that turned out to be a symlink, which is refused at the write (a key
 through it would land outside the keystore, where no scan of it could ever name what
 landed) and reported with its destination.
+
+### An older build's keystore
+
+Builds before `v2` wrote the module's `keystore/` itself. This build keeps its own in
+`keystore/v2/` (`layout::CURRENT`) and does **not read** what an older one left: those wallets are
+not listed and can't sign until they are moved in, which the keys app offers.
+
+* **`older_keystore`** (ungated) scans `keystore/` with the same classifier, skipping `v2/` at its
+  root (`layout::scan_older`), and counts what a move would bring in now: `accounts`, `keys`
+  (wallet keys), `phrases`, `devices`, and `documents` by file name. `left` lists what would stay:
+  what no build of this keystore wrote (both severities, and interrupted document writes), and
+  what this keystore holds otherwise (a file at the same path, a seed held differently, a device
+  wallet recorded differently). A file browser's own files are not listed. So what stays after a
+  move is not offered again: the keys app shows the offer only while a count or `documents` is
+  non-empty.
+* **`move_older_keystore`** (Tier D) moves it in, under this keystore's lock:
+  1. every file and staging directory the scan explains is renamed to the same path under `v2/`,
+     unless something is already there (then it stays, and is listed in `left`);
+  2. older builds' own four documents are renamed in, and the next read takes them into the index
+     as it always did;
+  3. `seeds.json`, `index.sealed.json` and `index.pending.json` are joined to this keystore's by
+     seed (`index::adopt`): a seed only the older one holds comes in as it is, its box still
+     sealed. A seed held the same here is skipped; one held differently keeps this keystore's
+     version, and the older documents then stay and are listed in `left`;
+  4. `device-wallets.json` is joined the same way, unless an id is recorded differently here;
+  5. `settle` runs, so a moved staging directory is promoted or swept.
+
+  Files move before documents, so a move cut short leaves files no record names yet (reported,
+  never lost) rather than a record whose file is missing, and asking again finishes it. The moved
+  seeds arrive closed: the module asks the signer manager for their keys, as at start-up, and
+  announces the new accounts. An older build's wallet that never had an unlock root is then
+  listed in `addAgain`, as in place.
+* **Downgrading** to an older build after a move shows no wallets there: it reads `keystore/`,
+  and reports `v2/` as material it did not write. Nothing is lost; moving forward again reads it.
 
 ### Concurrent access
 
