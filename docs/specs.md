@@ -262,11 +262,11 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `unlock` | `params_json: String` | `{ ok, account, expiresInMs, countLeft }` | no |
 | `lock` | `params_json: String` | `{ ok, locked }` | no |
 | `unlocked` | — | `{ ok, unlocked: [..] }` | no |
-| `database_key` | `params_json: String` | `{ ok, group, databaseKey, origin, birthday }` | no |
-| `device_database_key` | `params_json: String` | `{ ok, signer, account, databaseKey, origin, birthday, created }` | the first open makes a vault → event |
-| `device_wallets` | — | `{ ok, wallets: [{ signer, account, birthday, createdMs }] }` | no |
+| `database_key` | `params_json: String` | `{ ok, group, databaseKey }` | no |
+| `device_database_key` | `params_json: String` | `{ ok, signer, account, databaseKey, created }` | the first open makes a vault → event |
+| `device_wallets` | — | `{ ok, wallets: [{ signer, account, createdMs }] }` | no |
 | `forget_device_wallet` | `params_json: String` | `{ ok, forgotten }` | yes → event |
-| `import_bitcoin` | `params_json: String` | `{ ok, group, family, chain, path, fingerprint, external, internal, phrase, origin, birthday }` | yes → event |
+| `import_bitcoin` | `params_json: String` | `{ ok, group, family, chain, path, fingerprint, external, internal, phrase }` | yes → event |
 | `show_phrase` | `params_json: String` | `{ ok, phrase, words }` | no |
 | `forget_phrase` | `params_json: String` | `{ ok, forgotten }` | yes → event |
 | `list_phrases` | — | `{ ok, phrases: [{ id, groups, staged }] }` | no |
@@ -1167,16 +1167,9 @@ An EVM record gains only `fingerprint`, the master fingerprint of the phrase it 
 recorded while the seed is in memory; a Bitcoin import from the same phrase fills it in on older
 records.
 
-**Where its history starts.** The record also keeps `origin` and `birthday`, for the wallet core
-to know where to start scanning:
-- `created`: the keys app made the phrase for this wallet, so no coin can have reached it before
-  the day it is made. `birthday` is that day, by the keystore's clock, in UTC.
-- `restored`: the phrase came from elsewhere, or was kept earlier. `birthday` is the day the
-  person gave, if they knew it.
-
-A birthday is a real day as `YYYY-MM-DD`, from 2009-01-03 to tomorrow in UTC, since the person's
-day may run ahead of it. A wallet from a kept phrase is always `restored`, since the phrase is older
-than the wallet. A record from before these were kept reads `restored`, with no birthday.
+**Where its history starts** is not kept here: the Bitcoin wallet core keeps each account's
+birthday itself. The `origin` an older build recorded, or an older caller sends, is ignored with
+it, and a record drops both the next time it is written.
 
 `account_descriptors` (`{ group }`, for the configured manager or custodian, so the keys app can
 show a wallet's descriptor with its warning) returns both descriptors with their BIP380
@@ -1295,7 +1288,7 @@ an item under it is refused. A key imported on its own derives its unlock key fr
 - **Enrolment.** After every import (`import_mnemonic`, `import_seed_wallet`, `import_bitcoin`,
   `import_private_key`, `import_keystore_json`, `create_unrelated_account`) the keystore tells the
   manager of the seed, while the password is at hand, so the person never unlocks it twice:
-  `enroll_seed({ seed, kind: "keystore", unlockKey, name, origin?, birthday? })` through
+  `enroll_seed({ seed, kind: "keystore", unlockKey, name })` through
   `logos.wallets/1` (`wallets.lidl`), bound to `signer_manager_module` at runtime. It is asked
   without waiting; with no manager installed, the import succeeds all the same.
 
@@ -1333,10 +1326,9 @@ deleted account end the account's unlock, and nothing about an unlock is written
 
 ### `database_key(params_json: String) -> String`
 
-`{ group, password? }` → `{ ok, group, databaseKey, origin, birthday }`: a Bitcoin wallet's 32
-random bytes for the wallet core's database, for an open request the keys app approved, with where
-its history starts (`birthday` is `null` when unknown). With `password` the vault opens; without
-it, the wallet's unlock answers, and opening uses no count.
+`{ group, password? }` → `{ ok, group, databaseKey }`: a Bitcoin wallet's 32 random bytes for the
+wallet core's database, for an open request the keys app approved. With `password` the vault opens;
+without it, the wallet's unlock answers, and opening uses no count.
 
 ### Device wallets' database keys
 
@@ -1345,17 +1337,15 @@ wallet core's encrypted database. The keystore keeps one per device account, in 
 own under a password the person sets the first time the wallet is opened for an app. It opens the
 wallet core's records and nothing else: no coin, no signature. The device signs.
 
-- **`device_database_key`** (`{ signer, account, password, birthday? }`, Tier M): the manager
-  calls it for an open the keys app approved, naming the signer module that offers the account
-  and the account's id there.
-  - The first open makes the vault: 32 random bytes under `password`, with the `birthday` the
-    person gave, if any.
-  - Every later open needs that password, and keeps the first birthday.
+- **`device_database_key`** (`{ signer, account, password }`, Tier M): the manager calls it for
+  an open the keys app approved, naming the signer module that offers the account and the
+  account's id there.
+  - The first open makes the vault: 32 random bytes under `password`.
+  - Every later open needs that password.
   - A wrong password is `wrong_secret`, with one message for every way the vault fails to open.
-  - The reply is `{ ok, signer, account, databaseKey, origin: "restored", birthday, created }`.
-    A device account is always `restored`: a device keeps no record of when its seed was made.
-- **`device_wallets`** (the manager and the custodian): which device accounts have a vault, with
-  their birthdays. Never a key.
+  - The reply is `{ ok, signer, account, databaseKey, created }`.
+- **`device_wallets`** (the manager and the custodian): which device accounts have a vault. Never a
+  key.
 - **`forget_device_wallet`** (`{ signer, account }`, Tier D): removes the vault and its record
   without a password, the escape from a forgotten one. What the old key opened can no longer be
   read, so a wallet core starts its records over. The next open makes a new vault.
@@ -1363,7 +1353,7 @@ wallet core's records and nothing else: no coin, no signature. The device signs.
 **What is kept.** The vault sits at `groups/<device id>.json`, where the id is `d_` plus 16 random
 bytes, never derived from the account. It is staged and renamed like a group key, and holds
 `{ v: 1, databaseKey }` in the same scrypt envelope. `device-wallets.json` maps each id to its
-signer, account, creation time and birthday. The scan explains both paths, staged and live. A
+signer, account and creation time. The scan explains both paths, staged and live. A
 database key is not key material: it is never counted among what could open a whole wallet.
 
 A record whose vault never landed, from an interrupted first open, is no wallet: the next open
@@ -1373,13 +1363,9 @@ another wallet.
 ### `import_bitcoin(params_json: String) -> String`
 
 `{ phrase, passphrase?, family: "bitcoin" | "bitcoin_taproot", chain: "main" | "test", account?,
-password, label?, keepPhrase?: { password }, origin?: "created" | "restored", birthday? }` →
-`{ ok, group, family, chain, path, fingerprint, external, internal, phrase, origin, birthday }`,
-the two descriptors with their checksums. Tier D. See [Bitcoin wallets](#bitcoin-wallets-bip84-bip86).
-
-`origin` defaults to `restored`, which takes an optional `birthday`. `created` takes none: its
-birthday is the day it is made. A birthday that isn't a real day from 2009-01-03 on, or a created
-wallet from a kept phrase, is refused and records nothing.
+password, label?, keepPhrase?: { password } }` → `{ ok, group, family, chain, path, fingerprint,
+external, internal, phrase }`, the two descriptors with their checksums. Tier D. See [Bitcoin
+wallets](#bitcoin-wallets-bip84-bip86).
 
 `keepPhrase` keeps the phrase in a vault of its own under that password, and `phrase` in the
 reply is its id. `{ keptPhrase, phrasePassword }` in place of `phrase` makes another wallet from
