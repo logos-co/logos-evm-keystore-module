@@ -564,7 +564,6 @@ mod tests {
                 label: "",
                 wallet_name: "",
                 keep: crate::keystore::KeepPhrase::No,
-                start: crate::keystore::WalletStart::Restored(None),
             })
             .unwrap();
         }

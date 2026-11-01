@@ -32,7 +32,7 @@ pub mod hd;
 
 pub use ack::Unrecoverable;
 pub use keystore::{
-    BitcoinGroup, BitcoinImport, Enrolment, KeepPhrase, KeptPhrase, Keystore, KeystoreError, WalletStart, IMPORTED_SEED,
+    BitcoinGroup, BitcoinImport, Enrolment, KeepPhrase, KeptPhrase, Keystore, KeystoreError, IMPORTED_SEED,
 };
 
 /// A seed's unlock key: what unlocks the wallet's data in every app, kept behind its password.
