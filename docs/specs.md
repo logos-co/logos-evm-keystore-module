@@ -603,7 +603,8 @@ the machine is showing, and the count in the payload does not move.
 **A wallet's name is its seed's; an account file's is its own.** `set_wallet_name` names the
 wallet — every account file of one seed, shown as the header over them — with `group` any file of
 it, priced as `set_group_label` prices a name. `list_groups` gives each file's `walletName`, and
-the imports take `walletName`, kept for a seed that has none yet. Each file's `fingerprint` is its
+the imports take `walletName`, kept for a seed that has none yet; `walletDefaultName` is the
+wallet's name until it has one. Each file's `fingerprint` is its
 seed's master fingerprint, the Wallet ID the apps show. A file's `label` is its own name,
 empty unless the person gives one. An older keys app copied the wallet's name onto every file and
 account: the first `set_wallet_name` of that seed takes the copy off them.
@@ -626,6 +627,13 @@ wallet with no signer manager, or a stranded key, still proves custody.
 `wallets_changed`, the module reads `wallets()`: it takes the name of each of its wallets that is
 `named` (given in any app), and sends its own name for one not named yet, once a run. A locked
 wallet takes its name once it unlocks.
+
+**Until someone names it, a wallet goes by one default.** It is the name an older keys app copied
+onto its files, else `Keystore wallet` (`Imported key` for a key imported on its own). The same
+default is the name the signer manager gets at enrolment, `list_groups` gives it as each file's
+`walletDefaultName`, and clearing the name with `set_wallet_name` sends it to the manager. So the
+Keys app and the Signer app never disagree about an unnamed wallet, and a cleared name doesn't come
+back from the manager at the next start.
 
 **Otherwise, setting a name needs a password; clearing one never does.** A label is what a reader
 shows *in place of* an address, so writing one is a claim of custody — and until this

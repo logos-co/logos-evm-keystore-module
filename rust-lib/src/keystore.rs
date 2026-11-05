@@ -194,21 +194,28 @@ fn adopt_copied_name(d: &mut SeedDoc, seed: &str) {
     if d.wallet_names.contains_key(seed) {
         return;
     }
-    let groups: Vec<String> = d
-        .groups
-        .iter()
-        .filter(|(id, _)| Keystore::seed_of_group(&d.groups, id) == seed)
-        .map(|(id, _)| id.clone())
-        .collect();
-    let names: std::collections::BTreeSet<&String> =
-        groups.iter().filter_map(|id| d.group_labels.get(id)).filter(|n| !n.trim().is_empty()).collect();
-    let [copied] = names.into_iter().collect::<Vec<_>>()[..] else { return };
-    let copied = copied.clone();
+    let Some(copied) = copied_name(d, seed) else { return };
+    let groups = groups_of_seed(d, seed);
     d.group_labels.retain(|id, n| !(groups.contains(id) && *n == copied));
     let accounts: Vec<String> =
         d.accounts.iter().filter(|(_, p)| groups.contains(&p.group)).map(|(a, _)| a.clone()).collect();
     d.labels.retain(|a, n| !(accounts.contains(a) && *n == copied));
     d.wallet_names.insert(seed.to_string(), copied);
+}
+
+fn groups_of_seed(d: &SeedDoc, seed: &str) -> Vec<String> {
+    d.groups.keys().filter(|id| Keystore::seed_of_group(&d.groups, id) == seed).cloned().collect()
+}
+
+/// The one name an older keys app copied onto a seed's files, if they carry exactly one.
+fn copied_name(d: &SeedDoc, seed: &str) -> Option<String> {
+    let names: std::collections::BTreeSet<&String> = groups_of_seed(d, seed)
+        .iter()
+        .filter_map(|id| d.group_labels.get(id))
+        .filter(|n| !n.trim().is_empty())
+        .collect();
+    let [copied] = names.into_iter().collect::<Vec<_>>()[..] else { return None };
+    Some(copied.clone())
 }
 
 /// An account's key in the index: lowercase hex, no 0x.
@@ -688,27 +695,32 @@ impl Keystore {
     pub fn enrolment(&self, account_or_group: &str, password: &str) -> Result<Enrolment> {
         let id = account_or_group.trim();
         let groups = self.get_groups()?;
-        let names = self.get_group_labels()?;
-        let wallets = self.wallet_names()?;
-        let (seed, name) = match groups.get(id) {
-            Some(_) => (Self::seed_of_group(&groups, id), names.get(id).cloned().filter(|n| !n.is_empty())),
+        let seed = match groups.get(id) {
+            Some(_) => Self::seed_of_group(&groups, id),
             None => {
                 let addr = parse_address(id)?;
                 let p = by_key(&self.get_provenance()?, &addr.to_string())
                     .cloned()
                     .ok_or_else(|| KeystoreError::NotFound(addr.to_string()))?;
-                let label = by_key(&self.get_labels()?, &addr.to_string()).cloned().filter(|l| !l.is_empty());
-                let name = names.get(&p.group).cloned().filter(|n| !n.is_empty()).or(label);
-                (Self::seed_of_account(&groups, &p), name)
+                Self::seed_of_account(&groups, &p)
             }
         };
         let unlock_key = self.unlock_key(&seed, 0, password)?;
-        let name = wallets.get(&seed).cloned().filter(|n| !n.is_empty()).or(name);
-        // The name shows while the wallet is locked, so it never comes from an address.
-        let name = name.unwrap_or_else(|| {
-            if seed.starts_with(IMPORTED_SEED) { "Imported key".into() } else { "Keystore wallet".into() }
-        });
+        let name = match self.wallet_name_of_seed(&seed) {
+            Some(n) => n,
+            None => self.default_wallet_name(&seed)?,
+        };
         Ok(Enrolment { seed, unlock_key, name })
+    }
+
+    /// A wallet's name until the person gives one, the same here, at enrolment and once a name is
+    /// cleared: the one an older keys app copied onto its files, else its kind. The name shows
+    /// while the wallet is locked, so it never comes from an address.
+    pub fn default_wallet_name(&self, seed: &str) -> Result<String> {
+        let d = self.view()?.merged();
+        Ok(copied_name(&d, seed).unwrap_or_else(|| {
+            if seed.starts_with(IMPORTED_SEED) { "Imported key".into() } else { "Keystore wallet".into() }
+        }))
     }
 
     /// Older builds' wallets the signer manager can't be asked for until the person adds them
@@ -7409,6 +7421,33 @@ mod tests {
         ks2.import_mnemonic_ex(&ImportRequest { index: 1, group_label: "Two", ..req(Storage::Plain, 0) }).unwrap();
         ks2.set_wallet_name(&rename_as(&x.group, "Both", &x.address.to_string(), "pw")).unwrap();
         assert_eq!(ks2.get_group_labels().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_wallet_no_one_named_goes_by_one_default_at_enrolment_and_once_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let a = ks.import_mnemonic_ex(&ImportRequest { group_label: "", ..req(Storage::Plain, 0) }).unwrap();
+        let seed = seed_of(&ks, &a.group);
+        assert_eq!(ks.default_wallet_name(&seed).unwrap(), "Keystore wallet");
+        // An account's own name is never the wallet's.
+        ks.set_label(&a.address.to_string(), "Daily", "pw").unwrap();
+        assert_eq!(ks.enrolment(&a.address.to_string(), "pw").unwrap().name, "Keystore wallet");
+
+        ks.set_wallet_name(&rename_as(&a.group, "Main", &a.address.to_string(), "pw")).unwrap();
+        assert_eq!(ks.enrolment(&a.group, "pw").unwrap().name, "Main");
+        ks.set_wallet_name(&rename(&a.group, "")).unwrap();
+        assert_eq!(ks.enrolment(&a.group, "pw").unwrap().name, "Keystore wallet", "cleared: the default again");
+
+        // The copy an older keys app left on every file is the default; two names of their own aren't.
+        let d2 = tempfile::tempdir().unwrap();
+        let ks2 = Keystore::new(d2.path());
+        let x = ks2.import_mnemonic_ex(&ImportRequest { group_label: "Old", ..req(Storage::Plain, 0) }).unwrap();
+        ks2.import_mnemonic_ex(&ImportRequest { index: 1, group_label: "Old", ..req(Storage::Plain, 0) }).unwrap();
+        assert_eq!(ks2.default_wallet_name(&seed_of(&ks2, &x.group)).unwrap(), "Old");
+        ks2.import_mnemonic_ex(&ImportRequest { index: 2, group_label: "Other", ..req(Storage::Plain, 0) }).unwrap();
+        assert_eq!(ks2.default_wallet_name(&seed_of(&ks2, &x.group)).unwrap(), "Keystore wallet");
+        assert_eq!(ks2.enrolment(&x.group, "pw").unwrap().name, "Keystore wallet", "not the file's own name");
     }
 
     // ---- an older build's wallet the signer manager can't be asked for --------------
