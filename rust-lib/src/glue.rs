@@ -95,16 +95,18 @@ pub trait KeystoreModule: Send + 'static {
     /// Derivation groups, `{ ok, groups: [...], lockedWallets, lockedSeeds, addAgain }`. UNGATED, like
     /// `get_labels`: a wallet showing an account picker needs it. Includes STRANDED groups — a
     /// derivation key on disk that no record names. A wallet locked in the Signer app is not
-    /// listed, only counted. Each group's `label` is its own name; `walletName` is its seed's.
-    /// `addAgain` names older builds' wallets the signer manager can't be asked for, `{ seed,
-    /// needs: "phrase" | "password", groups, accounts }`, and their files carry `needsPhrase`.
+    /// listed, only counted. Each group's `label` is its own name; `walletName` is its seed's,
+    /// and `walletDefaultName` the one the wallet goes by until someone names it. `addAgain`
+    /// names older builds' wallets the signer manager can't be asked for, `{ seed, needs:
+    /// "phrase" | "password", groups, accounts }`, and their files carry `needsPhrase`.
     fn list_groups(&mut self) -> String;
     /// Add an older build's wallet again, so the signer manager can unlock it: `{ group, phrase |
     /// keptPhrase + phrasePassword, passphrase?, password }` records its unlock root, `{ account,
     /// password }` an imported key's check; then it is enrolled. → `{ ok, seed }`.
     fn restore_unlock_root(&mut self, params_json: String) -> String;
     /// Name a wallet — every account file of one seed — `{ group, label, address?, password? }`
-    /// → `{ ok }`, `group` being any file of it, priced as `set_group_label` prices a name.
+    /// → `{ ok }`, `group` being any file of it, priced as `set_group_label` prices a name. An
+    /// empty `label` clears it, and the signer manager gets the default name back.
     fn set_wallet_name(&mut self, params_json: String) -> String;
     /// What the key directory holds: `{ ok, groups, staged, unexplained }`. UNGATED. Reads
     /// the directory ONLY, so a wallet whose bookkeeping is unreadable can still be named —
@@ -1186,6 +1188,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         match res {
             Ok((rows, wallet_names, again)) => {
                 let records: BTreeMap<String, Group> = rows.iter().map(|g| (g.id.clone(), g.group.clone())).collect();
+                let mut defaults: BTreeMap<String, Option<String>> = BTreeMap::new();
                 let groups: Vec<_> = rows
                     .into_iter()
                     .map(|g| {
@@ -1196,9 +1199,17 @@ impl KeystoreModule for KeystoreModuleImpl {
                             }
                         } else { serde_json::Value::Null };
                         let seed = g.group.seed.as_ref().map_or(g.id.as_str(), |s| s.id.as_str());
+                        let default = match defaults.get(seed) {
+                            Some(d) => d.clone(),
+                            None => {
+                                let d = self.ks().ok().and_then(|ks| ks.default_wallet_name(seed).ok());
+                                defaults.insert(seed.to_string(), d.clone());
+                                d
+                            }
+                        };
                         json!({
                             "id": g.id, "storage": g.group.storage.as_str(),
-                            "walletName": wallet_names.get(seed),
+                            "walletName": wallet_names.get(seed), "walletDefaultName": default,
                             "pathPrefix": g.group.path_prefix,
                             "seedId": g.group.seed.as_ref().map(|s| &s.id), "nextIndex": g.group.next_index,
                             "usedIndices": g.used_indices, "retiredIndices": g.group.retired,
@@ -1557,8 +1568,15 @@ impl KeystoreModule for KeystoreModuleImpl {
         match self.ks() {
             Ok(ks) => match ks.set_wallet_name(&req) {
                 Ok(()) => {
-                    if let (Ok(seed), false) = (ks.seed_of_file(&p.group), p.label.trim().is_empty()) {
-                        send_name(seed, p.label.trim().to_string());
+                    // A cleared name is the default again, in the signer manager too.
+                    if let Ok(seed) = ks.seed_of_file(&p.group) {
+                        let name = match p.label.trim() {
+                            "" => ks.default_wallet_name(&seed).ok(),
+                            given => Some(given.to_string()),
+                        };
+                        if let Some(name) = name {
+                            send_name(seed, name);
+                        }
                     }
                     self.announce();
                     json!({ "ok": true }).to_string()

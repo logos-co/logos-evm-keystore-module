@@ -62,7 +62,8 @@ a name; an empty string clears. `get_group_labels` answers from the names alone 
 survives the record and the key it belonged to, which is the row a UI most needs to name.
 Duplicates are storable on purpose; uniqueness is the reader's problem. A wallet unlocked in the
 Signer app is named with no password, and its name is shared with the signer manager, so every
-app shows the same one. `change_wallet_password` puts all of a wallet's files under one password.
+app shows the same one. Until it is named, and again once its name is cleared, a wallet goes by
+one default (`walletDefaultName` in `list_groups`), which the signer manager has too. `change_wallet_password` puts all of a wallet's files under one password.
 
 **A locked wallet lists nothing.** The records, accounts and names are kept one document per
 seed, sealed under this module's key for that seed from the signer manager (`data_key(seed,
