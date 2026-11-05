@@ -175,6 +175,9 @@ pub const TIER_D_METHODS: &[&str] = &[
     "import_keystore_json",
     "export_keystore_json",
     "change_password",
+    // One password over every file of a wallet, and whether one opens it: as `change_password`.
+    "change_wallet_password",
+    "opens_wallet",
     "set_label",
     // Naming a WALLET or an account file, like naming an account: it is written by whoever
     // manages the keystore, and it is what a reader shows in place of an address.
@@ -183,6 +186,8 @@ pub const TIER_D_METHODS: &[&str] = &[
     // Adding an older build's wallet again: it records an unlock root, from its phrase.
     "restore_unlock_root",
     "delete_account",
+    // A Bitcoin account's file holds its only key here: removing it is `delete_account`'s.
+    "delete_bitcoin_account",
     // HD derivation. Deriving an account is a mutation, and it opens a vault whose blast
     // radius is a whole wallet rather than one account — so if anything it belongs here
     // more firmly than the rest.

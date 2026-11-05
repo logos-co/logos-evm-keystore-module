@@ -24,6 +24,7 @@ const ANNOUNCES: &[&str] = &[
     "import_private_key",
     "import_keystore_json",
     "delete_account",
+    "delete_bitcoin_account",
     "set_label",
     "set_group_label",
     "set_wallet_name",
@@ -48,6 +49,9 @@ const SILENT: &[&str] = &[
     "preview_addresses",
     "export_keystore_json",
     "change_password",
+    // One password over a wallet's files, and checking one: nothing a reader shows moves.
+    "change_wallet_password",
+    "opens_wallet",
     "list_accounts",
     "get_account_wallets",
     "get_labels",

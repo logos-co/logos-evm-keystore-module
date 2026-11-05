@@ -407,18 +407,8 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
     let names = ks.get_group_labels().map_err(from_keystore)?;
     let groups = ks.get_groups().map_err(from_keystore)?;
     let seed_of = |address: &str| by_address(&provenance, address).map(|p| Keystore::seed_of_account(&groups, p));
-    // The wallet an EVM account comes from: its group's fingerprint, else one another group of the
-    // same seed recorded. An imported key belongs to no wallet.
-    let wallet_of = |gid: &str| {
-        let g = groups.get(gid)?;
-        g.fingerprint.clone().or_else(|| {
-            let seed = g.seed.as_ref()?;
-            groups
-                .values()
-                .filter(|o| o.seed.as_ref().is_some_and(|s| s.id == seed.id))
-                .find_map(|o| o.fingerprint.clone())
-        })
-    };
+    // The wallet an EVM account comes from. An imported key belongs to no wallet.
+    let wallet_of = |gid: &str| Keystore::wallet_fingerprint(&groups, gid);
     // An older build's wallet the manager can't be asked for is left out until it is added again.
     let waiting = ks.add_again().map_err(from_keystore)?;
     let mut out = Vec::new();

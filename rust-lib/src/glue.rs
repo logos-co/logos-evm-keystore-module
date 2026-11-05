@@ -13,6 +13,7 @@
 use serde::Deserialize;
 use serde_json::json;
 use zeroize::Zeroizing;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::ack::Unrecoverable;
@@ -20,11 +21,13 @@ use crate::approval::Approvals;
 use crate::btc::{Chain as BtcChain, Family as BtcFamily};
 use crate::gate;
 use crate::index::AddAgain;
-use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
+use crate::keystore::{Derived, Group, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
 use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
 use crate::BitcoinImport;
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
-use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
+use logos_signer_interface::wallets::{
+    name_steps, read_data_key, read_wallets, DataKey, DataKeyRequest, NameSeed, NameStep,
+};
 use logos_signer_interface::{json as signer_json, wire};
 
 /// The keystore module's IPC contract. Each non-defaulted method is a callable
@@ -148,6 +151,17 @@ pub trait KeystoreModule: Send + 'static {
     /// and renamed, so a failure cannot leave the account with no readable copy.
     /// `{ ok, address }`, or `{ ok: false }` if the old password is wrong.
     fn change_password(&mut self, address: String, old_password: String, new_password: String) -> String;
+    /// Put every file of a wallet under one password: `{ seed, passwords: [old…], newPassword }` →
+    /// `{ ok, changed, already, left: [{ kind, id, address? }] }`. Each file takes the first of
+    /// `passwords` that opens it; `left` lists those none opens, to ask for theirs and call again.
+    /// Tier D. Unlocks opened with an old password end.
+    fn change_wallet_password(&mut self, params_json: String) -> String;
+    /// Whether `password` opens any file of a wallet, which adding to it takes: `{ seed, password }`
+    /// → `{ ok, opens }`. Tier D.
+    fn opens_wallet(&mut self, params_json: String) -> String;
+    /// Remove a Bitcoin account, whose wallet file holds its only key here: `{ group, password }`
+    /// → `{ ok, removed }`. Tier D.
+    fn delete_bitcoin_account(&mut self, params_json: String) -> String;
     /// Name an account, or clear the name with an empty string. Tier D, plus the account's
     /// own vault password when a name is being SET: a label is what a wallet shows in place
     /// of an address, so writing one is a claim of custody and now has to prove it. Clearing
@@ -306,10 +320,13 @@ fn watch_wallets(ks: Keystore) {
     let locked = client.on_wallets_locked();
     let k = ks.clone();
     std::thread::spawn(move || {
+        let mut sent = std::collections::HashSet::new();
         open_wallets(&k);
+        sync_names(&k, &mut sent);
         if let Ok(sub) = changed {
             for _ in sub {
                 open_wallets(&k);
+                sync_names(&k, &mut sent);
             }
         }
     });
@@ -353,6 +370,43 @@ fn open_wallets(ks: &Keystore) {
     if opened {
         announce_accounts(ks);
     }
+}
+
+/// One name per wallet: take the name the person gave in any app, and send one given here while
+/// the wallet has none, once a run.
+fn sync_names(ks: &Keystore, sent: &mut std::collections::HashSet<String>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    wallets::WalletsClient::bind(WALLETS).wallets_async_with_timeout(Duration::from_secs(10), move |r| {
+        let _ = tx.send(r);
+    });
+    let Some(listed) = rx.recv().ok().and_then(|r| r.ok()).and_then(|r| read_wallets(&r).ok()) else { return };
+    let mut took = false;
+    for step in name_steps(&listed, |seed| ks.wallet_name_of_seed(seed)) {
+        match step {
+            NameStep::Take { seed, name } => match ks.take_wallet_name(&seed, &name) {
+                Ok(t) => took |= t,
+                Err(e) => eprintln!("keystore_module: a wallet's name didn't apply: {e}"),
+            },
+            NameStep::Send { seed, name } => {
+                if sent.insert(seed.clone()) {
+                    send_name(seed, name);
+                }
+            }
+        }
+    }
+    if took {
+        announce_accounts(ks);
+    }
+}
+
+/// A wallet's name, to the signer manager, from a thread of its own: the first call to the manager
+/// waits for its connection in a nested event loop, where a call into this module would wait.
+fn send_name(seed: String, name: String) {
+    std::thread::spawn(move || {
+        if let Ok(body) = serde_json::to_string(&NameSeed { seed, name }) {
+            wallets::WalletsClient::bind(WALLETS).name_seed_async(&body, |_| {});
+        }
+    });
 }
 
 /// This module's key for a wallet's bookkeeping, named by the keystore's seed id.
@@ -611,6 +665,29 @@ struct UnrelatedParams {
 #[derive(Deserialize)]
 struct GroupParams {
     group: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WalletPasswordParams {
+    seed: String,
+    #[serde(default)]
+    passwords: Vec<String>,
+    new_password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpensWalletParams {
+    seed: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteBitcoinParams {
+    group: String,
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -1108,6 +1185,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok((rows, wallet_names, again)) => {
+                let records: BTreeMap<String, Group> = rows.iter().map(|g| (g.id.clone(), g.group.clone())).collect();
                 let groups: Vec<_> = rows
                     .into_iter()
                     .map(|g| {
@@ -1129,6 +1207,7 @@ impl KeystoreModule for KeystoreModuleImpl {
                             "stranded": g.stranded, "staged": g.staged,
                             "family": g.group.family, "chain": g.group.chain,
                             "phrase": g.group.phrase, "preview": preview,
+                            "fingerprint": Keystore::wallet_fingerprint(&records, &g.id),
                             "needsPhrase": again.iter().any(|a| a.needs == AddAgain::Phrase && a.groups.contains(&g.id)),
                         })
                     })
@@ -1342,6 +1421,68 @@ impl KeystoreModule for KeystoreModuleImpl {
         }
     }
 
+    fn change_wallet_password(&mut self, params_json: String) -> String {
+        if !self.may_mutate("change_wallet_password") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: WalletPasswordParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let olds: Vec<&str> = p.passwords.iter().map(|s| s.as_str()).collect();
+        match self.ks() {
+            Ok(ks) => match ks.change_wallet_password(&p.seed, &olds, &p.new_password) {
+                Ok(done) => {
+                    // A new password ends every unlock opened with an old one.
+                    self.unlocks.lock(None);
+                    json!({ "ok": true, "changed": done.changed, "already": done.already, "left": done.left })
+                        .to_string()
+                }
+                Err(e) => err(e),
+            },
+            Err(e) => err(e),
+        }
+    }
+
+    fn opens_wallet(&mut self, params_json: String) -> String {
+        if !self.may_mutate("opens_wallet") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: OpensWalletParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        match self.ks().and_then(|ks| ks.opens_wallet(&p.seed, &p.password).map_err(|e| e.to_string())) {
+            Ok(opens) => json!({ "ok": true, "opens": opens }).to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn delete_bitcoin_account(&mut self, params_json: String) -> String {
+        if !self.may_mutate("delete_bitcoin_account") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: DeleteBitcoinParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let res = match self.ks() {
+            Ok(ks) => ks.delete_bitcoin_account(&p.group, &p.password),
+            Err(e) => return err(e),
+        };
+        match res {
+            Ok(removed) => {
+                self.unlocks.lock(Some(&p.group));
+                self.announce();
+                json!({ "ok": true, "removed": removed }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
     fn set_label(&mut self, address: String, label: String, password: String) -> String {
         if !self.may_mutate("set_label") {
             let _ = Zeroizing::new(password);
@@ -1416,6 +1557,9 @@ impl KeystoreModule for KeystoreModuleImpl {
         match self.ks() {
             Ok(ks) => match ks.set_wallet_name(&req) {
                 Ok(()) => {
+                    if let (Ok(seed), false) = (ks.seed_of_file(&p.group), p.label.trim().is_empty()) {
+                        send_name(seed, p.label.trim().to_string());
+                    }
                     self.announce();
                     json!({ "ok": true }).to_string()
                 }
