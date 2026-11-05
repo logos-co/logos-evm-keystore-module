@@ -191,6 +191,8 @@ The crypto core is feature-gated away from the Logos glue so it stays
 `list_groups` includes a local `seedId` for wallets derived from the same BIP39 seed.
 Ethereum, Bitcoin native SegWit and Bitcoin Taproot branches share this ID, including
 branches on different networks. A different BIP39 passphrase creates a different seed group.
+Each file also carries the seed's master `fingerprint`, the Wallet ID every app shows; an EVM
+file that didn't record one takes another file's of the same seed.
 The existing wallet IDs, derivation paths, keys, passwords and signer descriptors stay intact.
 
 The metadata stores a random local ID and a salted check of a fixed derived public address;

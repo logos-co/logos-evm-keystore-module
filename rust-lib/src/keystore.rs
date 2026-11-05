@@ -633,6 +633,16 @@ impl Keystore {
         groups.get(group).and_then(|g| g.seed.as_ref()).map_or_else(|| group.to_string(), |s| s.id.clone())
     }
 
+    /// A file's master fingerprint, the Wallet ID every app shows: its own, else one another file
+    /// of its seed recorded (an EVM file records it only while the seed is in memory).
+    pub fn wallet_fingerprint(groups: &BTreeMap<String, Group>, group: &str) -> Option<String> {
+        let g = groups.get(group)?;
+        g.fingerprint.clone().or_else(|| {
+            let seed = g.seed.as_ref()?;
+            groups.values().filter(|o| o.seed.as_ref().is_some_and(|s| s.id == seed.id)).find_map(|o| o.fingerprint.clone())
+        })
+    }
+
     /// The seed an account comes from: its group's, else its own as a key imported on its own.
     pub fn seed_of_account(groups: &BTreeMap<String, Group>, p: &Provenance) -> String {
         if p.group.is_empty() {
@@ -7132,6 +7142,22 @@ mod tests {
         // Locked, it is refused: its files are listed by nothing.
         let fresh = Keystore::new(dir.path());
         assert!(matches!(fresh.change_wallet_password(&seed, &["new"], "x"), Err(KeystoreError::Refused(_))));
+    }
+
+    #[test]
+    fn every_file_of_a_seed_carries_its_master_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let (evm, _, _) = evm_wallet(&ks);
+        let btc = ks.bitcoin_groups().unwrap()[0].clone();
+        let (acct, _) = ks.bitcoin_account(&btc).unwrap();
+        let mut groups = ks.get_groups().unwrap();
+        let want = Some(acct.fingerprint.to_string());
+        assert_eq!(Keystore::wallet_fingerprint(&groups, &btc), want);
+        // An EVM file that didn't record it takes its seed's.
+        groups.get_mut(&evm).unwrap().fingerprint = None;
+        assert_eq!(Keystore::wallet_fingerprint(&groups, &evm), want);
+        assert_eq!(Keystore::wallet_fingerprint(&groups, "g_none"), None);
     }
 
     #[test]

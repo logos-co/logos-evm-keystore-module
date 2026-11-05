@@ -13,6 +13,7 @@
 use serde::Deserialize;
 use serde_json::json;
 use zeroize::Zeroizing;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::ack::Unrecoverable;
@@ -20,7 +21,7 @@ use crate::approval::Approvals;
 use crate::btc::{Chain as BtcChain, Family as BtcFamily};
 use crate::gate;
 use crate::index::AddAgain;
-use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
+use crate::keystore::{Derived, Group, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
 use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
 use crate::BitcoinImport;
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
@@ -1184,6 +1185,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok((rows, wallet_names, again)) => {
+                let records: BTreeMap<String, Group> = rows.iter().map(|g| (g.id.clone(), g.group.clone())).collect();
                 let groups: Vec<_> = rows
                     .into_iter()
                     .map(|g| {
@@ -1205,6 +1207,7 @@ impl KeystoreModule for KeystoreModuleImpl {
                             "stranded": g.stranded, "staged": g.staged,
                             "family": g.group.family, "chain": g.group.chain,
                             "phrase": g.group.phrase, "preview": preview,
+                            "fingerprint": Keystore::wallet_fingerprint(&records, &g.id),
                             "needsPhrase": again.iter().any(|a| a.needs == AddAgain::Phrase && a.groups.contains(&g.id)),
                         })
                     })

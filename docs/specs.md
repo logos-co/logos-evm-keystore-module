@@ -603,7 +603,8 @@ the machine is showing, and the count in the payload does not move.
 **A wallet's name is its seed's; an account file's is its own.** `set_wallet_name` names the
 wallet — every account file of one seed, shown as the header over them — with `group` any file of
 it, priced as `set_group_label` prices a name. `list_groups` gives each file's `walletName`, and
-the imports take `walletName`, kept for a seed that has none yet. A file's `label` is its own name,
+the imports take `walletName`, kept for a seed that has none yet. Each file's `fingerprint` is its
+seed's master fingerprint, the Wallet ID the apps show. A file's `label` is its own name,
 empty unless the person gives one. An older keys app copied the wallet's name onto every file and
 account: the first `set_wallet_name` of that seed takes the copy off them.
 
