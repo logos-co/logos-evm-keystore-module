@@ -233,6 +233,9 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `list_accounts` | — | `{ ok, accounts: [..], staged: [..], unexplained: [path, ..], mismatched: [..] }` | no |
 | `has_address` | `address: String` | `bool` | no |
 | `delete_account` | `address, password: String` | `bool` | yes → event |
+| `delete_bitcoin_account` | `params_json: String` — `{ group, password }` | `{ ok, removed }`: its wallet file, record and name. Tier D | yes → event |
+| `change_wallet_password` | `params_json: String` — `{ seed, passwords, newPassword }` | `{ ok, changed, already, left: [{ kind, id, address? }] }`. Tier D | no |
+| `opens_wallet` | `params_json: String` — `{ seed, password }` | `{ ok, opens }`. Tier D | no |
 | `set_label` | `address, label, password: String` | `{ ok }` | no |
 | `get_labels` | — | `{ ok, labels: { <address>: <name> } }` | no |
 | `set_group_label` | `params_json: String` | `{ ok }` | no |
@@ -558,6 +561,30 @@ logosctl call keystore_module delete_account <address> pw
 
 ---
 
+### One password per wallet
+
+A wallet's files (its accounts' vaults, its wallet files, their unlock roots, its kept phrases)
+each have a scrypt envelope of their own, and older builds asked a password per file. The keys
+app now asks one per wallet:
+
+- **`change_wallet_password({ seed, passwords, newPassword })`** puts every file of `seed` under
+  `newPassword`. Each takes the first of `passwords` that opens it; `left` lists the files none
+  opens (`account` with its `address`, `wallet`, `unlock` or `phrase`), which keep their own. The
+  app asks for one of those and calls again: `newPassword` counts as one of `passwords`, so files
+  already moved count as `already`.
+  - Every file is written on its own, staged and renamed like every vault here. A call cut short
+    leaves some files under the new password, and calling again finishes it.
+  - A locked wallet is refused: unlock it in the Signer app first. Every unlock held in memory
+    ends, as `change_password` ends one.
+- **`opens_wallet({ seed, password })`** says whether `password` opens any file of `seed`. Adding
+  accounts to a wallet asks for its password and checks it here, then gives it to every new file.
+- **`delete_bitcoin_account({ group, password })`** removes a Bitcoin account: its wallet file,
+  staged copy, record and name. Its file holds the account's only key here, so like
+  `delete_account` it takes that file's password and checks the key is the record's.
+  `forget_derivation` still refuses a Bitcoin file.
+- A wallet file left with no account and no key stays until `remove_group`; an app removing a
+  file's last account follows with it.
+
 ### Naming accounts and wallets
 
 Four methods: the two `set_` calls are **Tier D** *and* need a password (below), and the
@@ -588,7 +615,18 @@ logosctl call keystore_module get_group_labels
 # → {"ok":true,"labels":{"g_0123456789abcdef0123456789abcdef":"Cold storage"}}
 ```
 
-**Setting a name needs a password; clearing one never does.** A label is what a reader
+**A wallet unlocked in the Signer app is named with no password.** The person just showed they hold
+it there, so `set_label`, `set_group_label` and `set_wallet_name` ask nothing for an account or a
+file of a seed the signer manager unlocked this session. Otherwise the rules below apply: a
+wallet with no signer manager, or a stranded key, still proves custody.
+
+**One name per wallet.** The signer manager keeps the name every app shows. A name given with
+`set_wallet_name` goes to it with `name_seed`, from a thread of its own. At start and on each
+`wallets_changed`, the module reads `wallets()`: it takes the name of each of its wallets that is
+`named` (given in any app), and sends its own name for one not named yet, once a run. A locked
+wallet takes its name once it unlocks.
+
+**Otherwise, setting a name needs a password; clearing one never does.** A label is what a reader
 shows *in place of* an address, so writing one is a claim of custody — and until this
 landing it was the one keystore mutation with no proof behind it, while delete, export
 and change-password each had one. What is required depends on what the name speaks for:

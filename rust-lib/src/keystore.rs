@@ -503,6 +503,131 @@ impl Keystore {
         })
     }
 
+    /// Put every file of a seed under one password, `new`: its accounts' vaults, its wallet files,
+    /// its unlock roots and its kept phrases. Each file takes the first of `passwords` that opens
+    /// it; one none opens keeps its own and is listed in `left`. Every file is written on its own,
+    /// staged and renamed, so a call cut short leaves some files under `new`: calling again with
+    /// the old passwords finishes it, `new` counting as one.
+    pub fn change_wallet_password(&self, seed: &str, passwords: &[&str], new: &str) -> Result<WalletPassword> {
+        let seed = seed.trim();
+        if new.is_empty() {
+            return Err(KeystoreError::InvalidParams("a wallet's password can't be empty".into()));
+        }
+        let state = self.view()?;
+        if state.is_locked(seed) {
+            return Err(KeystoreError::Refused("this wallet is locked: unlock it in the Signer app first".into()));
+        }
+        let files = state.seeds.get(seed).cloned().ok_or_else(|| KeystoreError::NotFound(format!("seed {seed}")))?;
+        let mut tries: Vec<&str> = Vec::new();
+        for p in passwords.iter().copied().chain([new]) {
+            if !p.is_empty() && !tries.contains(&p) {
+                tries.push(p);
+            }
+        }
+        // `new` last: a file under it already costs one try more than the others, not one each.
+        tries.retain(|p| *p != new);
+        tries.push(new);
+        let accounts = state.merged().accounts;
+        let address_of = |vault: &str| accounts.iter().find(|(_, p)| p.vault == vault).map(|(a, _)| a.clone());
+        let scan = self.scan()?;
+        let mut out = WalletPassword::default();
+        let mut tally = |done: Option<bool>, kind: &'static str, id: &str, address: Option<String>| match done {
+            Some(true) => out.changed += 1,
+            Some(false) => out.already += 1,
+            None => out.left.push(LeftFile { kind, id: id.to_string(), address }),
+        };
+        for id in files.vaults.iter().filter(|v| scan.vaults.contains(v)) {
+            let done = self.rewrap(&self.root.path(&Slot::Vault(id.clone())), StageKind::Vault(id.clone()), &tries, new)?;
+            tally(done, "account", id, address_of(id));
+        }
+        for id in files.groups.keys().filter(|g| scan.keys.contains(g)) {
+            let done = self.rewrap(&self.group_vault_path(id), StageKind::Group(id.clone()), &tries, new)?;
+            tally(done, "wallet", id, None);
+        }
+        for id in files.phrases.iter().filter(|p| scan.phrases.contains(p)) {
+            let done = self.rewrap(&self.phrase_vault_path(id), StageKind::Phrase(id.clone()), &tries, new)?;
+            tally(done, "phrase", id, None);
+        }
+        // Each group's unlock root, sealed under its own password, which unlocks the wallet's data.
+        let mut resealed = BTreeMap::new();
+        for (id, sealed) in files.groups.iter().filter_map(|(id, s)| Some((id, s.as_ref()?))) {
+            let opened = tries.iter().find_map(|pw| crate::unlockkey::open(sealed, pw, id).map(|root| (*pw, root)));
+            match opened {
+                Some((pw, _)) if pw == new => tally(Some(false), "unlock", id, None),
+                Some((_, root)) => {
+                    resealed.insert(id.clone(), crate::unlockkey::seal(&root, new, id)?);
+                    tally(Some(true), "unlock", id, None);
+                }
+                None => tally(None, "unlock", id, None),
+            }
+        }
+        if !resealed.is_empty() {
+            self.update_groups(|groups| {
+                for (id, sealed) in resealed {
+                    if let Some(g) = groups.get_mut(&id) {
+                        g.unlock = Some(sealed);
+                    }
+                }
+            })?;
+        }
+        Ok(out)
+    }
+
+    /// Whether `password` opens any file of a seed: what a new file of that wallet must take.
+    pub fn opens_wallet(&self, seed: &str, password: &str) -> Result<bool> {
+        let state = self.view()?;
+        let files = state.seeds.get(seed.trim()).ok_or_else(|| KeystoreError::NotFound(format!("seed {}", seed.trim())))?;
+        if files.groups.iter().any(|(id, s)| s.as_ref().is_some_and(|s| crate::unlockkey::open(s, password, id).is_some())) {
+            return Ok(true);
+        }
+        let scan = self.scan()?;
+        let opens = |path: PathBuf| {
+            std::fs::read_to_string(&path).is_ok_and(|raw| check_kdf_params(&raw).is_ok())
+                && eth_keystore::decrypt_key(&path, password).is_ok()
+        };
+        Ok(files.vaults.iter().filter(|v| scan.vaults.contains(v)).any(|v| opens(self.root.path(&Slot::Vault(v.clone()))))
+            || files.groups.keys().filter(|g| scan.keys.contains(g)).any(|g| opens(self.group_vault_path(g))))
+    }
+
+    /// One vault file under `new`, from the first of `tries` that opens it, staged and renamed like
+    /// every write here. `Some(true)` rewritten, `Some(false)` already under `new`, `None` unopened.
+    fn rewrap(&self, path: &Path, kind: StageKind, tries: &[&str], new: &str) -> Result<Option<bool>> {
+        let raw = std::fs::read_to_string(path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        check_kdf_params(&raw)?;
+        let Some((pw, bytes)) =
+            tries.iter().find_map(|pw| eth_keystore::decrypt_key(path, pw).ok().map(|b| (*pw, Zeroizing::new(b))))
+        else {
+            return Ok(None);
+        };
+        if pw == new {
+            return Ok(Some(false));
+        }
+        let stage = atomic::Stage::create(self.root.path(&Slot::Stage(kind.clone())))
+            .map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        let name = Slot::staged_name(&kind);
+        eth_keystore::encrypt_key(stage.path(), &mut rand::thread_rng(), bytes.as_slice(), new, Some(&name))
+            .map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        stage.promote(&name, path).map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        Ok(Some(true))
+    }
+
+    /// Unlocked in the Signer app this session: naming it then asks no password, as the person
+    /// has just shown they hold it there.
+    fn seed_unlocked(&self, seed: &str) -> bool {
+        self.view().is_ok_and(|s| s.unlocked(seed))
+    }
+
+    fn account_unlocked(&self, addr: &Address) -> bool {
+        let Ok(state) = self.view() else { return false };
+        let doc = state.merged();
+        doc.accounts.get(&addr_key(addr)).is_some_and(|p| state.unlocked(&Self::seed_of_account(&doc.groups, p)))
+    }
+
+    /// The seed of a wallet file, by the file's id, as the signer manager knows it.
+    pub fn seed_of_file(&self, group: &str) -> Result<String> {
+        Ok(Self::seed_of_group(&self.get_groups()?, group.trim()))
+    }
+
     /// The seed a group belongs to, as the signer manager knows it: its seed link, else itself.
     pub fn seed_of_group(groups: &BTreeMap<String, Group>, group: &str) -> String {
         groups.get(group).and_then(|g| g.seed.as_ref()).map_or_else(|| group.to_string(), |s| s.id.clone())
@@ -765,7 +890,7 @@ impl Keystore {
         }
         let key = addr_key(&addr);
         let label = label.trim().to_string();
-        if !label.is_empty() {
+        if !label.is_empty() && !self.account_unlocked(&addr) {
             self.prove_custody(address, password)?;
         }
         // Read and write under one lock, so a concurrent rename cannot lose a name.
@@ -929,6 +1054,26 @@ impl Keystore {
         std::fs::remove_file(&path).map_err(|e| KeystoreError::Io(e.to_string()))?;
         self.retire(&addr)?;
         Ok(true)
+    }
+
+    /// Remove a Bitcoin account: its wallet file, record and name. Its vault holds the account's only
+    /// key here, so like `delete_account` it takes the account's password, and checks the vault is
+    /// this wallet's before removing it.
+    pub fn delete_bitcoin_account(&self, id: &str, password: &str) -> Result<bool> {
+        check_group_id(id)?;
+        if self.view().is_ok_and(|s| s.hidden().groups.contains(id)) {
+            return Err(KeystoreError::Refused(format!("wallet {id} is locked: unlock it in the Signer app first")));
+        }
+        let (acct, _) = self.bitcoin_account(id)?;
+        self.open_bitcoin_vault(id, password, &acct).map(drop).map_err(|e| match e {
+            KeystoreError::Vault(_) => KeystoreError::Refused("the password for this account is not correct".into()),
+            other => other,
+        })?;
+        let removed = remove_path(&self.group_vault_path(id))?;
+        remove_path(&self.stage_dir(id))?;
+        // The key is gone either way; a record that couldn't follow lists nothing it can sign.
+        let _ = self.remove_group(id);
+        Ok(removed)
     }
 
     /// EIP-191 personal_sign over `message` — derives, signs, wipes.
@@ -1236,6 +1381,27 @@ impl Storage {
 pub struct SeedLink {
     pub id: String,
     pub check: String,
+}
+
+/// What `change_wallet_password` did.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct WalletPassword {
+    /// Files now under the new password.
+    pub changed: usize,
+    /// Under it already, from an earlier call.
+    pub already: usize,
+    /// Files no password given opens, which keep their own.
+    pub left: Vec<LeftFile>,
+}
+
+/// A file of a wallet under a password not given: `account` (with its address), `wallet` (a wallet
+/// file), `unlock` (a wallet file's unlock root) or `phrase`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LeftFile {
+    pub kind: &'static str,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 /// A group's record, in its seed's sealed index. `usedPassphrase` is a boolean so a user
@@ -1991,6 +2157,27 @@ impl Keystore {
         })
     }
 
+    /// A wallet's name the person gave in another app, kept with no password: the signer manager
+    /// keeps the one name every app shows. A locked wallet takes it once it unlocks.
+    pub fn take_wallet_name(&self, seed: &str, name: &str) -> Result<bool> {
+        let name = name.trim().to_string();
+        check_displayable(&name, "wallet name")?;
+        let state = self.view()?;
+        if name.is_empty() || state.is_locked(seed) || !state.seeds.contains_key(seed) {
+            return Ok(false);
+        }
+        self.update_index(|d| {
+            adopt_copied_name(d, seed);
+            d.wallet_names.insert(seed.to_string(), name.clone());
+        })?;
+        Ok(true)
+    }
+
+    /// The name of a seed's wallet, by the seed's id, once set.
+    pub fn wallet_name_of_seed(&self, seed: &str) -> Option<String> {
+        self.wallet_names().ok()?.remove(seed).filter(|n| !n.trim().is_empty())
+    }
+
     /// Wallet names, by the seed they name.
     pub fn wallet_names(&self) -> Result<BTreeMap<String, String>> {
         Ok(self.view()?.merged().wallet_names)
@@ -2025,7 +2212,8 @@ impl Keystore {
         }
         // Clearing is asked for nothing: it can only move the display toward the addresses
         // themselves, and it is the one way to strip a name off a wallet whose secret is lost.
-        if !req.label.trim().is_empty() {
+        // Nor is naming a wallet the person unlocked in the Signer app.
+        if !req.label.trim().is_empty() && !self.seed_unlocked(&Self::seed_of_group(&recorded, id)) {
             if held.accounts > 0 {
                 if req.address.is_empty() {
                     return Err(KeystoreError::Refused(
@@ -6900,6 +7088,96 @@ mod tests {
             seeds.push(seed);
         }
         (ks, seeds)
+    }
+
+    /// The EVM wallet's group of a [`sealed_keystore`], its seed, and its account.
+    fn evm_wallet(ks: &Keystore) -> (String, String, String) {
+        let groups = ks.get_groups().unwrap();
+        let (id, _) = groups.iter().find(|(_, g)| g.family.is_none()).unwrap();
+        let seed = Keystore::seed_of_group(&groups, id);
+        let (address, _) = ks.get_provenance().unwrap().into_iter().find(|(_, p)| &p.group == id).unwrap();
+        (id.clone(), seed, address)
+    }
+
+    #[test]
+    fn a_wallets_files_take_one_password_and_a_call_cut_short_finishes_with_the_old_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let (evm, seed, address) = evm_wallet(&ks);
+        let btc = ks.bitcoin_groups().unwrap()[0].clone();
+        let phrase = ks.kept_phrases().unwrap()[0].id.clone();
+        let imported = ks.list_accounts().unwrap().into_iter().map(|a| a.to_string()).find(|a| !a.eq_ignore_ascii_case(&address)).unwrap();
+        assert!(ks.change_wallet_password(&seed, &["pw"], "").is_err());
+        // Only the accounts' password: the derivation key and the kept phrase keep theirs.
+        let first = ks.change_wallet_password(&seed, &["pw"], "new").unwrap();
+        assert!(first.changed >= 2, "{first:?}");
+        let mut left: Vec<&str> = first.left.iter().map(|l| l.kind).collect();
+        left.sort_unstable();
+        left.dedup();
+        assert!(left.contains(&"wallet") && left.contains(&"phrase"), "{first:?}");
+        assert!(ks.opens_wallet(&seed, "new").unwrap() && !ks.opens_wallet(&seed, "nope").unwrap());
+        // Again with the others: the rest moves, and what moved already counts as done.
+        let second = ks.change_wallet_password(&seed, &["gp", "phrase-pw"], "new").unwrap();
+        assert!(second.left.is_empty(), "{second:?}");
+        assert_eq!((second.changed, second.already), (first.left.len(), first.changed + first.already));
+        ks.signer_for(&address, "new").unwrap();
+        assert!(ks.signer_for(&address, "pw").is_err());
+        ks.open_group_key(&evm, "new").unwrap();
+        let (acct, _) = ks.bitcoin_account(&btc).unwrap();
+        ks.open_bitcoin_vault(&btc, "new", &acct).unwrap();
+        ks.show_phrase(&phrase, "new").unwrap();
+        ks.unlock_key(&seed, 0, "new").unwrap();
+        assert!(ks.unlock_key(&seed, 0, "pw").is_err(), "no unlock root left under the old password");
+        ks.signer_for(&imported, "pw").expect("another wallet keeps its own");
+        // Locked, it is refused: its files are listed by nothing.
+        let fresh = Keystore::new(dir.path());
+        assert!(matches!(fresh.change_wallet_password(&seed, &["new"], "x"), Err(KeystoreError::Refused(_))));
+    }
+
+    #[test]
+    fn naming_asks_no_password_once_the_signer_app_unlocked_the_wallet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let (evm, seed, address) = evm_wallet(&ks);
+        let btc = ks.bitcoin_groups().unwrap()[0].clone();
+        ks.set_label(&address, "Spending", "").unwrap();
+        ks.set_wallet_name(&rename(&evm, "Daily")).unwrap();
+        ks.set_group_label(&rename(&btc, "Savings 2")).unwrap();
+        assert_eq!(ks.wallet_name_of_seed(&seed).as_deref(), Some("Daily"));
+        assert_eq!(ks.get_labels().unwrap().values().next().map(String::as_str), Some("Spending"));
+        // A wallet no signer manager unlocked (none here) still proves custody.
+        let other = tempfile::tempdir().unwrap();
+        let plain = Keystore::new(other.path());
+        let d = plain.import_mnemonic_ex(&req(Storage::Plain, 0)).unwrap();
+        assert!(plain.set_label(&d.address.to_string(), "x", "").is_err());
+        plain.set_label(&d.address.to_string(), "x", "pw").unwrap();
+    }
+
+    #[test]
+    fn a_name_given_elsewhere_is_taken_once_the_wallet_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let (_, seed, _) = evm_wallet(&ks);
+        assert!(ks.take_wallet_name(&seed, " White Card ").unwrap());
+        assert_eq!(ks.wallet_name_of_seed(&seed).as_deref(), Some("White Card"));
+        assert!(!ks.take_wallet_name("s_unknown", "x").unwrap());
+        let fresh = Keystore::new(dir.path());
+        assert!(!fresh.take_wallet_name(&seed, "Cold").unwrap(), "locked: taken when it unlocks");
+    }
+
+    #[test]
+    fn a_bitcoin_account_goes_with_its_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let btc = ks.bitcoin_groups().unwrap()[0].clone();
+        assert!(matches!(ks.delete_bitcoin_account(&btc, "wrong"), Err(KeystoreError::Refused(_))));
+        assert!(ks.delete_bitcoin_account(&btc, "pw").unwrap());
+        assert!(ks.bitcoin_groups().unwrap().is_empty() && !ks.get_groups().unwrap().contains_key(&btc));
+        assert!(ks.delete_bitcoin_account(&btc, "pw").is_err(), "nothing left to remove");
+        // The emptied EVM file stays for the app to remove; one that keeps a key is refused.
+        let (evm, _, address) = evm_wallet(&ks);
+        assert!(ks.delete_account(&address, "pw").unwrap());
+        assert!(ks.remove_group(&evm).is_err(), "its derivation key is still here");
     }
 
     #[test]

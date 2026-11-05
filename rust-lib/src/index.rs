@@ -268,6 +268,11 @@ impl State {
         self.locked(seed)
     }
 
+    /// Unlocked in the Signer app this session: its box is sealed, and this process opened it.
+    pub fn unlocked(&self, seed: &str) -> bool {
+        self.open.contains_key(seed)
+    }
+
     /// The files of every locked seed.
     pub fn hidden(&self) -> Hidden {
         let mut out = Hidden::default();

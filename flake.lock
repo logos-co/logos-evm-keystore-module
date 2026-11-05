@@ -10828,17 +10828,17 @@
     "logos-signer-interface": {
       "flake": false,
       "locked": {
-        "lastModified": 1793218879,
-        "narHash": "sha256-50tfoMe7w+9CmZcUSL9nGjv1R8eQtXWmnomSLkOWgYk=",
+        "lastModified": 1793844356,
+        "narHash": "sha256-Z4uNSVJamahwU10rtpk3UfxriwEt/obcLb3iW+Wxeyg=",
         "owner": "logos-co",
         "repo": "logos-signer-interface",
-        "rev": "d8cfff84327c9b2b5cdb9702d1c4217cad567cee",
+        "rev": "83dcde718c2a6caa319ea3eb76de81bd48d4d8c1",
         "type": "github"
       },
       "original": {
         "owner": "logos-co",
         "repo": "logos-signer-interface",
-        "rev": "d8cfff84327c9b2b5cdb9702d1c4217cad567cee",
+        "rev": "83dcde718c2a6caa319ea3eb76de81bd48d4d8c1",
         "type": "github"
       }
     },

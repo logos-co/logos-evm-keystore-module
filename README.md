@@ -30,8 +30,9 @@ temporary exposure rather than an oversight; see
 
 **Accounts (Tier D — the custodian only):** `create_mnemonic`, `import_mnemonic`,
 `create_unrelated_account`, `import_private_key`, `import_keystore_json`,
-`export_keystore_json`, `change_password`, `set_label`, `set_group_label`,
-`delete_account`, `restore_unlock_root`, `move_older_keystore`.
+`export_keystore_json`, `change_password`, `change_wallet_password`, `opens_wallet`,
+`set_label`, `set_group_label`, `delete_account`, `delete_bitcoin_account`,
+`restore_unlock_root`, `move_older_keystore`.
 
 `create_unrelated_account` is the only way this crate **generates** a key from randomness,
 and it requires an explicit `acknowledgeUnrecoverable`. It is not the only way to end up
@@ -59,7 +60,9 @@ A wallet is named like an account is: `set_wallet_name` names the wallet — eve
 file of one seed — and `set_group_label` one account file, each empty unless the person gives
 a name; an empty string clears. `get_group_labels` answers from the names alone — so a name
 survives the record and the key it belonged to, which is the row a UI most needs to name.
-Duplicates are storable on purpose; uniqueness is the reader's problem.
+Duplicates are storable on purpose; uniqueness is the reader's problem. A wallet unlocked in the
+Signer app is named with no password, and its name is shared with the signer manager, so every
+app shows the same one. `change_wallet_password` puts all of a wallet's files under one password.
 
 **A locked wallet lists nothing.** The records, accounts and names are kept one document per
 seed, sealed under this module's key for that seed from the signer manager (`data_key(seed,
