@@ -31,7 +31,7 @@ temporary exposure rather than an oversight; see
 **Accounts (Tier D — the custodian only):** `create_mnemonic`, `import_mnemonic`,
 `create_unrelated_account`, `import_private_key`, `import_keystore_json`,
 `export_keystore_json`, `change_password`, `change_wallet_password`, `opens_wallet`,
-`set_label`, `set_group_label`, `delete_account`, `delete_bitcoin_account`,
+`set_label`, `set_group_label`, `delete_account`, `delete_bitcoin_account`, `remove_wallet`,
 `restore_unlock_root`, `move_older_keystore`.
 
 `create_unrelated_account` is the only way this crate **generates** a key from randomness,

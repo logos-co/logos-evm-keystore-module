@@ -26,7 +26,7 @@ use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
 use crate::BitcoinImport;
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
 use logos_signer_interface::wallets::{
-    name_steps, read_data_key, read_wallets, DataKey, DataKeyRequest, NameSeed, NameStep,
+    name_steps, read_data_key, read_wallets, stale_seeds, DataKey, DataKeyRequest, ForgetSeed, NameSeed, NameStep,
 };
 use logos_signer_interface::{json as signer_json, wire};
 
@@ -164,6 +164,10 @@ pub trait KeystoreModule: Send + 'static {
     /// Remove a Bitcoin account, whose wallet file holds its only key here: `{ group, password }`
     /// → `{ ok, removed }`. Tier D.
     fn delete_bitcoin_account(&mut self, params_json: String) -> String;
+    /// Remove a wallet and every file of it here, then the Signer's record of it: `{ seed,
+    /// password }` → `{ ok, seed, accounts, files }`. Its password opens one of its files; an
+    /// empty one takes none. Tier D.
+    fn remove_wallet(&mut self, params_json: String) -> String;
     /// Name an account, or clear the name with an empty string. Tier D, plus the account's
     /// own vault password when a name is being SET: a label is what a wallet shows in place
     /// of an address, so writing one is a claim of custody and now has to prove it. Clearing
@@ -322,13 +326,13 @@ fn watch_wallets(ks: Keystore) {
     let locked = client.on_wallets_locked();
     let k = ks.clone();
     std::thread::spawn(move || {
-        let mut sent = std::collections::HashSet::new();
+        let (mut sent, mut forgot) = (std::collections::HashSet::new(), std::collections::HashSet::new());
         open_wallets(&k);
-        sync_names(&k, &mut sent);
+        sync_names(&k, &mut sent, &mut forgot);
         if let Ok(sub) = changed {
             for _ in sub {
                 open_wallets(&k);
-                sync_names(&k, &mut sent);
+                sync_names(&k, &mut sent, &mut forgot);
             }
         }
     });
@@ -375,13 +379,22 @@ fn open_wallets(ks: &Keystore) {
 }
 
 /// One name per wallet: take the name the person gave in any app, and send one given here while
-/// the wallet has none, once a run.
-fn sync_names(ks: &Keystore, sent: &mut std::collections::HashSet<String>) {
+/// the wallet has none, once a run. A wallet the manager lists that this keystore no longer has
+/// is forgotten there, once a run.
+fn sync_names(ks: &Keystore, sent: &mut std::collections::HashSet<String>, forgot: &mut std::collections::HashSet<String>) {
     let (tx, rx) = std::sync::mpsc::channel();
     wallets::WalletsClient::bind(WALLETS).wallets_async_with_timeout(Duration::from_secs(10), move |r| {
         let _ = tx.send(r);
     });
     let Some(listed) = rx.recv().ok().and_then(|r| r.ok()).and_then(|r| read_wallets(&r).ok()) else { return };
+    // Only from a clean read: a failed one must not read as "has none".
+    if let Ok(have) = ks.wallet_seeds() {
+        for seed in stale_seeds(&listed, |s| have.contains(s)) {
+            if forgot.insert(seed.clone()) {
+                send_forget(seed);
+            }
+        }
+    }
     let mut took = false;
     for step in name_steps(&listed, |seed| ks.wallet_name_of_seed(seed)) {
         match step {
@@ -407,6 +420,21 @@ fn send_name(seed: String, name: String) {
     std::thread::spawn(move || {
         if let Ok(body) = serde_json::to_string(&NameSeed { seed, name }) {
             wallets::WalletsClient::bind(WALLETS).name_seed_async(&body, |_| {});
+        }
+    });
+}
+
+/// A wallet removed here, to the signer manager, from a thread of its own as `send_name`.
+fn send_forget(seed: String) {
+    std::thread::spawn(move || {
+        if let Ok(body) = serde_json::to_string(&ForgetSeed { seed }) {
+            wallets::WalletsClient::bind(WALLETS).forget_seed_async(&body, |r| {
+                if let Err(e) = r.map_err(|e| e.to_string()).and_then(|r| {
+                    logos_signer_interface::wallets::read_forgotten(&r).map(drop).map_err(|e| e.to_string())
+                }) {
+                    eprintln!("keystore_module: the Signer didn't forget a removed wallet: {e}");
+                }
+            });
         }
     });
 }
@@ -689,6 +717,13 @@ struct OpensWalletParams {
 #[serde(deny_unknown_fields)]
 struct DeleteBitcoinParams {
     group: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct RemoveWalletParams {
+    seed: String,
+    #[serde(default)]
     password: String,
 }
 
@@ -1229,8 +1264,17 @@ impl KeystoreModule for KeystoreModuleImpl {
                     .map(|a| json!({ "seed": a.seed, "needs": a.needs.as_str(), "groups": a.groups,
                                      "accounts": a.accounts.iter().map(|x| x.to_string()).collect::<Vec<_>>() }))
                     .collect();
+                let empty = self.ks().ok().and_then(|ks| ks.empty_wallets().ok()).unwrap_or_default();
+                let empty: Vec<_> = empty
+                    .into_iter()
+                    .map(|w| {
+                        let default = self.ks().ok().and_then(|ks| ks.default_wallet_name(&w.seed).ok());
+                        json!({ "seed": w.seed, "walletName": w.name, "walletDefaultName": default,
+                                "fingerprint": w.fingerprint })
+                    })
+                    .collect();
                 json!({ "ok": true, "groups": groups, "lockedWallets": locked.len(), "lockedSeeds": locked,
-                        "addAgain": add_again })
+                        "addAgain": add_again, "emptyWallets": empty })
                 .to_string()
             }
             Err(e) => err(e),
@@ -1489,6 +1533,33 @@ impl KeystoreModule for KeystoreModuleImpl {
                 self.unlocks.lock(Some(&p.group));
                 self.announce();
                 json!({ "ok": true, "removed": removed }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn remove_wallet(&mut self, params_json: String) -> String {
+        if !self.may_mutate("remove_wallet") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: RemoveWalletParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let password = Zeroizing::new(p.password);
+        let res = match self.ks() {
+            Ok(ks) => ks.remove_wallet(&p.seed, &password),
+            Err(e) => return err(e),
+        };
+        match res {
+            Ok(r) => {
+                for id in &r.removed {
+                    self.unlocks.lock(Some(id));
+                }
+                send_forget(r.seed.clone());
+                self.announce();
+                json!({ "ok": true, "seed": r.seed, "accounts": r.accounts, "files": r.files }).to_string()
             }
             Err(e) => err(e),
         }
