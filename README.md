@@ -53,8 +53,8 @@ scan being complete — which is not decidable by inspection.
 custodians and managers.
 
 `get_account_wallets` is the canonical join of provenance and wallet names for account
-pickers: `{ ok, wallets: { "<address>": { wallet, index? } } }`. Accounts without a
-named derivation group are omitted rather than assigned a guessed wallet.
+pickers: `{ ok, wallets: { "<address>": { wallet, index? } } }`. Accounts of an unnamed
+wallet are omitted rather than given an account's name as the wallet's.
 
 A wallet is named like an account is: `set_wallet_name` names the wallet — every account
 file of one seed — and `set_group_label` one account file, each empty unless the person gives
