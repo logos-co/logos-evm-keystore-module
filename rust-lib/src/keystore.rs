@@ -188,34 +188,44 @@ fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
 }
 
 /// Before a seed's wallet had a name of its own, an older keys app copied it onto each of the
-/// seed's files and accounts: one text, on every one that has a name, which a reader shows as the
-/// wallet's. When the wallet is first named, that copy comes off them.
+/// seed's files and accounts, which a reader shows as the wallet's. When the wallet is first
+/// named, that copy comes off them; a lone file's may be its account's own name, so it stays.
 fn adopt_copied_name(d: &mut SeedDoc, seed: &str) {
     if d.wallet_names.contains_key(seed) {
         return;
     }
     let Some(copied) = copied_name(d, seed) else { return };
     let groups = groups_of_seed(d, seed);
-    d.group_labels.retain(|id, n| !(groups.contains(id) && *n == copied));
-    let accounts: Vec<String> =
-        d.accounts.iter().filter(|(_, p)| groups.contains(&p.group)).map(|(a, _)| a.clone()).collect();
-    d.labels.retain(|a, n| !(accounts.contains(a) && *n == copied));
+    if groups.len() > 1 {
+        d.group_labels.retain(|id, n| !(groups.contains(id) && *n == copied));
+        let accounts: Vec<String> =
+            d.accounts.iter().filter(|(_, p)| groups.contains(&p.group)).map(|(a, _)| a.clone()).collect();
+        d.labels.retain(|a, n| !(accounts.contains(a) && *n == copied));
+    }
     d.wallet_names.insert(seed.to_string(), copied);
+}
+
+/// A wallet's name: the one given, else the one an older keys app copied onto its files. A file
+/// with no record has no seed to look up, so the name over it is all there is.
+fn wallet_name_of_group(d: &SeedDoc, group: &str) -> Option<String> {
+    let seed = Keystore::seed_of_group(&d.groups, group);
+    let given = d.wallet_names.get(&seed).filter(|n| !n.trim().is_empty()).cloned();
+    given.or_else(|| copied_name(d, &seed)).or_else(|| {
+        d.group_labels.get(group).filter(|n| !d.groups.contains_key(group) && !n.trim().is_empty()).cloned()
+    })
 }
 
 fn groups_of_seed(d: &SeedDoc, seed: &str) -> Vec<String> {
     d.groups.keys().filter(|id| Keystore::seed_of_group(&d.groups, id) == seed).cloned().collect()
 }
 
-/// The one name an older keys app copied onto a seed's files, if they carry exactly one.
+/// The name an older keys app copied onto a seed's files: the same one on every file. One file
+/// named alone is an account's name (a Bitcoin account's sits on its file), not the wallet's.
 fn copied_name(d: &SeedDoc, seed: &str) -> Option<String> {
-    let names: std::collections::BTreeSet<&String> = groups_of_seed(d, seed)
-        .iter()
-        .filter_map(|id| d.group_labels.get(id))
-        .filter(|n| !n.trim().is_empty())
-        .collect();
-    let [copied] = names.into_iter().collect::<Vec<_>>()[..] else { return None };
-    Some(copied.clone())
+    let names: Vec<&str> =
+        groups_of_seed(d, seed).iter().map(|id| d.group_labels.get(id).map_or("", String::as_str)).collect();
+    let first = *names.first()?;
+    (!first.trim().is_empty() && names.iter().all(|n| *n == first)).then(|| first.to_string())
 }
 
 /// An account's key in the index: lowercase hex, no 0x.
@@ -3092,23 +3102,16 @@ impl Keystore {
             .collect())
     }
 
-    /// Join account provenance with the wallet names document. Accounts without a named
-    /// derivation group are intentionally absent: there is no wallet identity to assert for
-    /// an imported or otherwise ungrouped account.
+    /// Join account provenance with the wallet names. Accounts of an unnamed wallet are
+    /// intentionally absent: there is no wallet identity to assert for them.
     pub fn account_wallets(&self) -> Result<BTreeMap<String, AccountWallet>> {
-        let labels = self.get_group_labels()?;
+        let d = self.view()?.merged();
         Ok(self
             .provenance_view()?
             .into_iter()
             .filter_map(|account| {
-                let label = labels.get(&account.provenance.group)?;
-                if label.trim().is_empty() {
-                    return None;
-                }
-                Some((
-                    account.address.to_string(),
-                    AccountWallet { wallet: label.clone(), index: account.provenance.index },
-                ))
+                let wallet = wallet_name_of_group(&d, &account.provenance.group)?;
+                Some((account.address.to_string(), AccountWallet { wallet, index: account.provenance.index }))
             })
             .collect())
     }
@@ -3116,16 +3119,12 @@ impl Keystore {
     /// Public source metadata only. A seed link is a verified local grouping, never words. EVM
     /// accounts are keyed by address; a Bitcoin wallet, which is its own group, by the group's id.
     pub fn account_origins(&self) -> Result<BTreeMap<String, serde_json::Value>> {
-        let groups = self.get_groups()?;
-        let labels = self.get_group_labels()?;
+        let d = self.view()?.merged();
+        let groups = &d.groups;
         let phrase_of = |gid: &str| {
             groups.get(gid).map(|g| {
                 let id = g.seed.as_ref().map(|s| s.id.as_str()).unwrap_or(gid);
-                // One deterministic name across the wallets linked to this seed.
-                let name = groups.iter().filter(|(other_id, other)| {
-                    other.seed.as_ref().map(|s| s.id.as_str()).unwrap_or(other_id) == id
-                }).find_map(|(other_id, _)| labels.get(other_id).filter(|s| !s.trim().is_empty()));
-                serde_json::json!({ "id": id, "name": name })
+                serde_json::json!({ "id": id, "name": wallet_name_of_group(&d, gid) })
             })
         };
         let devices = serde_json::json!([{ "id": "local", "kind": "keystore", "name": "" }]);
@@ -5026,6 +5025,42 @@ mod tests {
         ks.set_group_label(&rename(&group, "")).unwrap();
         assert!(ks.account_wallets().unwrap().is_empty());
         assert!(ks.account_origins().unwrap()[&ACCT0.to_string()]["phrase"]["id"].is_string());
+    }
+
+    /// The EVM file, the Bitcoin file and the EVM account of a [`sealed_keystore`]'s wallet, the
+    /// account as origins key it.
+    fn wallet_files(ks: &Keystore) -> (String, String, String, String) {
+        let (evm, seed, key) = evm_wallet(ks);
+        let address = format!("0x{key}").parse::<Address>().unwrap().to_string();
+        (evm, ks.bitcoin_groups().unwrap()[0].clone(), seed, address)
+    }
+
+    #[test]
+    fn the_wallet_name_is_what_origins_and_account_wallets_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let (evm, btc, _, address) = wallet_files(&ks);
+        ks.set_wallet_name(&rename(&evm, "Status Throwaway")).unwrap();
+        let origins = ks.account_origins().unwrap();
+        assert_eq!(origins[&address]["phrase"]["name"], "Status Throwaway");
+        assert_eq!(origins[&btc]["phrase"]["name"], "Status Throwaway", "a Bitcoin account of the same seed");
+        assert_eq!(ks.account_wallets().unwrap()[&address].wallet, "Status Throwaway");
+    }
+
+    #[test]
+    fn a_bitcoin_accounts_name_is_never_its_wallets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let (evm, btc, seed, address) = wallet_files(&ks);
+        ks.set_group_label(&rename(&evm, "")).unwrap();
+        ks.set_group_label(&rename(&btc, "Rorschach BTC")).unwrap();
+        let origins = ks.account_origins().unwrap();
+        assert!(origins[&address]["phrase"]["name"].is_null(), "{origins:?}");
+        assert!(origins[&btc]["phrase"]["name"].is_null(), "{origins:?}");
+        assert!(ks.account_wallets().unwrap().get(&address).is_none());
+        assert_eq!(ks.default_wallet_name(&seed).unwrap(), "Keystore wallet");
+        ks.set_wallet_name(&rename(&evm, "Status Throwaway")).unwrap();
+        assert_eq!(ks.get_group_labels().unwrap()[&btc], "Rorschach BTC", "naming the wallet keeps the account's");
     }
 
     #[test]
@@ -7413,6 +7448,13 @@ mod tests {
         let files = ks.get_group_labels().unwrap();
         assert!(!files.contains_key(&a.group) && !files.contains_key(&b.group), "{files:?}");
         assert!(ks.get_labels().unwrap().is_empty(), "the copy on the account went too");
+
+        // A lone file's name may be its account's own: the wallet takes it, the file keeps it.
+        let d3 = tempfile::tempdir().unwrap();
+        let ks3 = Keystore::new(d3.path());
+        let solo = ks3.import_mnemonic_ex(&ImportRequest { group_label: "Solo", ..req(Storage::Plain, 0) }).unwrap();
+        ks3.set_wallet_name(&rename_as(&solo.group, "New", &solo.address.to_string(), "pw")).unwrap();
+        assert_eq!(ks3.get_group_labels().unwrap()[&solo.group], "Solo");
 
         // Two different names are names of their own, and stay.
         let d2 = tempfile::tempdir().unwrap();

@@ -607,7 +607,8 @@ the imports take `walletName`, kept for a seed that has none yet; `walletDefault
 wallet's name until it has one. Each file's `fingerprint` is its
 seed's master fingerprint, the Wallet ID the apps show. A file's `label` is its own name,
 empty unless the person gives one. An older keys app copied the wallet's name onto every file and
-account: the first `set_wallet_name` of that seed takes the copy off them.
+account: the same name on every file of a seed is that copy, and the first `set_wallet_name` of the
+seed takes it off them (a lone file keeps it: it may be its account's own name).
 
 ```bash
 logosctl call keystore_module set_group_label \
@@ -1108,8 +1109,8 @@ does not have to recreate ownership rules independently.
 { "ok": true, "wallets": { "0xf39F…2266": { "wallet": "Main", "index": 0 } } }
 ```
 
-Only accounts whose provenance names a derivation group with a non-empty wallet label
-appear. Imported, unknown, and unnamed accounts are omitted rather than assigned a
+Only accounts of a named wallet appear: the name `set_wallet_name` gave its seed, else the copy
+an older keys app left on every file of it. An account file's own name never counts. Imported, unknown, and unnamed accounts are omitted rather than assigned a
 guessed wallet. `index` is omitted when provenance does not carry one. An unreadable
 provenance or wallet-name document returns an error instead of pretending there are no
 wallets.
@@ -1304,7 +1305,7 @@ the master fingerprint of the phrase it was derived from, when known. A Bitcoin 
 <group>, family: "bitcoin" | "bitcoin_taproot", chain: "main" | "test", path: "m/84'/1'/0'",
 fingerprint, xpub, label?, origin?, available: true }`. `origin` is `{ devices, phrase: { id, name },
 kind, path }`, the signer interface's extension: `phrase.id` is the same for every account of one
-phrase, and `name` is one of their wallet names, the same for each.
+phrase, and `name` is that wallet's name (null while it has none), never an account's.
 
 An older build's wallet the signer manager was never told of is left out until it is added again
 (`restore_unlock_root`), and `sign` and `unlock` refuse it as `unknown_account`, saying so: the manager
