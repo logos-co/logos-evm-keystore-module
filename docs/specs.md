@@ -2174,7 +2174,9 @@ refuse them until it unlocks.
 
 * **`index.sealed.json`** — `{ v: 1, seeds: { <seed>: <box> } }`, 0600, the box format of
   `logos.wallets/1`, bound to `keystore_module index` and the seed. Opened with the key of its
-  box's generation and sealed again under the current one.
+  box's generation and sealed again under the current one, which the module keeps before the box
+  is written. Reads take no lock and read `index.pending.json` before the boxes, so a save running
+  while a seed's first box lands never finds that seed locked or missing.
 * **`seeds.json`** — plain, and only what a locked seed needs: each group's sealed unlock root
   (so `unlock_key` answers behind the wallet's password while it is locked), the random ids of
   its vaults, keys and kept phrases, and a check of its unlock key, salted by the seed's id. The

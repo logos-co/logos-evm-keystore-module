@@ -29,6 +29,12 @@ pub const UNCLAIMED: &str = "";
 const NAME: &str = "keystore_module index";
 const VERSION: u32 = 1;
 
+/// A test runs a reader here, right after `open_seed` writes a seed's box.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AFTER_BOX: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// This process's keys for the seeds it opened, by the keystore's own seed id. Shared with the
 /// thread that asks the signer manager for them.
 #[derive(Clone, Default)]
@@ -218,11 +224,13 @@ fn unseal(key: &DataKey, seed: &str, sealed: &str) -> Result<SeedDoc> {
 /// Read the index, opening every box this process holds the key for.
 pub fn load(root: &Root, keys: &KeyRing) -> Result<State> {
     let seeds: BTreeMap<String, SeedFiles> = read(root, Doc::Seeds)?;
+    // Pending before the boxes: a seal writes the box first, so a read without the lock never
+    // misses a seed moving from one to the other.
+    let pending: BTreeMap<String, SeedDoc> = read(root, Doc::Pending)?;
     let file: SealedFile = read(root, Doc::Index)?;
     if !file.seeds.is_empty() && file.v != VERSION {
         return Err(corrupt(Doc::Index, format!("version {}", file.v)));
     }
-    let pending: BTreeMap<String, SeedDoc> = read(root, Doc::Pending)?;
     let mut open = BTreeMap::new();
     for (seed, sealed) in &file.seeds {
         // A key of another generation (another process sealed it again) leaves it locked here.
@@ -523,7 +531,11 @@ pub fn open_seed(root: &Root, keys: &KeyRing, seed: &str, box_key: &DataKey, cur
     };
     let mut sealed = state.sealed.clone();
     sealed.insert(seed.to_string(), seal(current, seed, &doc)?);
+    // The key before the box: a save reading without the lock in between read the seed as locked.
+    keys.insert(seed, current.clone());
     write(root, Doc::Index, &SealedFile { v: VERSION, seeds: sealed })?;
+    #[cfg(test)]
+    AFTER_BOX.with(|h| if let Some(f) = h.borrow_mut().as_mut() { f() });
     if state.pending.contains_key(seed) {
         let mut pending = state.pending.clone();
         pending.remove(seed);
@@ -535,6 +547,5 @@ pub fn open_seed(root: &Root, keys: &KeyRing, seed: &str, box_key: &DataKey, cur
         seeds.insert(seed.to_string(), files);
         write(root, Doc::Seeds, &seeds)?;
     }
-    keys.insert(seed, current.clone());
     Ok(true)
 }

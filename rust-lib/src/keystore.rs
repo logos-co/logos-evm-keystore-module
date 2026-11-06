@@ -7771,4 +7771,35 @@ mod tests {
         // Read as a keystore of its own, the older directory still sees it.
         assert!(layout::scan(&Root::new(dir.path())).unwrap().stray().contains(&layout::CURRENT.to_string()));
     }
+
+    fn btc(ks: &Keystore, chain: Chain, account: u32) -> Result<BitcoinGroup> {
+        ks.import_bitcoin(&BitcoinImport {
+            phrase: TEST_MNEMONIC, bip39_passphrase: "", family: Family::Segwit, chain, account,
+            password: "pw", label: "", wallet_name: "", keep: KeepPhrase::No,
+        })
+    }
+
+    /// The manager's key opening a new seed, from the watcher's thread, while a save reads the
+    /// index without the lock: between the box landing and the key kept, the seed read as locked.
+    #[test]
+    fn a_seed_opening_never_reads_as_locked_midway() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        ks.import_mnemonic_ex(&req(Storage::Plain, 0)).unwrap();
+        let (seed, _) = ks.closed_seeds().unwrap().pop().unwrap();
+        let reader = ks.clone();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        index::AFTER_BOX.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let s = Seed::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+                log.borrow_mut().push(reader.seed_link(&s, None).map(drop).map_err(|e| e.to_string()));
+            }))
+        });
+        let opened = ks.open_seed(&seed, &data_key(1, 0), &data_key(1, 0));
+        index::AFTER_BOX.with(|h| *h.borrow_mut() = None);
+        assert!(opened.unwrap());
+        assert_eq!(*seen.borrow(), vec![Ok(())]);
+        btc(&ks, Chain::Main, 0).unwrap();
+    }
 }
