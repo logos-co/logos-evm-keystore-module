@@ -387,8 +387,9 @@ fn sync_names(ks: &Keystore, sent: &mut std::collections::HashSet<String>, forgo
         let _ = tx.send(r);
     });
     let Some(listed) = rx.recv().ok().and_then(|r| r.ok()).and_then(|r| read_wallets(&r).ok()) else { return };
-    // Only from a clean read: a failed one must not read as "has none".
-    if let Ok(have) = ks.wallet_seeds() {
+    // Only from a clean read of a keystore that has wallets: a failed read, or an empty or
+    // missing directory, must not read as "has none".
+    if let Some(have) = ks.wallet_seeds().ok().filter(|h| !h.is_empty()) {
         for seed in stale_seeds(&listed, |s| have.contains(s)) {
             if forgot.insert(seed.clone()) {
                 send_forget(seed);

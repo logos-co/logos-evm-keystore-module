@@ -595,7 +595,8 @@ app now asks one per wallet:
   `forget_seed`, and its record goes with its last holder.
 - A wallet the signer manager still lists for this keystore that it no longer has, one removed
   before `forget_seed` existed, is forgotten there when the keystore next reads `wallets()`, and
-  only after a clean read of its own index.
+  only after a clean read of its own index that finds at least one wallet: an empty or missing
+  directory forgets nothing.
 
 ### Naming accounts and wallets
 
