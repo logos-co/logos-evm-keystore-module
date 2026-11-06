@@ -215,6 +215,27 @@ fn wallet_name_of_group(d: &SeedDoc, group: &str) -> Option<String> {
     })
 }
 
+/// Every phrase wallet with a file gets its record, so the wallet outlives its last file.
+fn keep_wallet_records(d: &mut SeedDoc) {
+    let found: Vec<(String, index::WalletRecord)> = d
+        .groups
+        .iter()
+        .filter_map(|(id, g)| {
+            let link = g.seed.as_ref()?;
+            (!d.wallets.contains_key(&link.id)).then(|| {
+                let check = g.check.clone().or_else(|| {
+                    d.accounts.values().filter(|p| p.group == *id).find_map(|p| p.check.clone())
+                });
+                let fingerprint = Keystore::wallet_fingerprint(&d.groups, id);
+                (link.id.clone(), index::WalletRecord { link: link.check.clone(), check, fingerprint })
+            })
+        })
+        .collect();
+    for (seed, rec) in found {
+        d.wallets.entry(seed).or_insert(rec);
+    }
+}
+
 fn groups_of_seed(d: &SeedDoc, seed: &str) -> Vec<String> {
     d.groups.keys().filter(|id| Keystore::seed_of_group(&d.groups, id) == seed).cloned().collect()
 }
@@ -1576,6 +1597,25 @@ pub struct Removed {
     pub name_removed: bool,
 }
 
+/// What `remove_wallet` took away.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RemovedWallet {
+    pub seed: String,
+    pub accounts: usize,
+    pub files: usize,
+    /// The accounts' addresses and the files' ids, for whatever was unlocked under them.
+    #[serde(skip)]
+    pub removed: Vec<String>,
+}
+
+/// A phrase wallet with no file left, which stays until it is removed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EmptyWallet {
+    pub seed: String,
+    pub name: Option<String>,
+    pub fingerprint: Option<String>,
+}
+
 /// What one `settle` did, and what it left. Reported rather than merely performed: a
 /// leftover only named after it has been swept was never nameable.
 #[derive(Clone, Debug, Default)]
@@ -1997,6 +2037,7 @@ impl Keystore {
         let state = index::load(&self.root, &self.keys)?;
         let mut doc = state.merged();
         let out = f(&mut doc);
+        keep_wallet_records(&mut doc);
         index::store(&self.root, &self.keys, &state, &doc)?;
         Ok(out)
     }
@@ -2093,6 +2134,7 @@ impl Keystore {
             labels: self.read_json(&self.root.path(&Slot::Doc(Doc::Labels)))?,
             group_labels: self.read_json(&self.root.path(&Slot::Doc(Doc::GroupLabels)))?,
             wallet_names: BTreeMap::new(),
+            wallets: BTreeMap::new(),
         };
         let state = index::load(&self.root, &self.keys)?;
         let mut doc = state.merged();
@@ -2653,6 +2695,13 @@ impl Keystore {
                 }
             }
         }
+        // A wallet whose last file went is still this phrase's.
+        let link = link.or_else(|| {
+            let wallets = self.view().ok()?.merged().wallets;
+            wallets.into_iter().find_map(|(id, w)| {
+                (Self::seed_check(seed, &id).ok()? == w.link).then(|| SeedLink { id, check: w.link })
+            })
+        });
         let link = match link {
             Some(link) => link,
             None => {
@@ -2996,6 +3045,95 @@ impl Keystore {
             self.write_group_label(group, "")?;
         }
         Ok(Removed { group: group.to_string(), record_removed: recorded, name_removed: named })
+    }
+
+    /// Remove a wallet and everything of it here: its accounts, files, kept phrases and names. Its
+    /// password must open one of its files; one with none left asks for none. Not while locked.
+    pub fn remove_wallet(&self, seed: &str, password: &str) -> Result<RemovedWallet> {
+        let seed = seed.trim();
+        let state = self.view()?;
+        if state.is_locked(seed) {
+            return Err(KeystoreError::Refused("this wallet is locked: unlock it in the Signer app first".into()));
+        }
+        let doc = state.merged();
+        let groups = groups_of_seed(&doc, seed);
+        if groups.is_empty() && !doc.wallets.contains_key(seed) && !doc.wallet_names.contains_key(seed) {
+            return Err(KeystoreError::NotFound(format!("no such wallet: {seed}")));
+        }
+        let files = state.seeds.get(seed).cloned().unwrap_or_default();
+        let scan = self.scan()?;
+        let secret = files.vaults.iter().any(|v| scan.vaults.contains(v))
+            || groups.iter().any(|g| scan.keys.contains(g))
+            || files.phrases.iter().any(|p| scan.phrases.contains(p));
+        if secret && !self.opens_wallet(seed, password)? {
+            return Err(KeystoreError::Refused("the password for this wallet is not correct".into()));
+        }
+        let accounts: Vec<String> = doc
+            .accounts
+            .iter()
+            .filter(|(_, p)| index::account_seed(&doc, &state, p) == seed)
+            .map(|(a, _)| a.clone())
+            .collect();
+        let mut phrases: Vec<String> = files.phrases.clone();
+        phrases.extend(groups.iter().filter_map(|g| doc.groups.get(g)?.phrase.clone()));
+        phrases.sort();
+        phrases.dedup();
+        // Key material first, then the records: a cut leaves records over missing files, which
+        // list and remove again, rather than keys nothing names.
+        for a in &accounts {
+            let vault = &doc.accounts[a].vault;
+            if !vault.is_empty() {
+                remove_path(&self.root.path(&Slot::Vault(vault.clone())))?;
+                remove_path(&self.root.path(&Slot::Stage(StageKind::Vault(vault.clone()))))?;
+            }
+        }
+        for g in &groups {
+            remove_path(&self.group_vault_path(g))?;
+            remove_path(&self.stage_dir(g))?;
+        }
+        for p in &phrases {
+            remove_path(&self.phrase_vault_path(p))?;
+            remove_path(&self.phrase_stage_dir(p))?;
+        }
+        self.update_index(|d| {
+            for a in &accounts {
+                d.accounts.remove(a);
+                d.labels.remove(a);
+            }
+            for g in &groups {
+                d.groups.remove(g);
+                d.group_labels.remove(g);
+            }
+            d.wallet_names.remove(seed);
+            d.wallets.remove(seed);
+        })?;
+        let removed = accounts
+            .iter()
+            .filter_map(|a| parse_address(a).ok().map(|x| x.to_string()))
+            .chain(groups.iter().cloned())
+            .collect();
+        Ok(RemovedWallet { seed: seed.to_string(), accounts: accounts.len(), files: groups.len(), removed })
+    }
+
+    /// Every seed this keystore has, locked ones too.
+    pub fn wallet_seeds(&self) -> Result<std::collections::BTreeSet<String>> {
+        Ok(self.view()?.all_seeds())
+    }
+
+    /// The phrase wallets with no file left: each one's seed, name and Wallet ID.
+    pub fn empty_wallets(&self) -> Result<Vec<EmptyWallet>> {
+        let doc = self.view()?.merged();
+        let filed: std::collections::BTreeSet<String> = doc.groups.keys().map(|g| Self::seed_of_group(&doc.groups, g)).collect();
+        Ok(doc
+            .wallets
+            .iter()
+            .filter(|(seed, _)| !filed.contains(*seed))
+            .map(|(seed, w)| EmptyWallet {
+                seed: seed.clone(),
+                name: doc.wallet_names.get(seed).filter(|n| !n.trim().is_empty()).cloned(),
+                fingerprint: w.fingerprint.clone(),
+            })
+            .collect())
     }
 
     /// Every group a reader should see: the recorded ones, plus any derivation key on disk
@@ -5061,6 +5199,69 @@ mod tests {
         assert_eq!(ks.default_wallet_name(&seed).unwrap(), "Keystore wallet");
         ks.set_wallet_name(&rename(&evm, "Status Throwaway")).unwrap();
         assert_eq!(ks.get_group_labels().unwrap()[&btc], "Rorschach BTC", "naming the wallet keeps the account's");
+    }
+
+    #[test]
+    fn a_wallet_stays_when_its_last_file_goes_and_its_phrase_finds_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let d = ks.import_mnemonic_ex(&ImportRequest { wallet_name: "Funny", ..req(Storage::Plain, 0) }).unwrap();
+        let seed = ks.seed_of_file(&d.group).unwrap();
+        assert!(ks.empty_wallets().unwrap().is_empty(), "a wallet with a file isn't empty");
+        assert!(ks.delete_account(&d.address.to_string(), "pw").unwrap());
+        ks.remove_group(&d.group).unwrap();
+        assert!(ks.get_groups().unwrap().is_empty());
+        let empty = ks.empty_wallets().unwrap();
+        assert_eq!(empty.len(), 1);
+        assert_eq!((empty[0].seed.as_str(), empty[0].name.as_deref()), (seed.as_str(), Some("Funny")));
+        let again = ks.import_mnemonic_ex(&req(Storage::Plain, 1)).unwrap();
+        assert_eq!(ks.seed_of_file(&again.group).unwrap(), seed, "the same wallet, not a new one");
+        assert!(ks.empty_wallets().unwrap().is_empty());
+        assert_eq!(ks.wallet_name_of_seed(&seed).as_deref(), Some("Funny"));
+    }
+
+    #[test]
+    fn removing_a_wallet_takes_every_file_of_it_and_only_with_its_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let (evm, seed, address) = evm_wallet(&ks);
+        let btc = ks.bitcoin_groups().unwrap()[0].clone();
+        ks.set_wallet_name(&rename(&evm, "Status Throwaway")).unwrap();
+        let phrases = ks.view().unwrap().seeds[&seed].phrases.clone();
+        assert!(!phrases.is_empty(), "the helper keeps the phrase");
+        let others = ks.list_accounts().unwrap().len() - 1;
+        assert!(ks.remove_wallet(&seed, "wrong").is_err());
+        assert!(ks.has_address(&address), "a refusal removes nothing");
+        let gone = ks.remove_wallet(&seed, "pw").unwrap();
+        assert_eq!((gone.accounts, gone.files), (1, 2));
+        assert!(!ks.has_address(&address));
+        assert_eq!(ks.list_accounts().unwrap().len(), others, "the imported key isn't this wallet's");
+        let groups = ks.get_groups().unwrap();
+        assert!(!groups.contains_key(&evm) && !groups.contains_key(&btc));
+        assert!(!ks.group_vault_path(&evm).exists() && !ks.group_vault_path(&btc).exists());
+        assert!(phrases.iter().all(|p| !ks.phrase_vault_path(p).exists()));
+        let state = ks.view().unwrap();
+        assert!(!state.seeds.contains_key(&seed), "nothing of it is listed");
+        assert!(ks.wallet_name_of_seed(&seed).is_none() && ks.empty_wallets().unwrap().is_empty());
+        assert!(ks.remove_wallet(&seed, "pw").is_err(), "already gone");
+    }
+
+    #[test]
+    fn a_locked_wallet_isnt_removed_and_an_empty_one_needs_no_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ks, _) = sealed_keystore(dir.path());
+        let (_, seed, _) = evm_wallet(&ks);
+        ks.lock_seeds();
+        assert!(ks.wallet_seeds().unwrap().contains(&seed), "a locked wallet is still had");
+        assert!(ks.remove_wallet(&seed, "pw").is_err());
+        let other = tempfile::tempdir().unwrap();
+        let plain = Keystore::new(other.path());
+        let d = plain.import_mnemonic_ex(&req(Storage::Plain, 0)).unwrap();
+        let seed = plain.seed_of_file(&d.group).unwrap();
+        assert!(plain.delete_account(&d.address.to_string(), "pw").unwrap());
+        plain.remove_group(&d.group).unwrap();
+        assert_eq!(plain.remove_wallet(&seed, "").unwrap().accounts, 0);
+        assert!(plain.empty_wallets().unwrap().is_empty());
     }
 
     #[test]

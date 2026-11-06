@@ -188,6 +188,8 @@ pub const TIER_D_METHODS: &[&str] = &[
     "delete_account",
     // A Bitcoin account's file holds its only key here: removing it is `delete_account`'s.
     "delete_bitcoin_account",
+    // A whole wallet: every key file of it, as `delete_account` removes one.
+    "remove_wallet",
     // HD derivation. Deriving an account is a mutation, and it opens a vault whose blast
     // radius is a whole wallet rather than one account — so if anything it belongs here
     // more firmly than the rest.

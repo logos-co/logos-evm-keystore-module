@@ -219,7 +219,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `create_unrelated_account` | `params_json: String` | `{ ok, address, origin }`, or a refusal without the acknowledgement | yes → event |
 | `forget_derivation` | `params_json: String` | `{ ok, group, storage, recordUpdated, stranded, stagedRemoved }` | no |
 | `remove_group` | `params_json: String` | `{ ok, group, recordRemoved, nameRemoved }` | no — refuses while the wallet holds a key or an account |
-| `list_groups` | — | `{ ok, groups: [..], lockedWallets, lockedSeeds, addAgain: [..] }` | no |
+| `list_groups` | — | `{ ok, groups: [..], lockedWallets, lockedSeeds, addAgain: [..], emptyWallets: [..] }` | no |
 | `list_derivation_keys` | — | `{ ok, groups: [id, ..], staged: [id, ..], unexplained: [path, ..], links: [..] }` | no |
 | `get_provenance` | — | `{ ok, accounts: {..} }` | no |
 | `get_account_wallets` | — | `{ ok, wallets: { <address>: { wallet, index? } } }` | no |
@@ -234,6 +234,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `has_address` | `address: String` | `bool` | no |
 | `delete_account` | `address, password: String` | `bool` | yes → event |
 | `delete_bitcoin_account` | `params_json: String` — `{ group, password }` | `{ ok, removed }`: its wallet file, record and name. Tier D | yes → event |
+| `remove_wallet` | `params_json: String` — `{ seed, password }` | `{ ok, seed, accounts, files }`: the wallet and every file of it, then the Signer's record. Tier D | yes → event |
 | `change_wallet_password` | `params_json: String` — `{ seed, passwords, newPassword }` | `{ ok, changed, already, left: [{ kind, id, address? }] }`. Tier D | no |
 | `opens_wallet` | `params_json: String` — `{ seed, password }` | `{ ok, opens }`. Tier D | no |
 | `set_label` | `address, label, password: String` | `{ ok }` | no |
@@ -584,6 +585,18 @@ app now asks one per wallet:
   `forget_derivation` still refuses a Bitcoin file.
 - A wallet file left with no account and no key stays until `remove_group`; an app removing a
   file's last account follows with it.
+- **A wallet outlives its files.** Each phrase wallet keeps a record of its own, its seed link's
+  check, unlock check and Wallet ID, so removing its last file leaves it in `list_groups`'
+  `emptyWallets` (`{ seed, walletName, walletDefaultName, fingerprint }`), name and all. Importing
+  its phrase again adds to it, not to a new wallet.
+- **`remove_wallet({ seed, password })`** removes a wallet: every account, file, kept phrase and
+  name of it, key material first. Its password must open one of its files; a wallet with none
+  left takes none. A locked wallet is refused. The signer manager is then told with
+  `forget_seed`, and its record goes with its last holder.
+- A wallet the signer manager still lists for this keystore that it no longer has, one removed
+  before `forget_seed` existed, is forgotten there when the keystore next reads `wallets()`, and
+  only after a clean read of its own index that finds at least one wallet: an empty or missing
+  directory forgets nothing.
 
 ### Naming accounts and wallets
 

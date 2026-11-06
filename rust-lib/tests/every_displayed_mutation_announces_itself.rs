@@ -25,6 +25,7 @@ const ANNOUNCES: &[&str] = &[
     "import_keystore_json",
     "delete_account",
     "delete_bitcoin_account",
+    "remove_wallet",
     "set_label",
     "set_group_label",
     "set_wallet_name",

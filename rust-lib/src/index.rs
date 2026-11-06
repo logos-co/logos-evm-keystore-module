@@ -69,6 +69,21 @@ pub struct SeedDoc {
     /// The wallet's name, by its seed: one per seed, over every account file of it.
     #[serde(default, rename = "walletNames")]
     pub wallet_names: BTreeMap<String, String>,
+    /// Each phrase wallet's own record, by its seed: it stays when the wallet's last file goes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wallets: BTreeMap<String, WalletRecord>,
+}
+
+/// What finds a wallet with no file left: its phrase again, its unlock key, its Wallet ID.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletRecord {
+    /// The seed link's check, as its files carried it.
+    pub link: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 impl SeedDoc {
@@ -78,6 +93,7 @@ impl SeedDoc {
             && self.labels.is_empty()
             && self.group_labels.is_empty()
             && self.wallet_names.is_empty()
+            && self.wallets.is_empty()
     }
 
     /// Add what `other` holds that this doesn't.
@@ -96,6 +112,9 @@ impl SeedDoc {
         }
         for (k, v) in &other.wallet_names {
             self.wallet_names.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        for (k, v) in &other.wallets {
+            self.wallets.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
 }
@@ -123,7 +142,8 @@ impl SeedFiles {
             .groups
             .values()
             .find_map(|g| g.check.clone())
-            .or_else(|| doc.accounts.values().find_map(|p| p.check.clone()));
+            .or_else(|| doc.accounts.values().find_map(|p| p.check.clone()))
+            .or_else(|| doc.wallets.values().find_map(|w| w.check.clone()));
         let mut vaults: Vec<String> = doc.accounts.values().filter(|p| !p.vault.is_empty()).map(|p| p.vault.clone()).collect();
         vaults.sort();
         vaults.dedup();
@@ -244,6 +264,11 @@ pub fn load(root: &Root, keys: &KeyRing) -> Result<State> {
 impl State {
     fn locked(&self, seed: &str) -> bool {
         self.sealed.contains_key(seed) && !self.open.contains_key(seed)
+    }
+
+    /// Every seed the index records, readable or not.
+    pub fn all_seeds(&self) -> BTreeSet<String> {
+        self.seeds.keys().chain(self.sealed.keys()).chain(self.pending.keys()).cloned().collect()
     }
 
     /// Every document this process can read, by seed.
@@ -396,6 +421,9 @@ fn partition(doc: &SeedDoc, state: &State) -> BTreeMap<String, SeedDoc> {
     }
     for (seed, name) in &doc.wallet_names {
         out.entry(claim(seed.clone())).or_default().wallet_names.insert(seed.clone(), name.clone());
+    }
+    for (seed, w) in &doc.wallets {
+        out.entry(claim(seed.clone())).or_default().wallets.insert(seed.clone(), w.clone());
     }
     out
 }
