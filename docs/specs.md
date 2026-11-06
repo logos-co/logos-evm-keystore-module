@@ -586,12 +586,15 @@ app now asks one per wallet:
 - A wallet file left with no account and no key stays until `remove_group`; an app removing a
   file's last account follows with it.
 - **A wallet outlives its files.** Each phrase wallet keeps a record of its own, its seed link's
-  check, unlock check and Wallet ID, so removing its last file leaves it in `list_groups`'
-  `emptyWallets` (`{ seed, walletName, walletDefaultName, fingerprint }`), name and all. Importing
-  its phrase again adds to it, not to a new wallet.
+  check, unlock check, Wallet ID and the kept phrases its files were made from, so removing its
+  last file leaves it in `list_groups`' `emptyWallets`
+  (`{ seed, walletName, walletDefaultName, fingerprint, phrases }`), name and kept phrases and
+  all; `phrases` lists those still on disk. Importing its phrase again, typed or kept, adds to
+  it, not to a new wallet.
 - **`remove_wallet({ seed, password })`** removes a wallet: every account, file, kept phrase and
   name of it, key material first. Its password must open one of its files; a wallet with none
-  left takes none. A locked wallet is refused. The signer manager is then told with
+  left takes none, even with a kept phrase, as `forget_phrase` takes none. A locked wallet is
+  refused. The signer manager is then told with
   `forget_seed`, and its record goes with its last holder.
 - A wallet the signer manager still lists for this keystore that it no longer has, one removed
   before `forget_seed` existed, is forgotten there when the keystore next reads `wallets()`, and
