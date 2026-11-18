@@ -84,6 +84,9 @@ pub struct WalletRecord {
     pub check: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// The kept phrases its files were made from: still its own once its last file goes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phrases: Vec<String>,
 }
 
 impl SeedDoc {
@@ -147,7 +150,12 @@ impl SeedFiles {
         let mut vaults: Vec<String> = doc.accounts.values().filter(|p| !p.vault.is_empty()).map(|p| p.vault.clone()).collect();
         vaults.sort();
         vaults.dedup();
-        let mut phrases: Vec<String> = doc.groups.values().filter_map(|g| g.phrase.clone()).collect();
+        let mut phrases: Vec<String> = doc
+            .groups
+            .values()
+            .filter_map(|g| g.phrase.clone())
+            .chain(doc.wallets.values().flat_map(|w| w.phrases.iter().cloned()))
+            .collect();
         phrases.sort();
         phrases.dedup();
         SeedFiles {

@@ -1271,7 +1271,7 @@ impl KeystoreModule for KeystoreModuleImpl {
                     .map(|w| {
                         let default = self.ks().ok().and_then(|ks| ks.default_wallet_name(&w.seed).ok());
                         json!({ "seed": w.seed, "walletName": w.name, "walletDefaultName": default,
-                                "fingerprint": w.fingerprint })
+                                "fingerprint": w.fingerprint, "phrases": w.phrases })
                     })
                     .collect();
                 json!({ "ok": true, "groups": groups, "lockedWallets": locked.len(), "lockedSeeds": locked,
