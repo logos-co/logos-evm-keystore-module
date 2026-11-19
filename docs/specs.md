@@ -266,6 +266,9 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `unlock` | `params_json: String` | `{ ok, account, expiresInMs, countLeft }` | no |
 | `lock` | `params_json: String` | `{ ok, locked }` | no |
 | `unlocked` | — | `{ ok, unlocked: [..] }` | no |
+| `hold_key` | `params_json: String` | `{ ok, account }` | no |
+| `release_key` | `params_json: String` | `{ ok, released }` | no |
+| `held_keys` | — | `{ ok, held: [..] }` | no |
 | `database_key` | `params_json: String` | `{ ok, group, databaseKey }` | no |
 | `device_database_key` | `params_json: String` | `{ ok, signer, account, databaseKey, created }` | the first open makes a vault → event |
 | `device_wallets` | — | `{ ok, wallets: [{ signer, account, createdMs }] }` | no |
@@ -1296,8 +1299,8 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 | Methods | Admits |
 |---|---|
 | `signer_info` | anyone: it describes the kind of signer, not an account |
-| `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
-| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock_key`, `unlock_key_status`, `unlock_key_result`, `cancel_unlock_key`, `unlock`, `lock`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
+| `signer_accounts`, `unlocked`, `held_keys` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
+| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock_key`, `unlock_key_status`, `unlock_key_result`, `cancel_unlock_key`, `unlock`, `lock`, `hold_key`, `release_key`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
 | `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (Tier D) |
 | `device_wallets` | a configured **manager** or **custodian** |
 | `list_phrases` | anyone: ids and the wallets that name them, never words |
@@ -1387,6 +1390,16 @@ its only caller passed `ttl: None`, so it never expired and nobody had chosen th
 answers the manager alone, which takes the terms from a person in the keys app; the keystore
 enforces the time and the count, the manager the apps and the confirmation. A new password and a
 deleted account end the account's unlock, and nothing about an unlock is written to disk.
+
+### `hold_key(params_json: String) -> String`, `release_key(params_json: String) -> String`, `held_keys() -> String`
+
+`hold_key` takes `{ account, password }` and keeps the account's key in locked memory until the
+manager releases it, answering `{ ok, account }`. `sign` with no `secret` then uses that key. A hold
+has no time, count or caller: which requests may be signed, for whom and how much is the signer
+manager's, and only the manager can reach `sign`. `release_key` takes `{ account? }` and lets go of
+that account's key, or every key for `{}`, answering `{ ok, released: <how many> }`. `held_keys`
+lists `{ ok, held: [account] }`. A new password or a deleted account ends the hold, and nothing about
+a hold is written to disk.
 
 ### `database_key(params_json: String) -> String`
 
