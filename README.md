@@ -149,9 +149,9 @@ approver. No method signs on demand.
 [`logos.signer/1`](https://github.com/logos-co/logos-signer-interface), so the signer manager
 lists its accounts beside each hardware wallet's and has it sign. `signer_info` and
 `signer_accounts` describe it; `sign` / `sign_status` / `sign_result` / `cancel_sign` sign hashes
-the manager prepared, with the account's password or inside an unlock; `unlock` / `lock` hold an
-account's key in locked memory until a time or a count of requests runs out; `database_key`
-releases a Bitcoin wallet's database key for an approved open.
+the manager prepared, with the account's password or a key it keeps ready; `hold_key` /
+`release_key` keep an account's key in locked memory until the manager lets it go, with no terms of
+their own, because what may be signed is the manager's to decide; `database_key` releases a Bitcoin wallet's database key for an approved open.
 `device_database_key` does the same for a Bitcoin wallet whose key is on a device: the keystore
 keeps that wallet's database key in a vault of its own, made at its first open under a password
 the person sets. `device_wallets` lists them, and `forget_device_wallet` (Tier D) forgets one. Those answer the configured

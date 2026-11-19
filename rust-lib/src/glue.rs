@@ -22,7 +22,7 @@ use crate::btc::{Chain as BtcChain, Family as BtcFamily};
 use crate::gate;
 use crate::index::AddAgain;
 use crate::keystore::{Derived, Group, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
-use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
+use crate::signer::{self as ks_signer, HeldKeys, KeystoreSigner};
 use crate::BitcoinImport;
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
 use logos_signer_interface::wallets::{
@@ -156,7 +156,7 @@ pub trait KeystoreModule: Send + 'static {
     /// Put every file of a wallet under one password: `{ seed, passwords: [old…], newPassword }` →
     /// `{ ok, changed, already, left: [{ kind, id, address? }] }`. Each file takes the first of
     /// `passwords` that opens it; `left` lists those none opens, to ask for theirs and call again.
-    /// Tier D. Unlocks opened with an old password end.
+    /// Tier D. A key held under the old password is let go.
     fn change_wallet_password(&mut self, params_json: String) -> String;
     /// Whether `password` opens any file of a wallet, which adding to it takes: `{ seed, password }`
     /// → `{ ok, opens }`. Tier D.
@@ -245,14 +245,6 @@ pub trait KeystoreModule: Send + 'static {
     fn unlock_key_result(&mut self, job: String) -> String;
     /// `{ ok, job }`. Tier M.
     fn cancel_unlock_key(&mut self, job: String) -> String;
-    /// Hold an account's key in memory until `ttlMs` passes or `count` requests are signed.
-    /// `{ account, password, ttlMs?, count? }` → `{ ok, account, expiresInMs, countLeft }`. Tier M:
-    /// the manager keeps which apps the unlock covers, so nothing else may reach it.
-    fn unlock(&mut self, params_json: String) -> String;
-    /// `{ account? }` locks one account, `{}` every one → `{ ok, locked }`. Tier M.
-    fn lock(&mut self, params_json: String) -> String;
-    /// `{ ok, unlocked: [{ account, expiresInMs, countLeft }] }`. The manager and the custodian.
-    fn unlocked(&mut self) -> String;
     /// Keep an account's key ready until the manager releases it: `{ account, password }` → `{ ok,
     /// account }`. It carries no terms, because what may be signed is the manager's. Tier M.
     fn hold_key(&mut self, params_json: String) -> String;
@@ -261,7 +253,7 @@ pub trait KeystoreModule: Send + 'static {
     /// `{ ok, held: [account] }`. The manager and the custodian.
     fn held_keys(&mut self) -> String;
     /// A Bitcoin wallet's database key for an open request the keys app approved:
-    /// `{ group, password? }` → `{ ok, group, databaseKey }`, from its unlock when no password. Tier M.
+    /// `{ group, password }` → `{ ok, group, databaseKey }`. Tier M.
     fn database_key(&mut self, params_json: String) -> String;
     /// The database key of a Bitcoin wallet whose key is on a device, for an open the keys app
     /// approved. The first open makes it under the password the person set: `{ signer, account,
@@ -475,8 +467,8 @@ struct KeystoreModuleImpl {
     approvals: Approvals,
     /// Who may approve and who may mutate. Defaults from load, replaced by `configure`.
     roles: gate::Roles,
-    /// Keys held by an unlock, in memory only, and the signer interface's jobs.
-    unlocks: Unlocks,
+    /// Keys held ready for the manager, in memory only, and the signer interface's jobs.
+    held: HeldKeys,
     jobs: JobTable,
     /// Unlock-key jobs: read once, by the manager only, and announced nowhere.
     keys: KeyJobs,
@@ -493,7 +485,7 @@ impl KeystoreModuleImpl {
     /// The keystore as a signer, over this module's state for one call.
     fn signer(&mut self) -> std::result::Result<KeystoreSigner<'_>, String> {
         let ks = self.ks.as_ref().ok_or_else(|| "keystore not initialized (context not ready)".to_string())?;
-        Ok(KeystoreSigner { ks, unlocks: &mut self.unlocks, jobs: &mut self.jobs, keys: &mut self.keys })
+        Ok(KeystoreSigner { ks, held: &mut self.held, jobs: &mut self.jobs, keys: &mut self.keys })
     }
 
     /// Tell the signer manager about the wallet an import added, while its password is at hand,
@@ -749,17 +741,6 @@ struct GroupLabelParams {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UnlockParams {
-    account: String,
-    password: String,
-    #[serde(default)]
-    ttl_ms: Option<u64>,
-    #[serde(default)]
-    count: Option<u32>,
-}
-
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HoldParams {
     account: String,
@@ -775,8 +756,7 @@ struct LockParams {
 #[derive(Deserialize)]
 struct DatabaseKeyParams {
     group: String,
-    #[serde(default)]
-    password: Option<String>,
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -1482,7 +1462,7 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(ks) => match ks.change_password(&address, &old_password, &new_password) {
                 Ok(addr) => {
                     // A new password ends an unlock opened with the old one.
-                    self.unlocks.forget(Some(&addr.to_string()));
+                    self.held.release(Some(&addr.to_string()));
                     json!({ "ok": true, "address": addr.to_string() }).to_string()
                 }
                 Err(e) => err(e),
@@ -1505,7 +1485,7 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(ks) => match ks.change_wallet_password(&p.seed, &olds, &p.new_password) {
                 Ok(done) => {
                     // A new password ends every unlock opened with an old one.
-                    self.unlocks.forget(None);
+                    self.held.release(None);
                     json!({ "ok": true, "changed": done.changed, "already": done.already, "left": done.left })
                         .to_string()
                 }
@@ -1545,7 +1525,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(removed) => {
-                self.unlocks.forget(Some(&p.group));
+                self.held.release(Some(&p.group));
                 self.announce();
                 json!({ "ok": true, "removed": removed }).to_string()
             }
@@ -1570,7 +1550,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         match res {
             Ok(r) => {
                 for id in &r.removed {
-                    self.unlocks.forget(Some(id));
+                    self.held.release(Some(id));
                 }
                 send_forget(r.seed.clone());
                 self.announce();
@@ -1723,7 +1703,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(true) => {
-                self.unlocks.forget(Some(&address));
+                self.held.release(Some(&address));
                 self.announce();
                 true
             }
@@ -1964,57 +1944,6 @@ impl KeystoreModule for KeystoreModuleImpl {
         }
     }
 
-    fn unlock(&mut self, params_json: String) -> String {
-        if !self.is_manager("unlock") {
-            let _ = Zeroizing::new(params_json);
-            return not_authorized();
-        }
-        let p: UnlockParams = match parse_secret_params(params_json) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        let password = Zeroizing::new(p.password);
-        let ttl = p.ttl_ms.map(Duration::from_millis);
-        match self.signer() {
-            Ok(mut s) => match s.unlock(&p.account, &password, ttl, p.count) {
-                Ok(v) => json!({ "ok": true, "account": v.account, "expiresInMs": v.expires_in_ms,
-                                 "countLeft": v.count_left })
-                .to_string(),
-                Err(e) => wire::err(&e),
-            },
-            Err(e) => err(e),
-        }
-    }
-
-    fn lock(&mut self, params_json: String) -> String {
-        if !self.is_manager("lock") {
-            return not_authorized();
-        }
-        let p: LockParams = if params_json.trim().is_empty() {
-            LockParams::default()
-        } else {
-            match serde_json::from_str(&params_json) {
-                Ok(p) => p,
-                Err(e) => return err(e),
-            }
-        };
-        let locked = self.unlocks.lock(p.account.as_deref());
-        json!({ "ok": true, "locked": locked }).to_string()
-    }
-
-    fn unlocked(&mut self) -> String {
-        if !self.reads_signer_state() {
-            return not_authorized();
-        }
-        let list: Vec<_> = self
-            .unlocks
-            .list()
-            .into_iter()
-            .map(|v| json!({ "account": v.account, "expiresInMs": v.expires_in_ms, "countLeft": v.count_left }))
-            .collect();
-        json!({ "ok": true, "unlocked": list }).to_string()
-    }
-
     fn hold_key(&mut self, params_json: String) -> String {
         if !self.is_manager("hold_key") {
             let _ = Zeroizing::new(params_json);
@@ -2046,7 +1975,7 @@ impl KeystoreModule for KeystoreModuleImpl {
                 Err(e) => return err(e),
             }
         };
-        let released = self.unlocks.release(p.account.as_deref());
+        let released = self.held.release(p.account.as_deref());
         json!({ "ok": true, "released": released }).to_string()
     }
 
@@ -2054,7 +1983,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         if !self.reads_signer_state() {
             return not_authorized();
         }
-        json!({ "ok": true, "held": self.unlocks.held() }).to_string()
+        json!({ "ok": true, "held": self.held.accounts() }).to_string()
     }
 
     fn database_key(&mut self, params_json: String) -> String {
@@ -2066,9 +1995,9 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let password = p.password.map(Zeroizing::new);
+        let password = Zeroizing::new(p.password);
         match self.signer() {
-            Ok(mut s) => match s.database_key(&p.group, password.as_ref().map(|pw| pw.as_str())) {
+            Ok(mut s) => match s.database_key(&p.group, &password) {
                 Ok(key) => json!({ "ok": true, "group": p.group, "databaseKey": key.as_str() }).to_string(),
                 Err(e) => wire::err(&e),
             },

@@ -7778,9 +7778,9 @@ mod tests {
     fn sign_for_manager(ks: &Keystore) -> std::result::Result<String, logos_signer_interface::wire::SignerError> {
         use logos_signer_interface::wire::{HashItem, Payload, Scheme, Secret, SignRequest};
         use logos_signer_interface::Signer;
-        let (mut unlocks, mut jobs) = (crate::signer::Unlocks::default(), logos_signer_interface::jobs::JobTable::new());
+        let (mut held, mut jobs) = (crate::signer::HeldKeys::default(), logos_signer_interface::jobs::JobTable::new());
         let mut keys = logos_signer_interface::jobs::KeyJobs::new();
-        let mut s = crate::signer::KeystoreSigner { ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
+        let mut s = crate::signer::KeystoreSigner { ks, held: &mut held, jobs: &mut jobs, keys: &mut keys };
         s.sign(SignRequest {
             account: ACCT0.to_string(),
             payload: Payload::Hash { items: vec![HashItem { path: None, scheme: Scheme::Evm, digest: hex::encode([7u8; 32]) }] },

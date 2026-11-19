@@ -232,8 +232,6 @@ pub const TIER_M_METHODS: &[&str] = &[
     "sign_status",
     "sign_result",
     "cancel_sign",
-    "unlock",
-    "lock",
     "hold_key",
     "release_key",
     "database_key",
