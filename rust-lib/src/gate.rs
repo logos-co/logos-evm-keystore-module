@@ -234,6 +234,8 @@ pub const TIER_M_METHODS: &[&str] = &[
     "cancel_sign",
     "unlock",
     "lock",
+    "hold_key",
+    "release_key",
     "database_key",
     "device_database_key",
     "unlock_key",

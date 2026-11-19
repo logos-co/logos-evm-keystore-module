@@ -134,11 +134,25 @@ pub struct UnlockView {
     pub count_left: Option<u32>,
 }
 
+/// A key kept ready until the manager lets go of it. It has no terms: what may be signed, for whom
+/// and how much is the manager's.
+enum Ready {
+    Evm(LockedBytes),
+    /// The account key as its base58 text.
+    Bitcoin(LockedBytes),
+}
+
+struct Hold {
+    account: String,
+    ready: Ready,
+}
+
 /// Unlocked keys, in memory only. The keystore enforces the time and the count; the manager keeps
 /// the rest of the terms. Nothing here is ever written down.
 #[derive(Default)]
 pub struct Unlocks {
     entries: Vec<Unlock>,
+    holds: Vec<Hold>,
     /// Added to the clock, so tests move time instead of sleeping.
     skew: Duration,
 }
@@ -170,6 +184,30 @@ impl Unlocks {
             None => self.entries.clear(),
         }
         before - self.entries.len()
+    }
+
+    /// Let go of one account's key, or every one with `None`. Returns how many were held.
+    pub fn release(&mut self, account: Option<&str>) -> usize {
+        let before = self.holds.len();
+        match account {
+            Some(a) => {
+                let a = a.trim().to_ascii_lowercase();
+                self.holds.retain(|h| h.account != a);
+            }
+            None => self.holds.clear(),
+        }
+        before - self.holds.len()
+    }
+
+    /// The accounts whose keys are kept ready.
+    pub fn held(&self) -> Vec<String> {
+        self.holds.iter().map(|h| h.account.clone()).collect()
+    }
+
+    /// The account's key can no longer be trusted to match its vault: nothing of it stays.
+    pub fn forget(&mut self, account: Option<&str>) {
+        self.lock(account);
+        self.release(account);
     }
 
     pub fn list(&mut self) -> Vec<UnlockView> {
@@ -346,6 +384,38 @@ impl KeystoreSigner<'_> {
         Ok(self.unlocks.list().into_iter().find(|u| u.account == key).expect("just unlocked"))
     }
 
+    /// Keep an account's key ready until the manager releases it. Returns the account as held.
+    pub fn hold_key(&mut self, account: &str, password: &str) -> Result<String> {
+        let target = Target::resolve(self.ks, account)?;
+        let ready = match &target {
+            Target::Evm(a) => {
+                let signer = self.ks.signer_for(&a.to_string(), password).map_err(from_keystore)?;
+                Ready::Evm(LockedBytes::new(signer.to_bytes().as_slice()))
+            }
+            Target::Bitcoin { id, acct } => {
+                let (secret, _) = self.ks.open_bitcoin_vault(id, password, acct).map_err(from_keystore)?;
+                Ready::Bitcoin(LockedBytes::new(secret.encode().as_bytes()))
+            }
+        };
+        let key = target.key();
+        self.unlocks.release(Some(&key));
+        self.unlocks.holds.push(Hold { account: key.clone(), ready });
+        Ok(key)
+    }
+
+    /// The key kept ready for this account, if any.
+    fn from_hold(&self, target: &Target) -> Result<Option<Material>> {
+        let key = target.key();
+        let Some(h) = self.unlocks.holds.iter().find(|h| h.account == key) else { return Ok(None) };
+        Ok(Some(match (&h.ready, target) {
+            (Ready::Evm(bytes), Target::Evm(_)) => Material::Evm(PrivateKeySigner::from_slice(bytes.as_slice()).map_err(internal)?),
+            (Ready::Bitcoin(text), Target::Bitcoin { acct, .. }) => {
+                Material::Bitcoin(AccountSecret::decode(utf8(text)?, acct.chain).map_err(from_keystore)?)
+            }
+            _ => return Err(internal("the key held is not this account's kind")),
+        }))
+    }
+
     /// A Bitcoin wallet's database key: with its password, or from its unlock without using a count.
     pub fn database_key(&mut self, group: &str, password: Option<&str>) -> Result<Zeroizing<String>> {
         let target = Target::resolve(self.ks, group)?;
@@ -392,6 +462,7 @@ pub fn info() -> SignerInfo {
         shows_request: false,
         collects: Collects::Password,
         unlock_key: true,
+        holds_key: true,
     }
 }
 
@@ -477,7 +548,10 @@ impl Signer for KeystoreSigner<'_> {
         check_brought(&target, request.xpub.as_deref())?;
         let material = match &request.secret {
             Some(s) => open(self.ks, &target, s.expose())?,
-            None => self.from_unlock(&target)?,
+            None => match self.from_hold(&target)? {
+                Some(held) => held,
+                None => self.from_unlock(&target)?,
+            },
         };
         let outcome = sign_items(&target, &material, items, &checked);
         drop(material);
@@ -604,6 +678,41 @@ mod tests {
             let (req, _) = hash_request(&account, None);
             assert_eq!(s.sign(req).unwrap_err().code, ErrorCode::Locked, "{}: the third request", account.id);
         }
+    }
+
+    #[test]
+    fn a_held_key_signs_with_no_terms_until_it_is_released() {
+        let (_dir, ks) = keystore();
+        let (mut unlocks, mut jobs) = (Unlocks::default(), JobTable::new());
+        let mut keys = KeyJobs::new();
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
+        for account in s.accounts().unwrap() {
+            let (req, _) = hash_request(&account, None);
+            assert_eq!(s.sign(req).unwrap_err().code, ErrorCode::Locked, "{}", account.id);
+            assert_eq!(s.hold_key(&account.id, "nope").unwrap_err().code, ErrorCode::WrongSecret);
+            let held = s.hold_key(&account.id, "pw").unwrap();
+            assert!(s.unlocks.held().contains(&held));
+            for _ in 0..3 {
+                let (req, items) = hash_request(&account, None);
+                let job = s.sign(req).unwrap();
+                assert_eq!(s.result(&job).unwrap().len(), items.len());
+            }
+            assert_eq!(s.unlocks.release(Some(&held)), 1);
+            let (req, _) = hash_request(&account, None);
+            assert_eq!(s.sign(req).unwrap_err().code, ErrorCode::Locked, "released: {}", account.id);
+        }
+    }
+
+    #[test]
+    fn a_held_key_goes_with_its_account() {
+        let (_dir, ks) = keystore();
+        let (mut unlocks, mut jobs) = (Unlocks::default(), JobTable::new());
+        let mut keys = KeyJobs::new();
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs, keys: &mut keys };
+        let account = s.accounts().unwrap().remove(0);
+        let held = s.hold_key(&account.id, "pw").unwrap();
+        s.unlocks.forget(Some(&held));
+        assert!(s.unlocks.held().is_empty());
     }
 
     #[test]
