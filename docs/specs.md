@@ -263,9 +263,9 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `unlock_key_status` | `job: String` | `{ ok, job, state, code?, error? }` | no |
 | `unlock_key_result` | `job: String` | `{ ok, job, key }`, once | no |
 | `cancel_unlock_key` | `job: String` | `{ ok, job }` | no |
-| `unlock` | `params_json: String` | `{ ok, account, expiresInMs, countLeft }` | no |
-| `lock` | `params_json: String` | `{ ok, locked }` | no |
-| `unlocked` | — | `{ ok, unlocked: [..] }` | no |
+| `hold_key` | `params_json: String` | `{ ok, account }` | no |
+| `release_key` | `params_json: String` | `{ ok, released }` | no |
+| `held_keys` | — | `{ ok, held: [..] }` | no |
 | `database_key` | `params_json: String` | `{ ok, group, databaseKey }` | no |
 | `device_database_key` | `params_json: String` | `{ ok, signer, account, databaseKey, created }` | the first open makes a vault → event |
 | `device_wallets` | — | `{ ok, wallets: [{ signer, account, createdMs }] }` | no |
@@ -1296,16 +1296,16 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 | Methods | Admits |
 |---|---|
 | `signer_info` | anyone: it describes the kind of signer, not an account |
-| `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
-| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock_key`, `unlock_key_status`, `unlock_key_result`, `cancel_unlock_key`, `unlock`, `lock`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
+| `signer_accounts`, `held_keys` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
+| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock_key`, `unlock_key_status`, `unlock_key_result`, `cancel_unlock_key`, `hold_key`, `release_key`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
 | `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (Tier D) |
 | `device_wallets` | a configured **manager** or **custodian** |
 | `list_phrases` | anyone: ids and the wallets that name them, never words |
 | `account_descriptors` | a configured **manager** or **custodian**: a descriptor's xpub shows the wallet's whole history |
 
-Tier M is a registry like Tier D (`gate::TIER_M_METHODS`). It matters most for `unlock`: the
-manager keeps which apps an unlock covers and whether each signature is still confirmed, so a
-module that could reach `sign` past it would sign inside an unlock it was never granted.
+Tier M is a registry like Tier D (`gate::TIER_M_METHODS`). It matters most for `hold_key`: the
+manager decides what a key held ready may sign, so a module that could reach `sign` past it would
+sign with a key nobody allowed it.
 
 ### `signer_info() -> String`
 
@@ -1324,7 +1324,7 @@ kind, path }`, the signer interface's extension: `phrase.id` is the same for eve
 phrase, and `name` is that wallet's name (null while it has none), never an account's.
 
 An older build's wallet the signer manager was never told of is left out until it is added again
-(`restore_unlock_root`), and `sign` and `unlock` refuse it as `unknown_account`, saying so: the manager
+(`restore_unlock_root`), and `sign` and `hold_key` refuse it as `unknown_account`, saying so: the manager
 could not unlock it, so an app offering its accounts could only fail at the send.
 
 Every account names its `seed`: the seed link every group of one phrase shares, else its group's id;
@@ -1362,10 +1362,9 @@ an item under it is refused. A key imported on its own derives its unlock key fr
 is checked against the account **before any vault opens**: an EVM account takes scheme `evm` and
 no path, and signs with its own key; a native segwit wallet takes `ecdsa` and a Bitcoin wallet's
 receive or change path (`m/84'/c'/a'/0|1/i`); a taproot wallet takes `bip86`. With `secret`, the
-vault opens with that password for this request only; without it, the account's unlock answers,
-and one request counts once against it however many items it carries. A wrong password is
-`wrong_secret`, one message for every way a vault fails to open, as `set_label` gives; no secret
-and no unlock is `locked`. Signatures are 64 bytes `r‖s` with low S, `recoveryId` for EVM, and
+vault opens with that password for this request only; without it, a key held ready for the account
+answers. A wrong password is `wrong_secret`, one message for every way a vault fails to open, as
+`set_label` gives; no secret and no key held is `locked`. Signatures are 64 bytes `r‖s` with low S, `recoveryId` for EVM, and
 the signing key (33 bytes, or 32 x-only for taproot) as `pubkey`.
 
 ### `sign_status(job: String) -> String`, `sign_result(job: String) -> String`, `cancel_sign(job: String) -> String`
@@ -1374,25 +1373,20 @@ A keystore job finishes inside `sign`, so `sign_status` answers `done` (or `fail
 `code`) at once, and `sign_result` returns the signatures until the job is swept, ten minutes
 after it settled. `cancel_sign` is harmless on a settled job.
 
-### `unlock(params_json: String) -> String`, `lock(params_json: String) -> String`, `unlocked() -> String`
+### `hold_key(params_json: String) -> String`, `release_key(params_json: String) -> String`, `held_keys() -> String`
 
-`unlock` takes `{ account, password, ttlMs?, count? }` and holds the account's key in memory until
-`ttlMs` passes or `count` requests are signed — whichever comes first; neither means until it is
-locked. It answers `{ ok, account, expiresInMs, countLeft }`. `lock` takes `{ account? }` and locks
-that account, or every account for `{}`, answering `{ ok, locked: <how many> }`. `unlocked` lists
-`{ account, expiresInMs, countLeft }`.
-
-These are **not** the methods keystore#6 deleted. That `unlock` was callable by any module and
-its only caller passed `ttl: None`, so it never expired and nobody had chosen that. This one
-answers the manager alone, which takes the terms from a person in the keys app; the keystore
-enforces the time and the count, the manager the apps and the confirmation. A new password and a
-deleted account end the account's unlock, and nothing about an unlock is written to disk.
+`hold_key` takes `{ account, password }` and keeps the account's key in locked memory until the
+manager releases it, answering `{ ok, account }`. `sign` with no `secret` then uses that key. A hold
+has no time, count or caller: which requests may be signed, for whom and how much is the signer
+manager's, and only the manager can reach `sign`. `release_key` takes `{ account? }` and lets go of
+that account's key, or every key for `{}`, answering `{ ok, released: <how many> }`. `held_keys`
+lists `{ ok, held: [account] }`. A new password or a deleted account ends the hold, and nothing about
+a hold is written to disk.
 
 ### `database_key(params_json: String) -> String`
 
-`{ group, password? }` → `{ ok, group, databaseKey }`: a Bitcoin wallet's 32 random bytes for the
-wallet core's database, for an open request the keys app approved. With `password` the vault opens;
-without it, the wallet's unlock answers, and opening uses no count.
+`{ group, password }` → `{ ok, group, databaseKey }`: a Bitcoin wallet's 32 random bytes for the
+wallet core's database, for an open request the keys app approved. The password opens its vault.
 
 ### Device wallets' database keys
 
@@ -1472,12 +1466,11 @@ finishes its jobs inside `sign`, so it never sends them.
 ## Human-approved signing
 
 There is **no way to make this module sign anything except by a person's approval**: of the
-request, or of an unlock whose terms cover it. The methods that used to sign on demand —
+request, or of an allowance in the signer manager that covers it. The methods that used to sign on demand —
 `timed_unlock`, `is_unlocked`, `sign_transaction`, `sign_message`, `sign_digest`, and the
 `unlock` and `lock` keystore#6 removed — are **deleted from the contract**, not merely gated. On
 this path the signing key is derived from the vault password *inside* `approve()`, used, and
-zeroized before the call returns. The signer interface's `unlock` (above) answers the manager
-alone, on terms a person set.
+zeroized before the call returns. `hold_key` (above) answers the manager alone.
 
 ### The three tiers
 
@@ -1490,7 +1483,7 @@ Every request is classified by the **caller identity** the platform reports
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
 | **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity`, `list_phrases` — and, for now, `configure` | ungated |
 | **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `restore_unlock_root`, `move_older_keystore`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (default `evm_keystore_ui`) |
-| **M** | the signer interface's signing calls and the keys an unlock holds — see [the keystore as a signer](#the-keystore-as-a-signer-logossigner1) | a configured **manager** (default `signer_manager_module`) |
+| **M** | the signer interface's signing calls and the keys held ready — see [the keystore as a signer](#the-keystore-as-a-signer-logossigner1) | a configured **manager** (default `signer_manager_module`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
 names and `gate::tier_d_admits(method, custodian, caller)` is the only decision.
@@ -2228,7 +2221,7 @@ and the keystore can't tell it without what the person brings. Such a seed is pl
   names it in `addAgain` (`needs: "phrase"` for a wallet, `"password"` for a key) and marks its
   files `needsPhrase`, so the keys app says what it needs;
 * it is **not offered** to the manager: `signer_accounts` leaves it out, so no app lists an account
-  whose send could only end at "unlock it in the Signer app", where it isn't; `sign` and `unlock`
+  whose send could only end at "unlock it in the Signer app", where it isn't; `sign` and `hold_key`
   refuse it as `unknown_account`, and its key is never asked for;
 * **`restore_unlock_root`** adds it again (Tier D). `{ group | account, phrase | keptPhrase +
   phrasePassword, passphrase?, password }` for a wallet: the phrase is checked against the accounts
@@ -2295,16 +2288,15 @@ pub struct Keystore {
 }
 ```
 
-**Unlocked keys live in one place: `signer::Unlocks`.** An unlock the manager asked for holds the
-account's private key, or a Bitcoin wallet's account key and database key, in a buffer locked into
-RAM where the system allows it (`mlock`, `VirtualLock`), and on Linux the process stops writing core
-dumps once one exists. The buffer is wiped when the unlock ends: on its time or count, on `lock`,
-on a password change, or when the account is deleted. Each signature rebuilds the key from it for
-that one call. Nothing about an unlock is written to disk, and a restart locks everything. The
-signer interface's job table holds signatures, never keys, and forgets them ten minutes after a
+**Keys held ready live in one place: `signer::HeldKeys`.** A hold the manager asked for keeps the
+account's private key, or a Bitcoin wallet's account key, in a buffer locked into RAM where the
+system allows it (`mlock`, `VirtualLock`), and on Linux the process stops writing core dumps once one
+exists. The buffer is wiped when the manager releases it, on a password change, or when the account
+is deleted. Each signature rebuilds the key from it for that one call. Nothing about a hold is
+written to disk, and a restart ends every hold. The signer interface's job table holds signatures, never keys, and forgets them ten minutes after a
 job settles.
 
-**Outside an unlock there is no signer cache, by construction.** A decrypted key exists only
+**Outside a hold there is no signer cache, by construction.** A decrypted key exists only
 as a local inside `approve()`: derived from the vault password, used to sign every
 leg of the bundle, then zeroized (`Zeroizing` wraps the password, the derived key
 and the signer's key bytes) before the call returns. Nothing outside that call
